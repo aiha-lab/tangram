@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from dataclasses import field
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -151,10 +152,19 @@ class CacheConfig:
     page_group_size: int | None = 4
     """Head-group size; ``None`` disables head-group paging.
     Must divide ``num_kv_heads``."""
+    head_group_cluster_map: str | None = None
+    """Path to a head-group cluster map ``.npz`` with integer arrays
+    ``cluster_of`` and ``column_of`` (built by ``tools/head_group_clustering``).
+    Default ``None`` uses the identity map (adjacent-head grouping). When set,
+    KV heads are clustered by retention-budget similarity (possibly across
+    layers); requires ``page_group_size`` set and matching the map's
+    ``page_group_size``. Only the physical placement of each head's KV changes,
+    so at no compression the output is identical to the identity map."""
 
-    # Non-uniform KV cache compression.
+    # KV cache compression. Generalized over two orthogonal axes: selection
+    # level (``compression_level``) and score producer (``compression_scorer``).
     enable_compression: bool = False
-    """Enable non-uniform KV cache compression."""
+    """Enable KV cache compression (head-group paging required)."""
     compression_ratio: float = 0.3
     """Fraction of tokens kept per chunk; each chunk keeps
     ``floor(ratio * re_eval_size)`` tokens."""
@@ -168,9 +178,93 @@ class CacheConfig:
     """Chunk size for compression-aware chunked prefill (independent from
     ``long_prefill_token_threshold``)."""
     compression_gate_path: str = "fastkvzip"
-    """Gate checkpoint. The default ``"fastkvzip"`` sentinel triggers a
-    HuggingFace Hub download of ``Jang-Hyun/Fast-KVzip``; a local path is
-    also accepted."""
+    """Gate checkpoint (used only when ``compression_scorer == "fastkvzip"``).
+    The default ``"fastkvzip"`` sentinel triggers a HuggingFace Hub download
+    from ``hmkim97/tangram-gate``; a local path is also accepted."""
+
+    # --- Compression: two orthogonal axes (selection level + scorer) ---
+    compression_level: str = "crosslayer_head"
+    """Axis 1 — selection level (the rule turning eval scores into a per-(layer,
+    group) kept count). Named ``{scope}_{granularity}`` over two orthogonal axes:
+    threshold scope (``crosslayer`` global vs ``perlayer``) and calibration
+    granularity (``head`` -> max-pool inflates the budget; ``cluster`` -> exact
+    budget). One of:
+
+    * ``"crosslayer_head"`` (default) — a single CROSS-layer global threshold,
+      head-calibrated (reference ``pair``). Each (layer, group) keeps a divergent
+      count: strong clusters keep more, weak ones less. Sensitive to cross-layer
+      score-scale disparity (a layer with systematically larger scores
+      monopolises budget).
+    * ``"perlayer_head"`` — a SEPARATE threshold per layer (AdaKV-style),
+      head-calibrated, so every layer keeps its own top ``compression_ratio``
+      fraction while heads within a layer still diverge. Immune to cross-layer
+      scale disparity; the validated pairing for ``compression_scorer ==
+      "expected_attention"`` (its kvpress reference uses AdaKV per-layer budgets).
+    * ``"crosslayer_cluster"`` — cross-layer global threshold, cluster-calibrated
+      (the exact-budget counterpart of ``"crosslayer_head"``: cross-layer block
+      sharing without max-pool inflation). Needs a cross-layer (global) cluster
+      map; shares ``"crosslayer_head"``'s scale-disparity sensitivity; TP=1 only.
+    * ``"perlayer_cluster"`` — per-layer threshold, cluster-calibrated: the budget
+      is decided at the cluster (shared-block) granularity so the physical KV is
+      exactly ``compression_ratio`` (no max-pool inflation). Needs a within-layer
+      cluster map; TP=1 only.
+    * ``"uniform"`` — a uniform count ``floor(compression_ratio * eval_len)`` per
+      (layer, group) (reference ``pair-head``). Positions still differ per head;
+      only the kept *count* is uniform.
+
+    The accepted set is owned by ``selection_level.SELECTION_LEVELS``."""
+    compression_scorer: str = "fastkvzip"
+    """Axis 2 — score producer. ``"fastkvzip"`` uses the trained gate over
+    hidden_states (needs a checkpoint). ``"snapkv"``, ``"keydiff"``,
+    ``"streamingllm"``, and ``"tova"`` are gate-free and need no checkpoint:
+    SnapKV scores from observation-window attention over the chunk's post-RoPE
+    query/key, KeyDiff from key similarity to the chunk's mean key direction,
+    StreamingLLM from token recency (global position) alone — a recency
+    baseline, and TOVA from the last query's attention averaged across heads
+    (head-uniform)."""
+    compression_snap_window: int = 32
+    """SnapKV observation window: number of trailing queries used to score a
+    chunk. Distinct from ``compression_window_size`` (the always-kept recent
+    region). Auto-shrinks to 16 for short chunks (< 1000), matching the
+    reference. Only used when ``compression_scorer == "snapkv"``."""
+    compression_snap_kernel: int = 7
+    """SnapKV max-pool1d smoothing kernel size (odd). Only used when
+    ``compression_scorer == "snapkv"``."""
+    compression_ea_use_covariance: bool = True
+    """ExpectedAttention: add the query covariance term to the expected
+    attention logit (kvpress default True). Only used when
+    ``compression_scorer == "expected_attention"``."""
+    compression_ea_use_vnorm: bool = True
+    """ExpectedAttention: reweight the expected attention by the value norm
+    (kvpress default True). Only used when
+    ``compression_scorer == "expected_attention"``."""
+    compression_ea_n_future_positions: int = 512
+    """ExpectedAttention: number of future decode positions whose RoPE rotation
+    is averaged to anticipate where future queries attend (kvpress default
+    512). Only used when ``compression_scorer == "expected_attention"``."""
+    compression_ea_epsilon: float = 1e-2
+    """ExpectedAttention: constant added before the value-norm reweighting;
+    score is ``(prob + epsilon) * ||value||`` (kvpress reference default 1e-2).
+    The epsilon floor lets the low-probability tail of keys fall back to
+    value-norm ranking instead of being ordered by near-zero softmax noise; on
+    RULER this is what keeps NIAH recall from collapsing. It is only beneficial
+    paired with a per-layer budget (``compression_level ==
+    "perlayer_head"``): under the cross-layer global threshold the
+    uneven per-layer value-norm scale that epsilon introduces biases the budget
+    toward high-norm layers. Only used when ``compression_scorer ==
+    "expected_attention"``."""
+
+    compression_retention_dump: str | None = None
+    """Offline profiling only. When set to a directory path, the engine attaches
+    a retention observer that writes each per-request keep decision into that
+    directory (one ``.npz`` per decision). Used by the head-group clustering
+    retention profiler (``tools/head_group_clustering/build_profile.py
+    --backend vllm``) to derive a per-(layer, head) retention profile from the
+    engine's own keep decision — the only approach that works for eager-only
+    models whose query/key/value cannot be captured in HuggingFace transformers.
+    Set ``page_group_size=1`` so each (layer, group) is a single head. ``None``
+    in production: no observer, no extra work. See
+    ``vllm.v1.attention.compression.profiling``."""
 
     # Multi-turn serving.
     multi_turn: bool = False
@@ -226,6 +320,9 @@ class CacheConfig:
             "compression_ratio",
             "compression_floor_min",
             "compression_chunk_size",
+            # Cluster map relabels physical KV placement only; it does not
+            # change the compiled graph shape or kernel selection.
+            "head_group_cluster_map",
         }
 
         from vllm.config.utils import get_hash_factors, hash_factors
@@ -296,6 +393,13 @@ class CacheConfig:
                         f"num_kv_heads={self.num_kv_heads}, "
                         f"page_group_size={self.page_group_size}."
                     )
+            # Head-grouped paging is only implemented in the FLASH_ATTN
+            if not os.environ.get("VLLM_ATTENTION_BACKEND"):
+                os.environ["VLLM_ATTENTION_BACKEND"] = "FLASH_ATTN"
+                logger.info(
+                    "Defaulting VLLM_ATTENTION_BACKEND=FLASH_ATTN (required by "
+                    "head-grouped paging / compression)."
+                )
 
         # Compression.
         if self.enable_compression:
@@ -335,13 +439,59 @@ class CacheConfig:
                     f"must be greater than compression_window_size "
                     f"({self.compression_window_size})."
                 )
-            if not isinstance(self.compression_gate_path, str) or not (
-                self.compression_gate_path
+            # Axis 1 — selection level. Validated against the registry that
+            # ``make_selection_level`` dispatches on (single source of truth);
+            # the local import keeps the torch-backed runtime module out of the
+            # config module's import graph.
+            from vllm.v1.attention.compression.selection_level import (
+                SELECTION_LEVELS,
+            )
+            if self.compression_level not in SELECTION_LEVELS:
+                raise ValueError(
+                    f"compression_level must be one of {SELECTION_LEVELS}, "
+                    f"got {self.compression_level!r}."
+                )
+            if self.compression_scorer not in (
+                    "fastkvzip", "snapkv", "keydiff", "streamingllm", "tova",
+                    "expected_attention"):
+                raise ValueError(
+                    "compression_scorer must be 'fastkvzip', 'snapkv', "
+                    "'keydiff', 'streamingllm', 'tova', or "
+                    f"'expected_attention', got {self.compression_scorer!r}."
+                )
+            # The gate checkpoint is only consumed by the fastkvzip scorer;
+            # every other (gate-free) scorer ignores the path.
+            if self.compression_scorer == "fastkvzip" and (
+                not isinstance(self.compression_gate_path, str)
+                or not self.compression_gate_path
             ):
                 raise ValueError(
                     "compression_gate_path must be a non-empty string "
                     "(either 'fastkvzip' for HF download or a local path)."
                 )
+            if self.compression_scorer == "snapkv":
+                if self.compression_snap_window <= 0:
+                    raise ValueError(
+                        f"compression_snap_window must be > 0, got "
+                        f"{self.compression_snap_window}."
+                    )
+                if (self.compression_snap_kernel <= 0
+                        or self.compression_snap_kernel % 2 == 0):
+                    raise ValueError(
+                        f"compression_snap_kernel must be a positive odd "
+                        f"integer, got {self.compression_snap_kernel}."
+                    )
+            if self.compression_scorer == "expected_attention":
+                if self.compression_ea_n_future_positions <= 0:
+                    raise ValueError(
+                        "compression_ea_n_future_positions must be > 0, got "
+                        f"{self.compression_ea_n_future_positions}."
+                    )
+                if self.compression_ea_epsilon < 0:
+                    raise ValueError(
+                        "compression_ea_epsilon must be >= 0, got "
+                        f"{self.compression_ea_epsilon}."
+                    )
 
         # Multi-turn rides on top of head-group paging but does not
         # require compression.

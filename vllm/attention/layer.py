@@ -37,6 +37,9 @@ from vllm.utils.torch_utils import (
     direct_register_custom_op,
     kv_cache_dtype_str_to_dtype,
 )
+from vllm.v1.attention.backends.head_grouped_layout import (
+    member_virtual_block_table,
+)
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     HeadGroupedAttentionSpec,
@@ -479,10 +482,12 @@ class Attention(nn.Module, AttentionLayerBase):
         value: torch.Tensor,
         output_shape: torch.Size | None,
     ) -> torch.Tensor:
-        """Head-grouped forward: each (request, head-group) is one varlen
-        sequence. Decode uses a single ``.view()`` per Q/K/V/O against
-        precomputed per-layer metadata; prefill / mixed batches reshape
-        token-major → group-major to handle varying sequence lengths.
+        """Head-grouped forward: each (request, KV-head member) is one varlen
+        sequence (column-major paging makes every KV head its own sequence,
+        carrying its GQA group of query heads). Decode uses a single ``.view()``
+        per Q/K/V/O against precomputed per-layer metadata; prefill / mixed
+        batches reshape token-major → member-major to handle varying sequence
+        lengths.
         """
         assert self.use_output, (
             "Head-grouped paging requires backends that accept an output "
@@ -490,12 +495,14 @@ class Attention(nn.Module, AttentionLayerBase):
         )
 
         num_groups = self.num_groups_per_layer
-        num_query_heads_per_group = self.num_query_heads_per_group
-        page_group_size = self.page_group_size
-        assert page_group_size is not None
+        assert self.page_group_size is not None
         head_size = self.head_size
         num_heads = self.num_heads
         num_kv_heads = self.num_kv_heads
+        # Column-major paging makes each KV head its own varlen sequence (one
+        # member), so a member carries the GQA group's query heads. See
+        # vllm/v1/attention/backends/head_grouped_layout.py.
+        num_query_heads_per_kv = num_heads // num_kv_heads
 
         forward_context: ForwardContext = get_forward_context()
         attn_metadata = forward_context.attn_metadata
@@ -516,23 +523,31 @@ class Attention(nn.Module, AttentionLayerBase):
 
         if attn_metadata.head_grouped_decode_layout:
             # Uniform-decode fast path: token-major Q/K/V flattens directly
-            # into group-major because every (req, group) sequence is one
-            # row. Per-layer metadata is precomputed by the builder, so we
-            # avoid the per-layer view/slice CPU dispatch cost called out
-            # in ``FlashAttentionImpl.forward``.
+            # into member-major (one sequence per KV head) because every
+            # (req, member) sequence is one row. Per-layer metadata is
+            # precomputed by the builder, so we avoid the per-layer view/slice
+            # CPU dispatch cost called out in ``FlashAttentionImpl.forward``.
             num_tokens = query.shape[0]
             hidden = num_heads * head_size
-            q_grouped = query.view(
-                num_tokens * num_groups, num_query_heads_per_group, head_size)
-            k_grouped = key.view(
-                num_tokens * num_groups, page_group_size, head_size)
-            v_grouped = value.view(
-                num_tokens * num_groups, page_group_size, head_size)
+            # ``reshape`` (not ``view``) because Q/K/V may be non-contiguous:
+            # models that fuse the QKV projection hand each tensor out as a
+            # ``split`` view, and a tensor with no post-projection op (e.g.
+            # Gemma-3's value, which unlike query/key is not re-materialized by
+            # q/k-norm + RoPE) keeps the fused row stride. Merging the
+            # ``num_tokens`` and ``num_kv_heads`` dims then spans that stride,
+            # which ``view`` rejects. ``reshape`` is a free view when already
+            # contiguous and copies only the non-contiguous case.
+            q_grouped = query.reshape(
+                num_tokens * num_kv_heads, num_query_heads_per_kv, head_size)
+            k_grouped = key.reshape(
+                num_tokens * num_kv_heads, 1, head_size)
+            v_grouped = value.reshape(
+                num_tokens * num_kv_heads, 1, head_size)
             output_token_major = torch.empty(
                 (num_tokens, hidden), dtype=query.dtype, device=query.device
             )
             output_grouped = output_token_major.view(
-                num_tokens * num_groups, num_query_heads_per_group, head_size)
+                num_tokens * num_kv_heads, num_query_heads_per_kv, head_size)
             layer_md = attn_metadata.per_layer_md[self.layer_idx]
             self.impl.forward(
                 self, q_grouped, k_grouped, v_grouped,
@@ -543,63 +558,71 @@ class Attention(nn.Module, AttentionLayerBase):
                 return output_token_major.view(output_shape)
             return output_token_major
 
-        # Group-major path (prefill / mixed batches): a data copy is
-        # required because (req, group) sequences are not contiguous in
+        # Member-major path (prefill / mixed batches): a data copy is
+        # required because (req, member) sequences are not contiguous in
         # any single view of token-major Q/K/V when sequence lengths vary.
         q_token_major = query.view(-1, num_heads, head_size)
         k_token_major = key.view(-1, num_kv_heads, head_size)
         v_token_major = value.view(-1, num_kv_heads, head_size)
         num_tokens = q_token_major.shape[0]
 
-        block_table_grouped = attn_metadata.block_table_grouped
+        cluster_block_table = attn_metadata.cluster_block_table
+        clusters_per_layer = attn_metadata.clusters_per_layer
+        cols_per_layer = attn_metadata.cols_per_layer
         seq_lens_grouped = attn_metadata.seq_lens_grouped
         slot_mapping_grouped = attn_metadata.slot_mapping_grouped
         query_start_loc_grouped = attn_metadata.query_start_loc_grouped
-        assert block_table_grouped is not None
+        assert cluster_block_table is not None
+        assert clusters_per_layer is not None
+        assert cols_per_layer is not None
         assert seq_lens_grouped is not None
         assert slot_mapping_grouped is not None
         assert query_start_loc_grouped is not None
 
-        def to_group_major(
-            x: torch.Tensor, total_heads: int, sub_heads: int,
+        def to_member_major(
+            x: torch.Tensor, sub_heads: int,
         ) -> torch.Tensor:
-            # x: [num_tokens, total_heads, head_size]
+            # x: [num_tokens, num_kv_heads * sub_heads, head_size] ->
+            # [num_kv_heads * num_tokens, sub_heads, head_size], one KV head
+            # (member) per varlen sequence.
             return (
-                x.view(num_tokens, num_groups, sub_heads, head_size)
+                x.view(num_tokens, num_kv_heads, sub_heads, head_size)
                 .permute(1, 0, 2, 3)
                 .contiguous()
-                .view(num_groups * num_tokens, sub_heads, head_size)
+                .view(num_kv_heads * num_tokens, sub_heads, head_size)
             )
 
-        q_grouped = to_group_major(
-            q_token_major, num_heads, num_query_heads_per_group)
-        k_grouped = to_group_major(
-            k_token_major, num_kv_heads, page_group_size)
-        v_grouped = to_group_major(
-            v_token_major, num_kv_heads, page_group_size)
+        q_grouped = to_member_major(q_token_major, num_query_heads_per_kv)
+        k_grouped = to_member_major(k_token_major, 1)
+        v_grouped = to_member_major(v_token_major, 1)
 
         output_grouped = torch.empty(
-            (num_groups * num_tokens, num_query_heads_per_group, head_size),
+            (num_kv_heads * num_tokens, num_query_heads_per_kv, head_size),
             dtype=query.dtype,
             device=query.device,
         )
 
-        # Slice the per-layer span of the group-major precomputes.
-        layer_start = self.layer_idx * num_groups
-        layer_end = layer_start + num_groups
+        # Slice the per-layer span of the member-major precomputes.
+        layer_start = self.layer_idx * num_kv_heads
+        layer_end = layer_start + num_kv_heads
 
         num_reqs = seq_lens_grouped.shape[1]
-        block_table_layer = block_table_grouped[layer_start:layer_end].reshape(
-            num_groups * num_reqs, block_table_grouped.shape[-1]
-        )
+        # This layer's virtual block table, built on demand: member-major
+        # [num_kv_heads, num_reqs, max_blocks] -> [num_kv_heads * num_reqs,
+        # max_blocks].
+        block_table_layer = member_virtual_block_table(
+            cluster_block_table, clusters_per_layer[self.layer_idx],
+            cols_per_layer[self.layer_idx], attn_metadata.page_group_size,
+            cluster_axis=1,
+        ).permute(1, 0, 2).reshape(num_kv_heads * num_reqs, -1)
         seq_lens_layer = seq_lens_grouped[layer_start:layer_end].reshape(
-            num_groups * num_reqs)
+            num_kv_heads * num_reqs)
         slot_mapping_layer = slot_mapping_grouped[
             layer_start:layer_end].reshape(-1)
 
         layer_md = dataclass_replace(
             attn_metadata,
-            num_actual_tokens=num_groups * num_tokens,
+            num_actual_tokens=num_kv_heads * num_tokens,
             block_table=block_table_layer,
             seq_lens=seq_lens_layer,
             slot_mapping=slot_mapping_layer,
@@ -611,11 +634,11 @@ class Attention(nn.Module, AttentionLayerBase):
             self_kv_cache, layer_md, output=output_grouped,
         )
 
-        # Inverse reshape: group-major → token-major hidden.
+        # Inverse reshape: member-major → token-major hidden.
         output_token_major = (
             output_grouped.view(
-                num_groups, num_tokens,
-                num_query_heads_per_group, head_size)
+                num_kv_heads, num_tokens,
+                num_query_heads_per_kv, head_size)
             .permute(1, 0, 2, 3)
             .contiguous()
             .view(num_tokens, num_heads * head_size)

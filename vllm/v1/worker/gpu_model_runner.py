@@ -91,6 +91,9 @@ from vllm.utils.torch_utils import (
     supports_dynamo,
 )
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadataBuilder
+from vllm.v1.attention.backends.head_grouped_layout import (
+    column_major_cache_shape,
+)
 from vllm.v1.attention.compression import (
     CompressionExecutor,
     CompressionMetadata,
@@ -101,8 +104,10 @@ from vllm.v1.attention.backends.utils import (
     AttentionMetadataBuilder,
     CommonAttentionMetadata,
     create_fast_prefill_custom_backend,
+    full_attention_layer_indices,
     get_dcp_local_seq_lens,
     reorder_batch_to_split_decodes_and_prefills,
+    sliding_window_layers,
     split_attn_metadata,
 )
 from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher
@@ -483,6 +488,14 @@ class GPUModelRunner(
         self.last_compression_freed_block_ids: np.ndarray = np.empty(
             0, dtype=np.int32
         )
+        # Sliding-window eviction: out-of-window front blocks freed for
+        # sliding-window layers. A SEPARATE channel from compression because it
+        # is null-in-place (length-preserving) on the scheduler side, not the
+        # shrinking ``free_blocks_by_ids`` path. Empty for dense models.
+        self.pending_sliding_freed_blocks: list[np.ndarray] = []
+        self.last_sliding_freed_block_ids: np.ndarray = np.empty(
+            0, dtype=np.int32
+        )
 
         self.use_async_scheduling = self.scheduler_config.async_scheduling
         # Separate cuda stream for overlapping transfer of sampled token ids from
@@ -738,6 +751,12 @@ class GPUModelRunner(
         for req_id in scheduler_output.finished_req_ids:
             self.requests.pop(req_id, None)
             self.num_prompt_logprobs.pop(req_id, None)
+            # Free the compressor's per-request GPU buffers on completion;
+            # request ids are unique within an llm.generate, so otherwise
+            # finished entries accumulate for the whole run and OOM mid-generate.
+            # end_request is idempotent — safe for non-compressed ids.
+            if self.compressor is not None:
+                self.compressor.end_request(req_id)
         # Remove the finished requests from the persistent batch.
         # NOTE(woosuk): There could be an edge case where finished_req_ids and
         # scheduled_req_ids overlap. This happens when a request is aborted and
@@ -927,6 +946,18 @@ class GPUModelRunner(
                 # The request is not in the persistent batch.
                 # The request was either preempted and resumed later, or was not
                 # scheduled in the previous step and needs to be added again.
+
+                # Head-grouped re-add: a request that merely skipped a step
+                # carries a ``block_table_snapshot`` of its exact per-group
+                # layout; ``new_block_ids`` is this step's increment to append
+                # after restoring it. A preempt-resume instead re-prefills from
+                # scratch with a fresh full block list, so its stale pre-preempt
+                # snapshot must be dropped (the normal ``add_row`` path applies).
+                if resumed_from_preemption:
+                    req_state.block_table_snapshot = None
+                    req_state.block_table_readd_increment = None
+                elif req_state.block_table_snapshot is not None:
+                    req_state.block_table_readd_increment = new_block_ids
 
                 if self.use_async_scheduling and num_output_tokens > 0:
                     # We must recover the output token ids for resumed requests in the
@@ -2733,34 +2764,30 @@ class GPUModelRunner(
                 f"multiple of page_group_size ({cache_config.page_group_size})."
             )
 
-        self.compressor = KVCompressor(
-            num_layers=num_layers,
-            num_kv_heads=num_kv_heads_per_rank,
-            page_group_size=cache_config.page_group_size,
-            head_size=head_size,
-            hidden_dim=hidden_dim,
-            block_size=block_size,
-            dtype=dtype,
-            device=self.device,
-        )
-        self.compressor.load_gate_checkpoint(
-            self.model_config.model,
-            cache_config.compression_gate_path,
-            num_kv_heads_total=num_kv_heads_total,
-            tp_rank=tp_rank,
-        )
-
-        # Hook the *outer* attention block (e.g. Qwen2Attention) so the
-        # pre-hook can read hidden_states; the inner ``Attention`` only
-        # sees already-projected q/k/v.
+        # Enumerate the decoder attention layers and split them into
+        # full-attention (compressible) vs sliding-window. FastKVZip scores and
+        # evicts only the full-attention layers; sliding-window layers retain
+        # their full KV and are never compressed (the window is applied inside
+        # the attention kernel). The gate checkpoint stores one gate per
+        # full-attention layer. For a dense model every layer is full-attention,
+        # so this reduces exactly to the prior all-layers path.
+        #
+        # Hook the *outer* attention block (e.g. Qwen2Attention) so the pre-hook
+        # can read hidden_states; the inner ``Attention`` only sees the
+        # already-projected q/k/v but exposes ``sliding_window`` for the split.
         from vllm.attention import Attention as _InnerAttention
         from vllm.model_executor.models.utils import extract_layer_index
 
         inner_attn_layers = get_layers_from_vllm_config(
             self.vllm_config, _InnerAttention
         )
+        # ``layer_to_parent`` feeds the hidden_states scorer (FastKVZip gate);
+        # ``layer_to_inner`` feeds the query/key scorer (SnapKV), which hooks
+        # the inner ``Attention`` to read its post-RoPE q/k. Both are keyed by
+        # physical layer index so ``attach_scorers`` can pick by scorer type.
         layer_to_parent: dict[int, nn.Module] = {}
-        for layer_name in inner_attn_layers:
+        layer_to_inner: dict[int, nn.Module] = {}
+        for layer_name, inner in inner_attn_layers.items():
             try:
                 idx = extract_layer_index(layer_name)
             except (AssertionError, ValueError):
@@ -2775,6 +2802,7 @@ class GPUModelRunner(
             except AttributeError:
                 continue
             layer_to_parent[idx] = parent
+            layer_to_inner[idx] = inner
 
         missing = [i for i in range(num_layers) if i not in layer_to_parent]
         if missing:
@@ -2782,8 +2810,109 @@ class GPUModelRunner(
                 f"Compression: outer attention parent missing for layers "
                 f"{missing}; one Attention per decoder layer is required."
             )
-        parent_modules = [layer_to_parent[i] for i in range(num_layers)]
-        self.compressor.attach_to_attention_layers(parent_modules)
+
+        # Physical indices of the compressible (full-attention) layers, in
+        # ascending order — the order the gate checkpoint's per-layer modules
+        # are stored in. Shared with the head-grouped FlashAttention builder via
+        # full_attention_layer_indices so the two cannot disagree on which
+        # layers are compressed (and thus how a cluster map maps to physical
+        # rows).
+        static_layer_ids = full_attention_layer_indices(self.vllm_config)
+        if not static_layer_ids:
+            raise RuntimeError(
+                "Compression: model has no full-attention layers; FastKVZip "
+                "needs at least one compressible (non-sliding-window) layer."
+            )
+        num_compressed_layers = len(static_layer_ids)
+        # Consumed by the executor (KV / block-table access is physical) and by
+        # the compression layer loop (static->physical kept_lengths expansion).
+        self.compression_static_layer_ids = np.array(
+            static_layer_ids, dtype=np.int64)
+
+        # Sliding-window layers + window, for sliding-window KV eviction.
+        # Out-of-window front blocks of these layers are returned to the pool at
+        # each compression boundary so concurrent long-context requests stop
+        # thrashing on KV (head-grouped paging otherwise keeps full KV for every
+        # layer, including sliding-window ones). Resolved via the same source of
+        # truth as the compressible (full-attention) split. Empty for a dense
+        # model (no sliding-window layers) → eviction is a no-op.
+        sliding_ids, sliding_window = sliding_window_layers(self.vllm_config)
+        self.compression_sliding_layer_ids = np.array(
+            sliding_ids, dtype=np.int64)
+        self.compression_sliding_window = sliding_window
+
+        # Sliding-window hybrid models author the cluster map over the
+        # compressible (full-attention) layers only: shape
+        # ``[num_compressed_layers, num_kv_heads]``. The compressor consumes it
+        # as-is (its layer axis IS the compressed space; set_cluster_map below
+        # validates ``cluster_of.shape[0] == num_compressed_layers``). The
+        # FlashAttention builder expands the same static map to the physical
+        # layer layout it needs (static cross-layer clusters at their executor
+        # block-table rows + identity for sliding layers) — see
+        # head_grouped_layout.physical_member_maps_from_static_cluster_map.
+        # Dense models keep ``num_compressed_layers == num_layers`` and the map
+        # is already physical, so both paths see the same array.
+
+        self.compressor = KVCompressor(
+            num_layers=num_compressed_layers,
+            num_kv_heads=num_kv_heads_per_rank,
+            page_group_size=cache_config.page_group_size,
+            head_size=head_size,
+            hidden_dim=hidden_dim,
+            block_size=block_size,
+            dtype=dtype,
+            device=self.device,
+            level=cache_config.compression_level,
+        )
+        # Axis-2 scorer selection. FastKVZip loads a
+        # per-layer gate checkpoint over hidden_states; every other scorer is a
+        # gate-free query/key scorer (SnapKV, KeyDiff, …) dispatched by name
+        # through ``build_qk_scorer`` (num_q_per_kv = per-rank GQA ratio).
+        if cache_config.compression_scorer == "fastkvzip":
+            self.compressor.load_gate_checkpoint(
+                self.model_config.model,
+                cache_config.compression_gate_path,
+                num_kv_heads_total=num_kv_heads_total,
+                tp_rank=tp_rank,
+            )
+        else:
+            self.compressor.set_qk_scorers(
+                cache_config.compression_scorer,
+                num_q_per_kv=self.model_config.get_num_attention_heads(
+                    self.parallel_config) // num_kv_heads_per_rank,
+                snap_window=cache_config.compression_snap_window,
+                snap_kernel=cache_config.compression_snap_kernel,
+                ea_use_covariance=cache_config.compression_ea_use_covariance,
+                ea_use_vnorm=cache_config.compression_ea_use_vnorm,
+                ea_n_future_positions=(
+                    cache_config.compression_ea_n_future_positions),
+                ea_epsilon=cache_config.compression_ea_epsilon,
+            )
+        # Bind the same member->cluster map the FlashAttention builder uses so
+        # scoring max-pools over the physical clusters (cross-layer when a map
+        # is set; identity adjacency otherwise — bit-identical to before).
+        self.compressor.set_cluster_map(cache_config.head_group_cluster_map)
+
+        # Offline retention profiling (head-group clustering): when a dump
+        # directory is configured, observe every keep decision. None in
+        # production, so the keep-decision path stays untouched.
+        if cache_config.compression_retention_dump is not None:
+            from vllm.v1.attention.compression.profiling import (
+                RetentionProfileObserver)
+            # Tag dumps with the TP rank: each rank observes only its own KV-head
+            # shard, and all ranks share the dump directory.
+            self.compressor.keep_decision_observer = RetentionProfileObserver(
+                cache_config.compression_retention_dump,
+                rank=get_tensor_model_parallel_rank())
+
+        # Attach scorer pre-hooks to the compressible layers in ascending
+        # physical-layer order (matching the scorer ordering and the
+        # compressor's per-compressed-layer state). The hidden_states scorer
+        # hooks the outer block; the query/key scorer hooks the inner Attention
+        # — attach_scorers picks per scorer type.
+        static_parents = [layer_to_parent[i] for i in static_layer_ids]
+        static_inners = [layer_to_inner[i] for i in static_layer_ids]
+        self.compressor.attach_scorers(static_parents, static_inners)
 
         self.compression_executor = CompressionExecutor(
             num_layers=num_layers,
@@ -2791,6 +2920,7 @@ class GPUModelRunner(
             page_group_size=cache_config.page_group_size,
             head_size=head_size,
             block_size=block_size,
+            compressed_layer_ids=static_layer_ids,
         )
 
     def _begin_compression_step(
@@ -2810,8 +2940,12 @@ class GPUModelRunner(
         req_ids = self.input_batch.req_ids
         num_scheduled_tokens = scheduler_output.num_scheduled_tokens
         offsets: list[tuple[str, int, int]] = []
+        # ``req_id -> global position of this chunk's first scored token`` (the
+        # request's num_computed_tokens this step). Position-dependent qk
+        # scorers (StreamingLLM, ExpectedAttention) read it via the qk hook.
+        pos_offsets: dict[str, int] = {}
         cursor = 0
-        for req_id in req_ids:
+        for req_index, req_id in enumerate(req_ids):
             num_tokens = num_scheduled_tokens.get(req_id, 0)
             if num_tokens <= 0:
                 continue
@@ -2820,6 +2954,8 @@ class GPUModelRunner(
             cursor = end
             if req_id in compression_metadata:
                 offsets.append((req_id, start, end))
+                pos_offsets[req_id] = int(
+                    self.input_batch.num_computed_tokens_cpu[req_index])
 
         # First-chunk resets happen earlier in
         # ``_pre_prepare_compression_reset``; this only adds fresh state.
@@ -2829,6 +2965,7 @@ class GPUModelRunner(
 
         self.compressor.compress_active = True
         self.compressor.pending_req_offsets = offsets
+        self.compressor.pending_req_pos_offsets = pos_offsets
 
     def _pre_prepare_compression_reset(
         self,
@@ -2851,27 +2988,130 @@ class GPUModelRunner(
             if req_id in self.compressor.req_state:
                 self.compressor.end_request(req_id)
             self.compressor.begin_request(req_id)
-            if effective_seq_lens_cpu is not None:
-                row = self.input_batch.req_id_to_index.get(req_id)
-                if row is not None:
-                    effective_seq_lens_cpu[row, :] = 0
+            row = (self.input_batch.req_id_to_index.get(req_id)
+                   if effective_seq_lens_cpu is not None else None)
+            if effective_seq_lens_cpu is not None and row is not None:
+                effective_seq_lens_cpu[row, :] = 0
+
+    def _prev_kept_lengths(
+        self, req_id: str, num_static: int, num_groups: int
+    ) -> np.ndarray:
+        """Per-(compressible-layer, group) valid length as of the previous
+        compression boundary.
+
+        This is the authoritative pre-chunk length the keep arithmetic needs —
+        the ``kept_lengths`` the last eviction left, not the live
+        ``effective_seq_lens``. Sourcing it from compressor state is what lets
+        one compression chunk span multiple forward steps: during budget-sliced
+        sub-chunks ``effective_seq_lens`` holds the raw write extent (kept +
+        accumulated), while the decision needs the pre-chunk length.
+
+        ``cached_kept_lengths_cpu`` carries that value (already on the CPU and
+        cross-rank-MAX-reduced under tensor parallelism). It is set at the last
+        boundary and persists across sub-chunks: ``prepare_keep_decision`` clears
+        it only at its own end, which runs after this read. On the first chunk it
+        is ``None`` and we return zeros, matching the post-reset
+        ``effective_seq_lens``. In the common single-step chunk it equals
+        ``eff_phys[static_layer_ids]``, so the decision is byte-identical to the
+        pre-change path.
+
+        Returns ``[num_static, num_groups]`` int64.
+        """
+        cached_kept = self.compressor.req_state[req_id].cached_kept_lengths_cpu
+        if cached_kept is not None:
+            return cached_kept.astype(np.int64, copy=True)
+        return np.zeros((num_static, num_groups), dtype=np.int64)
+
+    def _expand_static_to_physical_lengths(
+        self,
+        eff_phys: np.ndarray,
+        this_step: int,
+        kept_lengths_static: np.ndarray,
+        static_layer_ids: np.ndarray,
+    ) -> np.ndarray:
+        """Rebuild the physical (all-layer) kept_lengths from the compressible
+        ones.
+
+        Compressible (full-attention) layers take their post-eviction lengths;
+        sliding-window layers keep their full KV and so grow by ``this_step``
+        (this forward's raw advance) on top of ``eff_phys`` (the pre-increment
+        value). ``this_step`` — not ``chunk_len`` — is correct because earlier
+        sub-chunks of the same compression chunk were already folded into
+        ``eff_phys``. For a dense model every layer is compressible, so the
+        static assignment overwrites the whole array.
+
+        Returns ``[num_layers, num_groups]`` int32.
+        """
+        kept_lengths_phys = (eff_phys + this_step).astype(np.int32)
+        kept_lengths_phys[static_layer_ids] = kept_lengths_static
+        return kept_lengths_phys
+
+    def _evict_sliding_window_blocks(
+        self,
+        block_table,
+        row_idx: int,
+        kept_lengths_phys: np.ndarray,
+    ) -> None:
+        """Free the sliding-window layers' out-of-window front KV blocks.
+
+        Under head-grouped paging the sliding-window layers keep full KV (they
+        are not compressed), but FlashAttention only attends to the last
+        ``sliding_window`` tokens, so the leading blocks outside the window are
+        dead weight. This returns them to the pool null-in-place — the in-window
+        tail keeps its block positions, so output is unchanged — and records the
+        freed ids on ``pending_sliding_freed_blocks`` for the scheduler's
+        ``null_blocks_by_ids`` (length-preserving).
+
+        No-op for a dense model (no sliding-window layers). The sliding length
+        is the full per-layer sequence length, uniform across the sliding-window
+        layers, so a single skip count covers all of them.
+        """
+        sliding_layer_ids = self.compression_sliding_layer_ids
+        if not sliding_layer_ids.size:
+            return
+        block_size = self.compression_executor.block_size
+        sliding_len = int(kept_lengths_phys[sliding_layer_ids[0], 0])
+        num_skipped_blocks = (
+            sliding_len - self.compression_sliding_window + 1) // block_size
+        if num_skipped_blocks <= 0:
+            return
+        freed = block_table.null_front_blocks_sliding(
+            row_idx=row_idx,
+            sliding_layer_ids=sliding_layer_ids,
+            num_head_groups_per_layer=(
+                self.compression_executor.num_head_groups_per_layer),
+            num_skipped_blocks=num_skipped_blocks,
+        )
+        if freed.size:
+            self.pending_sliding_freed_blocks.append(freed)
 
     def _run_compression_layer_loop(
         self,
         compression_metadata: dict[str, "CompressionRequestMetadata"],
         scheduler_output: "SchedulerOutput",
     ) -> None:
-        """Drive ``executor.run_request`` once per compression-active
-        request. Each request reads shared ``effective_seq_lens`` and
-        ``block_table`` and writes its updates into ``pending_*`` for the
-        post-forward fold-in.
+        """Drive ``executor.run_request`` once per request that closed a
+        compression-chunk boundary this step (``run_compression`` is True;
+        the caller passes only those). Each request evicts over its
+        accumulated ``compression_chunk_len`` and writes its updates into
+        ``pending_*`` for the post-forward fold-in. Budget-sliced sub-chunk
+        steps (``run_compression`` False) never reach here — their KV is
+        written raw and their gate scores accumulate in the compressor.
         """
         assert self.compressor is not None
         assert self.compression_executor is not None
         block_table = self.input_batch.block_table.block_tables[0]
         eff_seq_lens_cpu = self.input_batch.effective_seq_lens_cpu
         num_groups = self.compression_executor.num_head_groups_per_layer
-        num_layers = self.compression_executor.num_layers
+        num_layers = self.compression_executor.num_layers  # physical (all)
+        # Terminology used below: "physical" layers are all layers (the KV cache
+        # and block table span every one). "static" == "compressible" == the
+        # full-attention layers — the only ones the compressor scores and evicts
+        # (sliding-window layers keep their full KV). ``static_layer_ids`` holds
+        # their physical indices, so it maps a compressed position to its
+        # physical layer. For a dense model every layer is compressible and the
+        # static<->physical selects / expands below are identities.
+        static_layer_ids = self.compression_static_layer_ids
 
         tp_world_size = get_tensor_model_parallel_world_size()
         tp_group = get_tp_group() if tp_world_size > 1 else None
@@ -2879,7 +3119,12 @@ class GPUModelRunner(
 
         for req_id, req_md in compression_metadata.items():
             row_idx = self.input_batch.req_id_to_index[req_id]
-            chunk_len = scheduler_output.num_scheduled_tokens[req_id]
+            # ``this_step`` advances the (uncompressed) sliding-layer lengths;
+            # ``chunk_len`` is the accumulated span the eviction evaluates
+            # (== chunk_size for interior chunks). They differ only when budget
+            # sharing split this chunk across forward steps.
+            this_step = scheduler_output.num_scheduled_tokens[req_id]
+            chunk_len = req_md.compression_chunk_len
             metadata = CompressionMetadata(
                 req_id=req_id,
                 row_idx=row_idx,
@@ -2887,17 +3132,25 @@ class GPUModelRunner(
                 floor_min=req_md.floor_min,
             )
 
-            # Cross-layer KeepDecision; caches sorted indices + group
-            # scores for ``run_request``.
-            prev_seq_lens_per_layer = (
+            # The compressor scores/evicts only the compressible layers, so it
+            # is fed the per-(compressible-layer, group) lengths; sliding-window
+            # layers keep their full KV and are excluded. ``eff_phys`` is the
+            # physical (all-layer) view used to rebuild the sliding lengths.
+            eff_phys = (
                 eff_seq_lens_cpu[row_idx, :]
                 .astype(np.int64, copy=True)
                 .reshape(num_layers, num_groups)
             )
+            num_static = len(static_layer_ids)
+            prev_seq_lens_static = self._prev_kept_lengths(
+                req_id, num_static, num_groups)
+
+            # Cross-layer KeepDecision; caches sorted indices + group scores
+            # for ``run_request`` (indexed by compressible position).
             self.compressor.prepare_keep_decision(
                 req_id=req_id,
                 prev_seq_lens_per_layer=torch.from_numpy(
-                    prev_seq_lens_per_layer),
+                    prev_seq_lens_static),
                 chunk_len=chunk_len,
                 ratio=req_md.compression_ratio,
                 window_size=req_md.window_size,
@@ -2905,45 +3158,49 @@ class GPUModelRunner(
                 total_prompt_tokens=req_md.total_prompt_tokens,
             )
 
-            # Under TP, MAX-reduce kept_lengths across ranks so every
-            # worker frees the same block ids (the slot is shared across
-            # ranks for a given (req, layer, group_local)). No-op at TP=1.
-            kept_lengths_all = (
+            # Per-compressible-layer post-evict kept_lengths. Under TP,
+            # MAX-reduce across ranks so every worker frees the same block ids
+            # (the slot is shared across ranks for a given
+            # (req, layer, group_local)). No-op at TP=1.
+            kept_lengths_static = (
                 self.compressor.compute_kept_lengths_per_rank(
                     req_id=req_id,
-                    eff_seq_lens_row=eff_seq_lens_cpu[row_idx, :],
+                    eff_seq_lens_row=prev_seq_lens_static.reshape(-1),
                     chunk_len=chunk_len,
                     floor_min=req_md.floor_min,
                 )
             )
             if tp_world_size > 1:
                 kept_lengths_gpu = torch.from_numpy(
-                    kept_lengths_all).to(tp_device)
+                    kept_lengths_static).to(tp_device)
                 torch.distributed.all_reduce(
                     kept_lengths_gpu,
                     op=torch.distributed.ReduceOp.MAX,
                     group=tp_group.device_group,
                 )
-                kept_lengths_all = (
+                kept_lengths_static = (
                     kept_lengths_gpu.cpu().numpy().astype(np.int32))
                 self.compressor.req_state[
-                    req_id].cached_kept_lengths_cpu = kept_lengths_all
+                    req_id].cached_kept_lengths_cpu = kept_lengths_static
 
             self.compression_executor.run_request(
                 layer_kv_caches=self.kv_caches,
                 block_table=block_table,
-                eff_seq_lens_cpu=eff_seq_lens_cpu,
+                prev_seq_lens_static_cpu=prev_seq_lens_static,
                 compressor=self.compressor,
                 compression_metadata=metadata,
             )
+
+            kept_lengths_phys = self._expand_static_to_physical_lengths(
+                eff_phys, this_step, kept_lengths_static, static_layer_ids)
             self.pending_eff_seq_lens[req_id] = (
-                kept_lengths_all.reshape(-1))
+                kept_lengths_phys.reshape(-1))
 
             # Batched compact: one numpy scan over all (layer, group)
             # pairs instead of one Python call per layer.
             block_size = self.compression_executor.block_size
             new_num_blocks_per_layer = (
-                (kept_lengths_all + block_size - 1) // block_size
+                (kept_lengths_phys + block_size - 1) // block_size
             ).astype(np.int32)
             freed = block_table.compact_after_compress_all_layers(
                 row_idx=row_idx,
@@ -2952,6 +3209,12 @@ class GPUModelRunner(
             )
             if freed.size:
                 self.pending_freed_blocks.append(freed)
+
+            # Sliding-window eviction: free the sliding-window layers'
+            # out-of-window front blocks (kept full by compression but never
+            # attended past the window). No-op for dense models.
+            self._evict_sliding_window_blocks(
+                block_table, row_idx, kept_lengths_phys)
 
     def _postprocess_compress_updates(
         self,
@@ -2979,8 +3242,17 @@ class GPUModelRunner(
             )
         else:
             freed_block_ids = np.empty(0, dtype=np.int32)
+        # Sliding-window freed ids travel on their own channel (null-in-place,
+        # not the shrinking compression free) — see ``null_blocks_by_ids``.
+        if self.pending_sliding_freed_blocks:
+            self.last_sliding_freed_block_ids = np.unique(
+                np.concatenate(self.pending_sliding_freed_blocks)
+            )
+        else:
+            self.last_sliding_freed_block_ids = np.empty(0, dtype=np.int32)
         self.pending_eff_seq_lens.clear()
         self.pending_freed_blocks.clear()
+        self.pending_sliding_freed_blocks.clear()
         return new_eff_seq_lens, freed_block_ids
 
     def _end_compression_step(self) -> None:
@@ -2989,6 +3261,7 @@ class GPUModelRunner(
             return
         self.compressor.compress_active = False
         self.compressor.pending_req_offsets = None
+        self.compressor.pending_req_pos_offsets = None
 
     @contextmanager
     def _compression_step(self, scheduler_output, compression_metadata):
@@ -3100,6 +3373,7 @@ class GPUModelRunner(
         # ``llm.generate`` returns.
         self.last_compression_new_eff_seq_lens = {}
         self.last_compression_freed_block_ids = np.empty(0, dtype=np.int32)
+        self.last_sliding_freed_block_ids = np.empty(0, dtype=np.int32)
 
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         with record_function_or_nullcontext("gpu_model_runner: preprocess"):
@@ -3271,44 +3545,41 @@ class GPUModelRunner(
                     **model_kwargs,
                 )
 
-            # Post-forward: cache reorder per layer, then fold
-            # eff_seq_lens / freed blocks into the input batch. Touches
-            # cache memory only — this step's attention is already done.
-            if do_compression:
+            # Post-forward: cache reorder + eff_seq_lens fold-in. Touches cache
+            # memory only — this step's attention is already done.
+            #
+            # ``do_compression`` means "the gate scored this step" (any prefill
+            # chunk of a compression request). The actual eviction runs only for
+            # requests that closed a chunk_size boundary (``run_compression``);
+            # budget-sliced sub-chunk steps only accumulated scores and advance
+            # eff_seq_lens by their raw writes like any other prefill. This is
+            # what keeps every eviction a full chunk_size chunk.
+            effective_seq_lens_cpu = self.input_batch.effective_seq_lens_cpu
+            boundary_md = (
+                {rid: md for rid, md in compression_metadata.items()
+                 if md.run_compression}
+                if do_compression else {})
+            if boundary_md:
                 with record_function_or_nullcontext(
                         "gpu_model_runner: compression"):
                     self._run_compression_layer_loop(
-                        compression_metadata, scheduler_output)
+                        boundary_md, scheduler_output)
                     new_eff, freed = self._postprocess_compress_updates()
                     self.last_compression_new_eff_seq_lens = new_eff
                     self.last_compression_freed_block_ids = freed
-                    # In a mixed step the fold-in sets eff_seq_lens only
-                    # for compression rows; non-compression rows still
-                    # need their per-row scheduled tokens added so the
-                    # next step's slot_mapping advances past their writes.
-                    effective_seq_lens_cpu = (
-                        self.input_batch.effective_seq_lens_cpu)
-                    if effective_seq_lens_cpu is not None:
-                        increments = (
-                            self._build_effective_seq_lens_increments(
-                                scheduler_output.num_scheduled_tokens,
-                                exclude=compression_metadata))
-                        if increments is not None:
-                            effective_seq_lens_cpu[
-                                :self.input_batch.num_reqs] += (
-                                    increments[:, None])
-            else:
-                # Advance ``effective_seq_lens_cpu`` by the per-row
-                # scheduled token count so the next step's slot_mapping
-                # and ``seq_lens_grouped`` see the post-write cache view.
-                effective_seq_lens_cpu = (
-                    self.input_batch.effective_seq_lens_cpu)
-                if effective_seq_lens_cpu is not None:
-                    increments = self._build_effective_seq_lens_increments(
-                        scheduler_output.num_scheduled_tokens)
-                    if increments is not None:
-                        effective_seq_lens_cpu[
-                            :self.input_batch.num_reqs] += increments[:, None]
+            # Advance ``effective_seq_lens_cpu`` by the raw scheduled tokens for
+            # every row written this step but NOT folded by the eviction above:
+            # decoders, sub-chunk prefills, and co-scheduled requests in a mixed
+            # step. Boundary rows are excluded — the fold-in already set their
+            # post-evict lengths. This keeps the next step's slot_mapping and
+            # ``seq_lens_grouped`` aligned with the post-write cache view.
+            if effective_seq_lens_cpu is not None:
+                increments = self._build_effective_seq_lens_increments(
+                    scheduler_output.num_scheduled_tokens,
+                    exclude=boundary_md or None)
+                if increments is not None:
+                    effective_seq_lens_cpu[
+                        :self.input_batch.num_reqs] += increments[:, None]
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:
@@ -3529,6 +3800,13 @@ class GPUModelRunner(
             compression_freed_block_ids_payload = (
                 self.last_compression_freed_block_ids
             )
+        # Sliding-window freed ids ride their own field (null-in-place on the
+        # scheduler), independent of whether compression evicted this step.
+        sliding_freed_block_ids_payload: np.ndarray | None = (
+            self.last_sliding_freed_block_ids
+            if self.last_sliding_freed_block_ids.size
+            else None
+        )
 
         with record_function_or_nullcontext("gpu_model_runner: ModelRunnerOutput"):
             output = ModelRunnerOutput(
@@ -3545,6 +3823,7 @@ class GPUModelRunner(
                 num_nans_in_logits=num_nans_in_logits,
                 compression_new_eff_seq_lens=compression_new_eff_seq_lens_payload,
                 compression_freed_block_ids=compression_freed_block_ids_payload,
+                sliding_freed_block_ids=sliding_freed_block_ids_payload,
             )
 
         if not self.use_async_scheduling:
@@ -5378,21 +5657,34 @@ class GPUModelRunner(
                     )
                     kernel_num_blocks = num_blocks * num_blocks_per_kv_block
 
-                    # Head-grouped paging stores ``page_group_size`` KV
-                    # heads per block instead of the layer's full
-                    # ``num_kv_heads``.
+                    dtype = kv_cache_spec.dtype
                     if isinstance(kv_cache_spec, HeadGroupedAttentionSpec):
-                        per_block_kv_heads = kv_cache_spec.page_group_size
-                    else:
-                        per_block_kv_heads = kv_cache_spec.num_kv_heads
+                        # Column-major head-grouped page: the
+                        # page_group_size (column) dimension sits outside
+                        # block_size so each (physical block, column) pair is
+                        # a contiguous virtual block. Allocated contiguous —
+                        # the NHD/HND stride-order permutation does not apply
+                        # to this layout. See
+                        # vllm/v1/attention/backends/head_grouped_layout.py.
+                        kv_cache_shape = column_major_cache_shape(
+                            kernel_num_blocks,
+                            kernel_block_size,
+                            kv_cache_spec.page_group_size,
+                            kv_cache_spec.head_size,
+                        )
+                        kv_caches[layer_name] = (
+                            kv_cache_raw_tensors[layer_name]
+                            .view(dtype)
+                            .view(kv_cache_shape)
+                        )
+                        continue
                     kv_cache_shape = attn_backend.get_kv_cache_shape(
                         kernel_num_blocks,
                         kernel_block_size,
-                        per_block_kv_heads,
+                        kv_cache_spec.num_kv_heads,
                         kv_cache_spec.head_size,
                         cache_dtype_str=self.cache_config.cache_dtype,
                     )
-                    dtype = kv_cache_spec.dtype
                     try:
                         kv_cache_stride_order = attn_backend.get_kv_cache_stride_order()
                         assert len(kv_cache_stride_order) == len(kv_cache_shape)

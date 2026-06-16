@@ -191,6 +191,37 @@ class Scheduler(SchedulerInterface):
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
         self.use_v2_model_runner = envs.VLLM_USE_V2_MODEL_RUNNER
 
+    def _compression_chunk_cap(
+        self,
+        num_computed_tokens: int,
+        num_prompt_tokens: int,
+        num_new_tokens: int,
+    ) -> int:
+        """Cap a prefill step at the distance to the next compression boundary.
+
+        Compression-mode prefill must close every chunk exactly on a
+        ``compression_chunk_size`` multiple. When budget sharing forces a short
+        sub-chunk, the next chunk realigns to the boundary instead of straddling
+        it, so each compressed chunk stays a full ``chunk_size`` — byte-equivalent
+        to the serial, unchunked baseline. For an unsliced request the cap equals
+        the full chunk size (boundary offset 0).
+
+        Returns ``num_new_tokens`` unchanged when compression is off, when the
+        request is past its prompt (a decode step, which is never chunk-capped),
+        or when the next boundary already lies beyond the requested span.
+        """
+        if not (
+            self.cache_config.enable_compression
+            and self.cache_config.compression_chunk_size is not None
+            and num_computed_tokens < num_prompt_tokens
+        ):
+            return num_new_tokens
+        chunk_size = int(self.cache_config.compression_chunk_size)
+        chunk_cap = chunk_size - (num_computed_tokens % chunk_size)
+        if 0 < chunk_cap < num_new_tokens:
+            return chunk_cap
+        return num_new_tokens
+
     def schedule(self) -> SchedulerOutput:
         # NOTE(woosuk) on the scheduling algorithm:
         # There's no "decoding phase" nor "prefill phase" in the scheduler.
@@ -236,18 +267,11 @@ class Scheduler(SchedulerInterface):
             )
             if 0 < self.scheduler_config.long_prefill_token_threshold < num_new_tokens:
                 num_new_tokens = self.scheduler_config.long_prefill_token_threshold
-            # Compression-mode prefill is capped by
-            # ``compression_chunk_size`` so per-chunk eviction stays
-            # predictable. Decode chunks (num_computed >= num_prompt) skip
-            # this branch entirely.
-            if (
-                self.cache_config.enable_compression
-                and self.cache_config.compression_chunk_size is not None
-                and request.num_computed_tokens < request.num_prompt_tokens
-            ):
-                chunk_cap = int(self.cache_config.compression_chunk_size)
-                if 0 < chunk_cap < num_new_tokens:
-                    num_new_tokens = chunk_cap
+            num_new_tokens = self._compression_chunk_cap(
+                request.num_computed_tokens,
+                request.num_prompt_tokens,
+                num_new_tokens,
+            )
             num_new_tokens = min(num_new_tokens, token_budget)
 
             # Make sure the input position does not exceed the max model len or
@@ -537,16 +561,13 @@ class Scheduler(SchedulerInterface):
                     if 0 < threshold < num_new_tokens:
                         num_new_tokens = threshold
 
-                    # Same chunk cap as the RUNNING path; applied here so a
-                    # single-step admission doesn't bypass it.
-                    if (
-                        self.cache_config.enable_compression
-                        and self.cache_config.compression_chunk_size is not None
-                        and num_computed_tokens < request.num_prompt_tokens
-                    ):
-                        chunk_cap = int(self.cache_config.compression_chunk_size)
-                        if 0 < chunk_cap < num_new_tokens:
-                            num_new_tokens = chunk_cap
+                    # Applied here too so a single-step admission doesn't bypass
+                    # the boundary-aligned cap the RUNNING path enforces.
+                    num_new_tokens = self._compression_chunk_cap(
+                        num_computed_tokens,
+                        request.num_prompt_tokens,
+                        num_new_tokens,
+                    )
 
                     # chunked prefill has to be enabled explicitly to allow
                     # pooling requests to be chunked
@@ -799,6 +820,20 @@ class Scheduler(SchedulerInterface):
         Once-only policy: compression fires only over the first prefill
         cycle; ``compression_done`` (set sticky in ``update_from_output``)
         gates every subsequent step.
+
+        ``chunk_in_sequence_idx`` is a first-prefill-chunk flag: the worker
+        resets a request's per-request compression state (and zeroes its
+        ``effective_seq_lens``) only when this value is 0. It must therefore be
+        0 on exactly the genuine first chunk (``num_computed_tokens == 0``) and
+        nonzero afterwards. It is deliberately NOT ``num_computed_tokens //
+        chunk_size``: when the token budget is shared, a prefill chunk can be
+        smaller than ``compression_chunk_size`` (a co-scheduled request's chunk
+        tail leaves under a full chunk for this one), and that formula then
+        stays 0 across the first two sub-chunks — firing a spurious mid-prefill
+        reset that zeroes ``effective_seq_lens`` and makes the next chunk
+        overwrite already-written KV (degenerate output). A preempt-resume also
+        re-enters at ``num_computed_tokens == 0``, so the flag still fires
+        correctly there.
         """
         if not self.cache_config.enable_compression:
             return
@@ -807,15 +842,27 @@ class Scheduler(SchedulerInterface):
         # Decode chunk (prefill already finished): no compression.
         if request.num_computed_tokens >= request.num_prompt_tokens:
             return
-        chunk_in_seq_idx = (
-            request.num_computed_tokens // self.cache_config.compression_chunk_size
-            if self.cache_config.compression_chunk_size
-            else 0
-        )
-        is_last_chunk = (
-            request.num_computed_tokens + num_new_tokens
-            >= request.num_prompt_tokens
-        )
+        # First-prefill-chunk flag (see docstring): 0 only on the genuine first
+        # chunk, nonzero otherwise. Deliberately not a chunk-index division.
+        chunk_in_seq_idx = 0 if request.num_computed_tokens == 0 else 1
+        end = request.num_computed_tokens + num_new_tokens
+        is_last_chunk = end >= request.num_prompt_tokens
+        # Eviction runs only when this step closes a full chunk_size boundary
+        # (``end`` is a chunk_size multiple) or the prompt end; intermediate
+        # budget-sliced sub-chunks only accumulate gate scores in the worker.
+        # ``compression_chunk_len`` is the span since the previous boundary —
+        # always ``chunk_size`` for interior chunks (the boundary-aligned cap
+        # above guarantees no step straddles a boundary), the remainder for the
+        # last chunk. This makes every eviction a full-chunk_size chunk,
+        # matching the serial baseline's chunk sequence exactly.
+        chunk_size = int(self.cache_config.compression_chunk_size or 0)
+        if chunk_size > 0:
+            run_compression = (end % chunk_size == 0) or is_last_chunk
+            last_boundary = ((end - 1) // chunk_size) * chunk_size
+            compression_chunk_len = end - last_boundary
+        else:
+            run_compression = True
+            compression_chunk_len = int(num_new_tokens)
         compression_metadata[request.request_id] = CompressionRequestMetadata(
             req_id=request.request_id,
             compression_ratio=float(self.cache_config.compression_ratio),
@@ -824,6 +871,8 @@ class Scheduler(SchedulerInterface):
             floor_min=int(self.cache_config.compression_floor_min or 0),
             chunk_in_sequence_idx=int(chunk_in_seq_idx),
             is_last_chunk=bool(is_last_chunk),
+            run_compression=bool(run_compression),
+            compression_chunk_len=int(compression_chunk_len),
             total_prompt_tokens=int(request.num_prompt_tokens),
         )
 
@@ -1156,6 +1205,19 @@ class Scheduler(SchedulerInterface):
             self.kv_cache_manager.free_blocks_by_ids(
                 freed_ids,
                 candidate_req_ids=candidate_req_ids,
+            )
+
+        # Sliding-window eviction frees out-of-window front blocks of the
+        # sliding-window layers. Unlike compression, the per-request block
+        # array stays full length (the freed slots become the null block), so
+        # this routes through ``null_blocks_by_ids`` (null-in-place) rather than
+        # ``free_blocks_by_ids`` (which would shrink the array and let the next
+        # allocation re-grow the front).
+        sliding_freed_ids = model_runner_output.sliding_freed_block_ids
+        if sliding_freed_ids is not None and sliding_freed_ids.size > 0:
+            self.kv_cache_manager.null_blocks_by_ids(
+                sliding_freed_ids,
+                candidate_req_ids=None,
             )
 
         # Keep ``compress_max_eff_seq_len`` in sync with cache occupancy on

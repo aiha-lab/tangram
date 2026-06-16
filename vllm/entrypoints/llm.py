@@ -223,6 +223,7 @@ class LLM:
         logits_processors: list[str | type[LogitsProcessor]] | None = None,
         # Head-group paging, compression, multi-turn.
         page_group_size: int | None = None,
+        head_group_cluster_map: str | None = None,
         enable_compression: bool = False,
         compression_ratio: float = 0.3,
         compression_window_size: int = 32,
@@ -345,6 +346,7 @@ class LLM:
             compilation_config=compilation_config_instance,
             logits_processors=logits_processors,
             page_group_size=page_group_size,
+            head_group_cluster_map=head_group_cluster_map,
             enable_compression=enable_compression,
             compression_ratio=compression_ratio,
             compression_window_size=compression_window_size,

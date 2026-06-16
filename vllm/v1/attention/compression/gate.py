@@ -2,10 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Compression gate module — per-layer importance score MLP.
 
-Loads checkpoints in the format used by ``Jang-Hyun/Fast-KVzip``.
-Architecture: q_proj/k_proj with weight-only RMSNorm, sink-anchor
-``k_base``, per-head bias ``b``; score is a sigmoid-like over
-(logit − logit_base) averaged across groups."""
+Architecture (Fast-KVzip gate): q_proj/k_proj with weight-only RMSNorm,
+sink-anchor ``k_base``, per-head bias ``b``; score is a sigmoid-like over
+(logit − logit_base) averaged across groups. Trained checkpoints are
+downloaded from the ``hmkim97/tangram-gate`` Hub repo."""
 from __future__ import annotations
 
 import math
@@ -18,6 +18,10 @@ from torch import nn
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
+
+# Hub repo hosting the trained gate checkpoints, laid out as per-model
+# subdirectories (e.g. ``qwen3-4b-instruct-2507/q4_dim16_sink16.pt``).
+_GATE_HF_REPO = "hmkim97/tangram-gate"
 
 
 class _RMSNorm(nn.Module):
@@ -42,6 +46,11 @@ class CompressionGate(nn.Module):
     Input:  hidden_states ``[T, hidden_dim]`` or ``[1, T, hidden_dim]``.
     Output: scores ``[num_kv_heads, T]``.
     """
+
+    # Axis-2 dispatch: the gate hooks the outer attention block, which
+    # exposes hidden_states.
+    consumes = "hidden_states"
+    name = "fastkvzip"
 
     def __init__(
         self,
@@ -119,8 +128,7 @@ class CompressionGate(nn.Module):
 
 def _resolve_gate_filename(model_name: str, gate_path: str) -> str:
     # "fastkvzip" → derive "{model_short}/q{num_groups}_dim16_sink16.pt"
-    # from the model's GQA ratio, matching the Jang-Hyun/Fast-KVzip
-    # upload layout.
+    # from the model's GQA ratio, matching the tangram-gate upload layout.
     if gate_path != "fastkvzip":
         return gate_path
     from transformers import AutoConfig
@@ -134,15 +142,15 @@ def _resolve_gate_filename(model_name: str, gate_path: str) -> str:
 
 
 def _download_or_local(model_name: str, gate_path: str) -> str:
-    # Priority: (1) absolute local path, (2) HuggingFace Hub
-    # Jang-Hyun/Fast-KVzip, (3) ~/FastKVzip/result_gate fallback.
+    # Priority: (1) absolute local path, (2) the tangram-gate Hub repo,
+    # (3) ~/FastKVzip/result_gate local fallback.
     if os.path.isabs(gate_path) and os.path.exists(gate_path):
         return gate_path
     resolved = _resolve_gate_filename(model_name, gate_path)
     try:
         from huggingface_hub import hf_hub_download
         return hf_hub_download(
-            repo_id="Jang-Hyun/Fast-KVzip",
+            repo_id=_GATE_HF_REPO,
             filename=resolved,
             repo_type="model",
         )
@@ -153,8 +161,8 @@ def _download_or_local(model_name: str, gate_path: str) -> str:
             return fallback
         raise FileNotFoundError(
             f"Compression gate checkpoint '{gate_path}' (resolved to "
-            f"'{resolved}') not found on HuggingFace Hub and no local "
-            f"fallback at '{fallback}'.") from e
+            f"'{resolved}') not found in the {_GATE_HF_REPO} Hub repo and no "
+            f"local fallback at '{fallback}'.") from e
 
 
 def _shard_gate_state_dict(

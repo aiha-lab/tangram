@@ -226,6 +226,32 @@ class BlockTable:
             self.num_blocks_per_row[row_idx] = 0
         self.append_row(block_ids, row_idx)
 
+    def snapshot_row(self, row_idx: int) -> tuple[np.ndarray, np.ndarray]:
+        """Capture a row's exact block ids + per-group fill counts.
+
+        Head-grouped paging only. A compressed request's per-group block
+        counts are non-uniform (each cluster evicts independently), and the
+        flat ``CachedRequestState.block_ids`` list cannot reconstruct that
+        layout via ``add_row`` (which fills groups uniformly, group-major).
+        When such a request is dropped from the persistent batch (it skipped
+        a step) we snapshot its live row here and ``restore_row`` it on
+        re-add, preserving the exact (cluster, slot) -> block id mapping the
+        KV already lives at."""
+        assert self.head_grouped, "snapshot_row is head-grouped only."
+        return (
+            self.block_table.np[row_idx, :, :].copy(),
+            self.num_blocks_per_row[row_idx, :].copy(),
+        )
+
+    def restore_row(
+        self, row_idx: int, snapshot: tuple[np.ndarray, np.ndarray]
+    ) -> None:
+        """Write back a row captured by :meth:`snapshot_row`."""
+        assert self.head_grouped, "restore_row is head-grouped only."
+        block_ids_np, counts = snapshot
+        self.block_table.np[row_idx, :, :] = block_ids_np
+        self.num_blocks_per_row[row_idx, :] = counts
+
     def move_row(self, src: int, tgt: int) -> None:
         if self.head_grouped:
             block_table_np = self.block_table.np
@@ -468,6 +494,66 @@ class BlockTable:
             new_counts.reshape(-1))
         return freed_ids
 
+    def null_front_blocks_sliding(
+        self,
+        row_idx: int,
+        sliding_layer_ids: np.ndarray,
+        num_head_groups_per_layer: int,
+        num_skipped_blocks: int,
+    ) -> np.ndarray:
+        """Free out-of-window front blocks of sliding-window layers in place.
+
+        For a sliding-window layer, FlashAttention only attends to the last
+        ``sliding_window`` tokens, so blocks holding tokens entirely before the
+        window are never read and their physical blocks can be returned to the
+        pool. Unlike ``compact_after_compress_all_layers`` (which keeps the
+        front and shrinks the tail), this keeps the in-window TAIL and nulls the
+        FRONT: the freed leading entries are set to the null block (id 0) while
+        ``num_blocks_per_row`` stays unchanged, so the position -> block mapping
+        of the surviving tail is preserved (no token-position remap, output
+        unchanged).
+
+        Args:
+            row_idx: persistent-batch row of the request.
+            sliding_layer_ids: physical indices of the sliding-window layers.
+            num_head_groups_per_layer: groups (page columns) per layer; the
+                group axis of the head-grouped block table is
+                ``layer * num_head_groups_per_layer + group``.
+            num_skipped_blocks: number of leading blocks now outside the window,
+                ``(num_computed_tokens - sliding_window + 1) // block_size``;
+                uniform across every sliding layer and group (single window).
+
+        Returns:
+            int32 ndarray of the freed physical block ids (null id 0 excluded),
+            to be returned to the pool and null-in-placed in the manager's
+            per-request array. Empty when there is nothing to free.
+        """
+        assert self.head_grouped, (
+            "null_front_blocks_sliding is head-grouped only.")
+        if num_skipped_blocks <= 0 or sliding_layer_ids.size == 0:
+            return np.empty(0, dtype=np.int32)
+        ngpl = num_head_groups_per_layer
+        # Flat group rows of every sliding layer: layer*ngpl + [0..ngpl).
+        group_rows = (
+            sliding_layer_ids.astype(np.int64)[:, None] * ngpl
+            + np.arange(ngpl, dtype=np.int64)[None, :]
+        ).reshape(-1)
+        # Fancy indexing returns a copy (rows are non-contiguous), so modify the
+        # copy and assign it back. Clamp the freed range per row to its actual
+        # fill so we never touch unallocated columns.
+        row_view = self.block_table.np[row_idx, group_rows, :]
+        counts = self.num_blocks_per_row[row_idx, group_rows]
+        col_axis = np.arange(row_view.shape[1])
+        skip = np.minimum(counts.astype(np.int64), num_skipped_blocks)
+        front_mask = col_axis[None, :] < skip[:, None]
+        freed = row_view[front_mask]
+        freed = freed[freed != 0].astype(np.int32, copy=True)
+        row_view[front_mask] = 0
+        self.block_table.np[row_idx, group_rows, :] = row_view
+        # ``num_blocks_per_row`` is intentionally left unchanged (the surviving
+        # tail keeps its column positions).
+        return freed
+
     @staticmethod
     def map_to_kernel_blocks(
         kv_manager_block_ids: np.ndarray,
@@ -611,6 +697,18 @@ class MultiGroupBlockTable:
             return
         for i, block_table in enumerate(self.block_tables):
             block_table.add_row(block_ids[i], row_idx)
+
+    def snapshot_row(self, row_idx: int) -> tuple[np.ndarray, np.ndarray]:
+        """Head-grouped paging keeps every layer/group in ``block_tables[0]``."""
+        assert self.head_grouped, "snapshot_row is head-grouped only."
+        return self.block_tables[0].snapshot_row(row_idx)
+
+    def restore_row(
+        self, row_idx: int, snapshot: tuple[np.ndarray, np.ndarray]
+    ) -> None:
+        """Head-grouped paging keeps every layer/group in ``block_tables[0]``."""
+        assert self.head_grouped, "restore_row is head-grouped only."
+        self.block_tables[0].restore_row(row_idx, snapshot)
 
     def move_row(self, src: int, tgt: int) -> None:
         for block_table in self.block_tables:

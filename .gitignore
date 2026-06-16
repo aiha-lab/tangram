@@ -215,6 +215,20 @@ hip_compat.h
 # Benchmark dataset
 benchmarks/**/*.json
 
+# Tangram benchmark result outputs
+benchmarks/tangram/results_*/
+benchmarks/tangram/ruler_summary*.txt
+examples/tangram/benchmark_results.jsonl
+examples/tangram/online_serving.sh
+
+# Tangram figure/profile artifacts (plots, scripts, intermediate profiles)
+benchmarks/tangram/data/
+
+# Tangram internal sweep drivers (host-specific; not for public release)
+benchmarks/tangram/run_ruler_sweep.py
+benchmarks/tangram/run_uniform_sweep.py
+benchmarks/tangram/summarize_ruler_sweep.py
+
 # Linting
 actionlint
 shellcheck*/

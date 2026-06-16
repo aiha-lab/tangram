@@ -176,6 +176,19 @@ class CompressionRequestMetadata:
     floor_min: int
     chunk_in_sequence_idx: int
     is_last_chunk: bool
+    # When True, this step closes a full ``compression_chunk_size`` boundary
+    # (or the prompt end), so the worker runs the keep-decision + eviction
+    # over ``compression_chunk_len`` accumulated tokens. When False, this is a
+    # budget-sliced sub-chunk: the gate still scores its tokens (accumulated
+    # in the compressor) but no eviction runs. Decoupling the two keeps every
+    # compression step a full ``chunk_size`` chunk — byte-equivalent to the
+    # serial baseline regardless of how the scheduler sliced the prefill.
+    run_compression: bool = True
+    # Tokens accumulated since the last compression boundary (== the chunk the
+    # worker evicts when ``run_compression`` is True): ``chunk_size`` for
+    # interior chunks, the remainder for the last chunk. Differs from this
+    # step's scheduled token count only when budget sharing split the chunk.
+    compression_chunk_len: int = 0
     # Total prompt length of this request's first prefill cycle, for
     # logging only.
     total_prompt_tokens: int = 0

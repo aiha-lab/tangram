@@ -49,6 +49,77 @@ def is_valid_kv_cache_layout(value: str) -> bool:
     return value in get_args(KVCacheLayoutType)
 
 
+def full_attention_layer_indices(vllm_config: VllmConfig) -> list[int]:
+    """Physical indices of the model's full-attention decoder layers, ascending.
+
+    A layer is full-attention when its ``Attention`` module has
+    ``sliding_window is None`` — the single signal used to decide which layers
+    are compressible by FastKVZip (and therefore carry a head-group cluster
+    map). This is the shared source of truth for that decision: the compression
+    engine (``GPUModelRunner._init_compression``) and the head-grouped
+    FlashAttention metadata builder both call it, so their static-layer sets
+    cannot drift. For a dense model every layer is full-attention, so the result
+    is ``range(num_decoder_layers)``.
+
+    Modules whose name carries no decoder layer index (e.g. encoder-only
+    attention) are skipped.
+    """
+    from vllm.attention.layer import Attention
+    from vllm.model_executor.models.utils import extract_layer_index
+
+    attention_layers = get_layers_from_vllm_config(vllm_config, Attention)
+    indices: list[int] = []
+    for layer_name, module in attention_layers.items():
+        try:
+            layer_index = extract_layer_index(layer_name)
+        except (AssertionError, ValueError):
+            continue
+        if getattr(module, "sliding_window", None) is None:
+            indices.append(layer_index)
+    return sorted(indices)
+
+
+def sliding_window_layers(vllm_config: VllmConfig) -> tuple[list[int], int]:
+    """Physical indices of the model's sliding-window decoder layers (ascending)
+    and their shared window size.
+
+    The exact complement of ``full_attention_layer_indices``: a layer is
+    sliding-window when its ``Attention`` module has ``sliding_window`` set.
+    These layers are not compressed by FastKVZip (they keep full KV within the
+    window); the sliding-window KV eviction
+    (``BlockTable.null_front_blocks_sliding`` driven by
+    ``GPUModelRunner._run_compression_layer_loop``) frees their out-of-window
+    blocks. Defined next to ``full_attention_layer_indices`` so the
+    full-vs-sliding layer split has one source of truth.
+
+    A single window across all sliding-window layers is assumed (e.g. gemma-3:
+    1024); a model mixing window sizes raises ``NotImplementedError``. Returns
+    ``([], 0)`` for a dense model (no sliding-window layers). Modules whose name
+    carries no decoder layer index are skipped, matching
+    ``full_attention_layer_indices``.
+    """
+    from vllm.attention.layer import Attention
+    from vllm.model_executor.models.utils import extract_layer_index
+
+    attention_layers = get_layers_from_vllm_config(vllm_config, Attention)
+    indices: list[int] = []
+    windows: set[int] = set()
+    for layer_name, module in attention_layers.items():
+        try:
+            layer_index = extract_layer_index(layer_name)
+        except (AssertionError, ValueError):
+            continue
+        window = getattr(module, "sliding_window", None)
+        if window is not None:
+            indices.append(layer_index)
+            windows.add(int(window))
+    if len(windows) > 1:
+        raise NotImplementedError(
+            "Sliding-window KV eviction assumes a single window across the "
+            f"sliding-window layers; got {sorted(windows)}.")
+    return sorted(indices), (int(next(iter(windows))) if windows else 0)
+
+
 @dataclass
 class CommonAttentionMetadata:
     """

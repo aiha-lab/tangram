@@ -53,6 +53,16 @@ class CachedRequestState:
     # held only while the request is out of the InputBatch (the batch row
     # is otherwise the source of truth). None when head-group paging is off.
     eff_seq_lens_snapshot: np.ndarray | None = None
+    # Head-grouped paging: exact per-group block_table row (block ids +
+    # fill counts) captured when the request leaves the InputBatch, so a
+    # re-add restores the precise (possibly compression-compacted, non-
+    # uniform) layout instead of reconstructing it from the flat ``block_ids``
+    # via ``add_row`` (which fills groups uniformly and would scramble a
+    # compacted request's KV). None when head-group paging is off.
+    block_table_snapshot: tuple[np.ndarray, np.ndarray] | None = None
+    # Head-grouped paging: this step's newly allocated block ids for a
+    # request being re-added, appended after ``restore_row``.
+    block_table_readd_increment: tuple[list[int], ...] | None = None
 
     def __post_init__(self):
         self.num_prompt_tokens = length_from_prompt_token_ids_or_embeds(
@@ -367,7 +377,22 @@ class InputBatch:
         self.num_tokens_no_spec[req_index] = request.num_tokens
 
         self.num_computed_tokens_cpu[req_index] = request.num_computed_tokens
-        self.block_table.add_row(request.block_ids, req_index)
+        if request.block_table_snapshot is not None:
+            # Re-add of a request that left the batch: restore its exact
+            # per-group layout, then append this step's freshly allocated
+            # blocks via the normal incremental path. add_row's uniform,
+            # group-major fill cannot reconstruct a compacted layout from the
+            # flat block_ids list.
+            self.block_table.restore_row(
+                req_index, request.block_table_snapshot
+            )
+            increment = request.block_table_readd_increment
+            if increment is not None and increment[0]:
+                self.block_table.append_row(increment, req_index)
+            request.block_table_snapshot = None
+            request.block_table_readd_increment = None
+        else:
+            self.block_table.add_row(request.block_ids, req_index)
 
         # Hand any out-of-batch snapshot back to the batch row, then clear
         # the request-side mirror; first-time entries start at zero.
@@ -514,6 +539,11 @@ class InputBatch:
                 req_index, :
             ].copy()
             self.effective_seq_lens_cpu[req_index, :] = 0
+            # Preserve the exact per-group block layout so the re-add restores
+            # it verbatim (see ``block_table_snapshot`` on CachedRequestState).
+            cached_state.block_table_snapshot = self.block_table.snapshot_row(
+                req_index
+            )
 
         self.batch_update_builder.removed_append(req_index)
         self._req_ids[req_index] = None

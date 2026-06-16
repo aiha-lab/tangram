@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Attention layer with FlashAttention."""
 
+import copy
 from dataclasses import dataclass, replace as dataclass_replace
 from typing import ClassVar
 
@@ -41,10 +42,22 @@ from vllm.model_executor.layers.batch_invariant import (
 )
 from vllm.platforms.interface import DeviceCapability
 from vllm.utils.math_utils import cdiv
+from vllm.v1.attention.backends.head_grouped_layout import (
+    as_virtual_block_view,
+    identity_member_maps,
+    load_cluster_map,
+    member_maps_from_cluster_map,
+    member_seq_lens,
+    member_virtual_block_table,
+    member_virtual_slots,
+    physical_member_maps_from_static_cluster_map,
+    read_cluster_map_static_layer_ids,
+)
 from vllm.v1.attention.backends.utils import (
     AttentionCGSupport,
     AttentionMetadataBuilder,
     CommonAttentionMetadata,
+    full_attention_layer_indices,
     get_dcp_local_seq_lens,
     get_kv_cache_layout,
 )
@@ -155,9 +168,15 @@ class FlashAttentionBackend(AttentionBackend):
 
     @classmethod
     def supports_sink(cls) -> bool:
-        if not is_flash_attn_varlen_func_available():
-            return False
-        return flash_attn_supports_sinks()
+        # Attention sinks are handled either by FlashAttention 3's native
+        # ``s_aux`` (Hopper+) or, on older GPUs, by an exact post-hoc rescale of
+        # the output using the returned softmax log-sum-exp
+        # (``FlashAttentionImpl._apply_sink_lse_correction``). Both only need the
+        # varlen entry point, so sinks are supported wherever it is available —
+        # not just on FA3. This lets sink models (e.g. gpt-oss) use the
+        # FlashAttention backend on pre-Hopper hardware, which the
+        # FlashAttention-only head-group paging path requires.
+        return is_flash_attn_varlen_func_available()
 
     @classmethod
     def supports_compute_capability(cls, capability: DeviceCapability) -> bool:
@@ -175,8 +194,16 @@ class FlashAttentionBackend(AttentionBackend):
         use_sparse: bool,
         device_capability: DeviceCapability,
     ) -> str | None:
-        if has_sink and device_capability < DeviceCapability(9, 0):
-            return "sink not supported on compute capability < 9.0"
+        # Attention sinks: FlashAttention 3 (Hopper+) handles them natively via
+        # the kernel's ``s_aux`` argument. On older GPUs (e.g. A100, where only
+        # FA2 is available) the impl recovers the identical result by rescaling
+        # the output with the returned log-sum-exp — see
+        # ``FlashAttentionImpl._apply_sink_lse_correction``. So sinks are
+        # supported on every compute capability FlashAttention itself supports,
+        # and no longer gate this backend out (which previously forced
+        # sink models such as gpt-oss onto the Triton backend on pre-Hopper
+        # hardware, and made head-group paging — FlashAttention-only — unusable
+        # for them).
         return None
 
 
@@ -217,26 +244,36 @@ class FlashAttentionMetadata:
     causal: bool = True
 
     # Head-grouped paging fields. Inactive when
-    # ``num_head_groups_per_layer == 0``; layout selected by
-    # ``head_grouped_decode_layout``:
+    # ``num_head_groups_per_layer == 0``. A sequence is one (req, KV-head)
+    # member (member row ``m = L * num_kv_heads + h``), not (req, group).
     #
-    #   False (prefill / mixed) — group-major:
-    #     block_table_grouped  [num_head_groups_total, num_reqs, max_blocks]
-    #     seq_lens_grouped     [num_head_groups_total, num_reqs]
-    #     slot_mapping_grouped [num_head_groups_total, num_actual_tokens]
-    #     Per-layer slice ``[L*n : (L+1)*n]`` flattens to varlen.
+    # Each attention call builds its own layer's virtual block table on demand
+    # (``member_virtual_block_table``); the all-member table is never stored, as
+    # it replicates the physical table page_group_size-fold and dominates peak
+    # memory at long context. Stored inputs:
+    #     cluster_block_table  [num_reqs, num_clusters_total, max_blocks]
+    #     clusters_per_layer   [num_layers, num_kv_heads]  (member -> cluster)
+    #     cols_per_layer       [num_layers, num_kv_heads]  (member -> column)
+    #     layer block table = phys_block[req, cluster] * page_group_size + column
     #
-    #   True (uniform decode, ``max_query_len == 1``) — req-major with
-    #   added layer axis so ``[L]`` is a pure view:
-    #     block_table_grouped  [num_layers, num_reqs, n_per_layer, max_blocks]
-    #     seq_lens_grouped     [num_layers, num_reqs, n_per_layer]
-    #     slot_mapping_grouped [num_layers, num_reqs, n_per_layer]
+    # ``seq_lens_grouped`` / ``slot_mapping_grouped`` have no block axis, so they
+    # keep the all-member form; layout selected by ``head_grouped_decode_layout``:
+    #   False (prefill / mixed) — member-major:
+    #     seq_lens_grouped     [num_members_total, num_reqs]
+    #     slot_mapping_grouped [num_members_total, num_actual_tokens]
+    #     Per-layer slice ``[L*num_kv_heads : (L+1)*num_kv_heads]`` -> varlen.
+    #   True (uniform decode, ``max_query_len == 1``) — req-major + layer axis:
+    #     seq_lens_grouped     [num_layers, num_reqs, num_kv_heads]
+    #     slot_mapping_grouped [num_layers, num_reqs, num_kv_heads]
     num_head_groups_per_layer: int = 0
-    block_table_grouped: torch.Tensor | None = None
+    cluster_block_table: torch.Tensor | None = None
+    clusters_per_layer: torch.Tensor | None = None
+    cols_per_layer: torch.Tensor | None = None
+    page_group_size: int = 0
     seq_lens_grouped: torch.Tensor | None = None
     slot_mapping_grouped: torch.Tensor | None = None
-    # cu_seqlens for the (n_per_layer × num_reqs) virtual sequences per
-    # layer; shape ``[n_per_layer × num_reqs + 1]``.
+    # cu_seqlens for the (num_kv_heads × num_reqs) member sequences per
+    # layer; shape ``[num_kv_heads × num_reqs + 1]``.
     query_start_loc_grouped: torch.Tensor | None = None
     head_grouped_decode_layout: bool = False
     # Per-layer ``FlashAttentionMetadata`` overlays for the decode fast
@@ -306,8 +343,8 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
         self.max_num_splits = 0  # No upper bound on the number of splits.
         self.aot_schedule = get_flash_attn_version() == 3
         # Head-grouped paging disables AOT scheduling because each layer
-        # sees ``num_groups × num_reqs`` virtual sequences, which AOT did
-        # not precompute against.
+        # sees ``num_kv_heads × num_reqs`` virtual sequences (one per
+        # KV-head member), which AOT did not precompute against.
         if isinstance(kv_cache_spec, HeadGroupedAttentionSpec):
             self.aot_schedule = False
 
@@ -338,8 +375,31 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
             self._num_head_groups_per_layer = (
                 kv_cache_spec.num_head_groups_per_layer
             )
+            # Column-major virtual-block addressing needs the page (column)
+            # width and the per-layer KV-head count. See
+            # vllm/v1/attention/backends/head_grouped_layout.py.
+            self._page_group_size = kv_cache_spec.page_group_size
+            self._num_kv_heads_per_layer = (
+                self._num_head_groups_per_layer * self._page_group_size
+            )
+            # member->(cluster, column) maps, lazily built in ``build()`` once
+            # the layer count is known and cached. ``_cluster_map`` is None for
+            # the identity map (adjacent-head grouping); a loaded
+            # ``(cluster_of, column_of)`` pair makes it a real, possibly
+            # cross-layer, cluster map.
+            cluster_map_path = self.cache_config.head_group_cluster_map
+            self._cluster_map: tuple[torch.Tensor, torch.Tensor] | None = (
+                None if cluster_map_path is None
+                else load_cluster_map(
+                    cluster_map_path, self._page_group_size,
+                    self._num_kv_heads_per_layer)
+            )
+            self._member_to_cluster: torch.Tensor | None = None
+            self._member_to_col: torch.Tensor | None = None
         else:
             self._num_head_groups_per_layer = 0
+            self._page_group_size = 0
+            self._num_kv_heads_per_layer = 0
 
         if self.use_full_cuda_graph and self.aot_schedule:
             self.scheduler_metadata = torch.zeros(
@@ -355,6 +415,92 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
         # Sliding window size to be used with the AOT scheduler will be
         # populated on first build() call.
         self.aot_sliding_window: tuple[int, int] | None = None
+
+    def _member_maps(
+        self, num_layers_local: int, device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Cached ``(member_to_cluster, member_to_col)`` for head-grouped paging.
+
+        member row ``m = layer * num_kv_heads_per_layer + head`` -> the cluster
+        that head reads/writes and its column within the cluster's page. The
+        identity map (``_cluster_map is None``) reproduces adjacent-head
+        grouping; a loaded cluster map assigns arbitrary, possibly
+        cross-layer, clusters. Built once: both the layer count and the map are
+        fixed for the model. See head_grouped_layout.py.
+        """
+        if self._member_to_cluster is None:
+            if self._cluster_map is None:
+                member_to_cluster, member_to_col = identity_member_maps(
+                    num_layers_local, self._num_kv_heads_per_layer,
+                    self._page_group_size, device)
+            else:
+                cluster_of, column_of = self._cluster_map
+                if cluster_of.shape[0] != num_layers_local:
+                    # Sliding-window hybrid: the map is authored over the
+                    # compressible (full-attention) layers only. Expand it to
+                    # the physical layer layout — static cross-layer clusters
+                    # placed at the same block-table rows the compression
+                    # executor reorders, plus identity grouping for the sliding
+                    # layers (physical_member_maps_from_static_cluster_map).
+                    static_layer_ids = self._head_grouped_static_layer_ids(
+                        num_layers_local)
+                    self._assert_static_layer_ids_match_map(
+                        static_layer_ids, cluster_of.shape[0])
+                    cluster_of, column_of = (
+                        physical_member_maps_from_static_cluster_map(
+                            cluster_of, column_of, static_layer_ids,
+                            num_layers_local, self._page_group_size))
+                member_to_cluster, member_to_col = member_maps_from_cluster_map(
+                    cluster_of.to(device), column_of.to(device))
+            self._member_to_cluster = member_to_cluster
+            self._member_to_col = member_to_col
+        return self._member_to_cluster, self._member_to_col
+
+    def _head_grouped_static_layer_ids(self, num_layers_local: int) -> list[int]:
+        """Physical indices of the full-attention (compressible) layers in this
+        KV cache group.
+
+        Uses the shared ``full_attention_layer_indices`` so this set is the SAME
+        one the compression engine compresses (``gpu_model_runner.
+        _init_compression``) — the two cannot drift. The cluster map's layer
+        axis is physical-major, so each layer's position in ``self.layer_names``
+        must equal its physical index; that is asserted here so any reordering
+        surfaces loudly instead of silently mis-mapping KV."""
+        from vllm.model_executor.models.utils import extract_layer_index
+
+        for pos, name in enumerate(self.layer_names):
+            phys = extract_layer_index(name)
+            if phys != pos:
+                raise RuntimeError(
+                    f"head-grouped KV group layer order mismatch: position "
+                    f"{pos} is physical layer {phys}. The cluster map's layer "
+                    f"axis assumes position == physical layer index.")
+        return [i for i in full_attention_layer_indices(self.vllm_config)
+                if i < num_layers_local]
+
+    def _assert_static_layer_ids_match_map(
+        self, static_layer_ids: list[int], map_num_static: int,
+    ) -> None:
+        """Guard that the cluster map matches the running model's
+        full-attention layers before expanding it to the physical layout.
+
+        When the map records ``static_layer_ids`` (built by
+        ``tools/head_group_clustering/build_cluster_map``), require an exact
+        match — this catches a map built for a different model whose
+        full-attention layers happen to be at different physical indices but the
+        same count. Older maps without the field fall back to a count check."""
+        recorded = read_cluster_map_static_layer_ids(
+            self.cache_config.head_group_cluster_map)
+        if recorded is not None:
+            if recorded != static_layer_ids:
+                raise ValueError(
+                    f"head_group_cluster_map was built for full-attention "
+                    f"layers {recorded}, but the running model's "
+                    f"full-attention layers are {static_layer_ids}.")
+        elif len(static_layer_ids) != map_num_static:
+            raise ValueError(
+                f"head_group_cluster_map has {map_num_static} layers but the "
+                f"model has {len(static_layer_ids)} full-attention layers.")
 
     def build(
         self,
@@ -519,16 +665,24 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
         # ``head_grouped_decode_layout``.
         head_grouped_decode_layout = False
         if self._head_grouped:
+            # Terminology in this block: a *head-group* and a *cluster* are the
+            # same thing — one shared-retention-budget unit owning a set of
+            # physical blocks. ("head-group" is the kv-cache-manager term;
+            # "cluster" is the layout/compression term; they are synonyms.) Its
+            # per-page columns are *members*, one KV head each, so expanding the
+            # cluster axis by ``page_group_size`` yields the member axis.
             assert block_table_tensor.ndim == 3, (
                 "head-grouped path expects 3D block_table_tensor "
                 "[num_reqs, num_head_groups_total, max_blocks_per_req], "
                 f"got shape {tuple(block_table_tensor.shape)}.")
             num_head_groups_total = block_table_tensor.shape[1]
-            n_per_layer = self._num_head_groups_per_layer
-            assert num_head_groups_total % n_per_layer == 0, (
+            num_head_groups_per_layer = self._num_head_groups_per_layer
+            assert num_head_groups_total % num_head_groups_per_layer == 0, (
                 f"num_head_groups_total ({num_head_groups_total}) is not "
-                f"divisible by num_head_groups_per_layer ({n_per_layer}).")
-            num_layers_local = num_head_groups_total // n_per_layer
+                "divisible by num_head_groups_per_layer "
+                f"({num_head_groups_per_layer}).")
+            num_layers_local = (
+                num_head_groups_total // num_head_groups_per_layer)
             assert slot_mapping.ndim == 2, (
                 "head-grouped path expects 2D slot_mapping "
                 "[num_head_groups_total, num_actual_tokens], "
@@ -537,105 +691,110 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
                 common_attn_metadata.effective_seq_lens_cpu)
             head_grouped_decode_layout = max_query_len == 1
 
+            num_kv_heads_per_layer = self._num_kv_heads_per_layer
+
+            # Per-CLUSTER sequence lengths in group-major form
+            # [num_clusters_total, num_reqs]; the decode overlay is just a
+            # reshape of this, so both layouts share one construction. With
+            # compression the cache holds effective[cluster] post-compression
+            # tokens plus this step's chunk; otherwise the full length.
+            if effective_seq_lens_cpu is not None:
+                query_start_loc_cpu = (
+                    common_attn_metadata.query_start_loc_cpu[: num_reqs + 1])
+                num_scheduled_np = (
+                    query_start_loc_cpu[1:].cpu().numpy()
+                    - query_start_loc_cpu[:-1].cpu().numpy()
+                )
+                effective_np = np.asarray(
+                    effective_seq_lens_cpu, dtype=np.int32)
+                seq_lens_cluster_np = (
+                    effective_np[:num_reqs].T.astype(np.int32)
+                    + num_scheduled_np.astype(np.int32)[None, :]
+                )
+                seq_lens_cluster = torch.from_numpy(
+                    seq_lens_cluster_np).to(seq_lens.device).contiguous()
+            else:
+                seq_lens_cluster = (
+                    seq_lens.unsqueeze(0)
+                    .expand(num_head_groups_total, -1)
+                    .contiguous()
+                )
+
+            # Gather per-cluster physical metadata into per-member (per-KV-head)
+            # column-major virtual addressing. member row m = layer *
+            # num_kv_heads_per_layer + head; member_to_cluster[m] is the
+            # (possibly cross-layer) cluster that head reads/writes, member_to_col
+            # its column. The identity map reproduces adjacent-head grouping.
+            # Gathering on the FLAT cluster axis before the per-layer
+            # reshape is what lets a cluster span layers. See
+            # vllm/v1/attention/backends/head_grouped_layout.py.
+            member_to_cluster, member_to_col = self._member_maps(
+                num_layers_local, seq_lens.device)
+            # Cluster block table trimmed to the blocks the batch occupies, plus
+            # the static per-layer (cluster, column) maps; each attention call
+            # builds its own virtual block table from these on demand.
+            # block_table_tensor: [num_reqs, num_clusters_total, max_blocks].
+            max_blocks = cdiv(max_seq_len, self.block_size)
+            cluster_block_table = block_table_tensor[:, :, :max_blocks]
+            clusters_per_layer = member_to_cluster.view(
+                num_layers_local, num_kv_heads_per_layer)
+            cols_per_layer = member_to_col.view(
+                num_layers_local, num_kv_heads_per_layer)
+            # slot_mapping / seq_lens member views carry no block axis, so the
+            # all-member form is cheap; keep it.
+            # slot_mapping: [num_clusters_total, num_actual_tokens].
+            slot_mapping_member = member_virtual_slots(
+                slot_mapping, member_to_cluster, member_to_col,
+                self._page_group_size, self.block_size, cluster_axis=0)
+            # seq_lens_cluster: [num_clusters_total, num_reqs].
+            seq_lens_member = member_seq_lens(
+                seq_lens_cluster, member_to_cluster, cluster_axis=0)
+
             if head_grouped_decode_layout:
-                # Uniform decode: every (req, group) varlen sequence has
+                # Uniform decode: every (req, member) varlen sequence has
                 # length 1 so num_actual_tokens == num_reqs.
                 assert num_actual_tokens == num_reqs, (
                     "uniform-decode head-grouped path expects "
                     f"num_actual_tokens ({num_actual_tokens}) == num_reqs "
                     f"({num_reqs})."
                 )
-                # [num_reqs, num_groups_total, max_blocks]
-                # → [num_layers, num_reqs, n_per_layer, max_blocks]
-                block_table_grouped = (
-                    block_table_tensor
-                    .view(num_reqs, num_layers_local, n_per_layer, -1)
-                    .permute(1, 0, 2, 3)
-                    .contiguous()
-                )
-                # [num_groups_total, num_reqs] as
-                # [num_layers, n_per_layer, num_reqs]
-                # → [num_layers, num_reqs, n_per_layer]
+                # member axis splits into (layer, head); the per-layer block
+                # table is built in the overlay loop below.
+                # [num_members_total, num_reqs] as
+                # [num_layers, num_kv_heads, num_reqs]
+                # → [num_layers, num_reqs, num_kv_heads].
                 slot_mapping_grouped = (
-                    slot_mapping
-                    .view(num_layers_local, n_per_layer, num_reqs)
+                    slot_mapping_member
+                    .view(num_layers_local, num_kv_heads_per_layer, num_reqs)
                     .permute(0, 2, 1)
                     .contiguous()
                 )
-                if effective_seq_lens_cpu is not None:
-                    # seq_lens_grouped[layer, req, group] =
-                    #   effective[req, layer*n + group] + num_scheduled[req]
-                    query_start_loc_cpu = (
-                        common_attn_metadata.query_start_loc_cpu[
-                            : num_reqs + 1])
-                    num_scheduled_np = (
-                        query_start_loc_cpu[1:].cpu().numpy()
-                        - query_start_loc_cpu[:-1].cpu().numpy()
-                    )
-                    effective_np = np.asarray(
-                        effective_seq_lens_cpu, dtype=np.int32)[:num_reqs]
-                    effective_np = effective_np.reshape(
-                        num_reqs, num_layers_local, n_per_layer
-                    )
-                    seq_lens_grouped_np = (
-                        effective_np
-                        + num_scheduled_np.astype(np.int32)[:, None, None]
-                    ).transpose(1, 0, 2).copy()
-                    seq_lens_grouped = torch.from_numpy(
-                        seq_lens_grouped_np).to(seq_lens.device)
-                else:
-                    seq_lens_grouped = (
-                        seq_lens.view(1, num_reqs, 1)
-                        .expand(num_layers_local, num_reqs, n_per_layer)
-                        .contiguous()
-                    )
-                # Every sequence has length 1, so cu_seqlens is
-                # ``[0, 1, ..., n_per_layer × num_reqs]``.
+                seq_lens_grouped = (
+                    seq_lens_member
+                    .view(num_layers_local, num_kv_heads_per_layer, num_reqs)
+                    .permute(0, 2, 1)
+                    .contiguous()
+                )
+                # Every (req, member) sequence has length 1, so cu_seqlens is
+                # ``[0, 1, ..., num_kv_heads × num_reqs]``.
                 query_start_loc_grouped = torch.arange(
-                    n_per_layer * num_reqs + 1,
+                    num_kv_heads_per_layer * num_reqs + 1,
                     device=query_start_loc.device,
                     dtype=query_start_loc.dtype,
                 )
             else:
-                # Group-major path: the data copy is required because
-                # (req, group) sequences are not contiguous in any view
-                # of token-major Q when sequence lengths vary.
-                block_table_grouped = (
-                    block_table_tensor.permute(1, 0, 2).contiguous()
-                )
-                if effective_seq_lens_cpu is not None:
-                    # Cache holds effective[group] post-compression tokens
-                    # plus this step's chunk:
-                    # seq_lens_grouped[group, req] =
-                    #   effective[req, group] + num_scheduled[req]
-                    query_start_loc_cpu = (
-                        common_attn_metadata.query_start_loc_cpu[
-                            : num_reqs + 1])
-                    num_scheduled_np = (
-                        query_start_loc_cpu[1:].cpu().numpy()
-                        - query_start_loc_cpu[:-1].cpu().numpy()
-                    )
-                    effective_np = np.asarray(
-                        effective_seq_lens_cpu, dtype=np.int32)
-                    seq_lens_grouped_np = (
-                        effective_np[:num_reqs].T.astype(np.int32)
-                        + num_scheduled_np.astype(np.int32)[None, :]
-                    )
-                    seq_lens_grouped = torch.from_numpy(
-                        seq_lens_grouped_np).to(seq_lens.device).contiguous()
-                else:
-                    seq_lens_grouped = (
-                        seq_lens.unsqueeze(0)
-                        .expand(num_head_groups_total, -1)
-                        .contiguous()
-                    )
-                slot_mapping_grouped = slot_mapping
-                # cu_seqlens for the (n_per_layer × num_reqs) virtual
-                # sequences per layer; the layer slice happens in
+                # Member-major path (prefill / mixed): the data copy in
+                # ``_forward_head_grouped`` is required because (req, member)
+                # sequences are not contiguous in any token-major view when
+                # sequence lengths vary.
+                slot_mapping_grouped = slot_mapping_member
+                seq_lens_grouped = seq_lens_member
+                # cu_seqlens for the (num_kv_heads_per_layer × num_reqs)
+                # member sequences per layer; the layer slice happens in
                 # ``Attention._forward_head_grouped``.
                 query_start_head = query_start_loc[:num_reqs]
                 offsets = torch.arange(
-                    n_per_layer,
+                    num_kv_heads_per_layer,
                     device=query_start_head.device,
                     dtype=query_start_head.dtype,
                 ) * num_actual_tokens
@@ -643,14 +802,16 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
                     query_start_head.unsqueeze(0) + offsets.unsqueeze(1)
                 ).reshape(-1)
                 query_start_grouped_tail = torch.tensor(
-                    [n_per_layer * num_actual_tokens],
+                    [num_kv_heads_per_layer * num_actual_tokens],
                     device=query_start_head.device,
                     dtype=query_start_head.dtype,
                 )
                 query_start_loc_grouped = torch.cat(
                     [query_start_grouped_head, query_start_grouped_tail])
         else:
-            block_table_grouped = None
+            cluster_block_table = None
+            clusters_per_layer = None
+            cols_per_layer = None
             seq_lens_grouped = None
             slot_mapping_grouped = None
             query_start_loc_grouped = None
@@ -675,7 +836,10 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
             max_num_splits=max_num_splits,
             causal=causal,
             num_head_groups_per_layer=self._num_head_groups_per_layer,
-            block_table_grouped=block_table_grouped,
+            cluster_block_table=cluster_block_table,
+            clusters_per_layer=clusters_per_layer,
+            cols_per_layer=cols_per_layer,
+            page_group_size=self._page_group_size,
             seq_lens_grouped=seq_lens_grouped,
             slot_mapping_grouped=slot_mapping_grouped,
             query_start_loc_grouped=query_start_loc_grouped,
@@ -683,22 +847,32 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
         )
         if head_grouped_decode_layout:
             # Pre-build per-layer overlays so the attention layer picks
-            # the right metadata with a single list lookup.
-            n_per_layer = self._num_head_groups_per_layer
-            num_virtual_seqs = num_reqs * n_per_layer
-            attn_metadata.per_layer_md = [
-                dataclass_replace(
-                    attn_metadata,
-                    num_actual_tokens=num_virtual_seqs,
-                    block_table=block_table_grouped[layer_idx].view(
-                        num_virtual_seqs, -1),
-                    seq_lens=seq_lens_grouped[layer_idx].view(
-                        num_virtual_seqs),
-                    slot_mapping=slot_mapping_grouped[layer_idx].reshape(-1),
-                    query_start_loc=query_start_loc_grouped,
-                )
-                for layer_idx in range(num_layers_local)
-            ]
+            # the right metadata with a single list lookup. One sequence per
+            # (request, KV-head member) now that members are per-head.
+            num_virtual_seqs = num_reqs * self._num_kv_heads_per_layer
+            # Shallow ``copy.copy`` + field overwrite, not ``dataclass_replace``:
+            # replace() re-runs __init__ over every field, which is pure-Python
+            # overhead paid num_layers times per decode step (on the eager
+            # critical path). copy.copy clones __dict__ and we overwrite only the
+            # five per-layer fields; the rest are shared (read-only) references.
+            per_layer_md = []
+            for layer_idx in range(num_layers_local):
+                layer_md = copy.copy(attn_metadata)
+                layer_md.num_actual_tokens = num_virtual_seqs
+                # This layer's virtual block table, built on demand:
+                # [num_reqs, num_kv_heads, max_blocks] ->
+                # [num_reqs * num_kv_heads, max_blocks].
+                layer_md.block_table = member_virtual_block_table(
+                    cluster_block_table, clusters_per_layer[layer_idx],
+                    cols_per_layer[layer_idx], self._page_group_size,
+                    cluster_axis=1).reshape(num_virtual_seqs, -1)
+                layer_md.seq_lens = seq_lens_grouped[layer_idx].view(
+                    num_virtual_seqs)
+                layer_md.slot_mapping = slot_mapping_grouped[
+                    layer_idx].reshape(-1)
+                layer_md.query_start_loc = query_start_loc_grouped
+                per_layer_md.append(layer_md)
+            attn_metadata.per_layer_md = per_layer_md
         return attn_metadata
 
     def use_cascade_attention(self, *args, **kwargs) -> bool:
@@ -755,14 +929,20 @@ class FlashAttentionImpl(AttentionImpl):
             )
 
         self.sinks = sinks
+        # Per-head attention sink (a learned extra logit, e.g. gpt-oss). The
+        # native kernel path (``s_aux``) exists only in FlashAttention 3 on
+        # Hopper+. When unavailable we fall back to an exact post-hoc rescale of
+        # the output by the softmax log-sum-exp (``_apply_sink_lse_correction``,
+        # mirroring the FastKVzip baseline), which works on FA2 / pre-Hopper and
+        # on the head-group paging path. ``False`` for sink-less models keeps
+        # the original hot path untouched (zero overhead).
+        self.sink_via_lse_correction = False
         if self.sinks is not None:
-            assert flash_attn_supports_sinks(), (
-                "Sinks are only supported in FlashAttention 3"
-            )
             assert self.sinks.shape[0] == num_heads, (
                 "Sinks must have the same number of heads as the number of "
                 "heads in the layer"
             )
+            self.sink_via_lse_correction = not flash_attn_supports_sinks()
 
     def supports_quant_query_input(self) -> bool:
         return True
@@ -832,6 +1012,14 @@ class FlashAttentionImpl(AttentionImpl):
             )
 
         # For decoder and cross-attention, use KV cache as before
+        if attn_metadata.num_head_groups_per_layer > 0:
+            # Head-grouped column-major page: present the cache as the
+            # standard single-KV-head paged layout over virtual blocks
+            # (virtual_block = physical_block * page_group_size + column).
+            # slot_mapping and block_table are already in virtual coordinates,
+            # so reshape_and_cache_flash / flash_attn_varlen_func run
+            # unchanged. See vllm/v1/attention/backends/head_grouped_layout.py.
+            kv_cache = as_virtual_block_view(kv_cache)
         key_cache, value_cache = kv_cache.unbind(0)
 
         # key and value may be None in the case of cross attention. They are
@@ -879,6 +1067,12 @@ class FlashAttentionImpl(AttentionImpl):
             descale_shape = (cu_seqlens_q.shape[0] - 1, self.num_kv_heads)
 
             if self.dcp_world_size > 1:
+                if self.sink_via_lse_correction:
+                    raise NotImplementedError(
+                        "Attention-sink log-sum-exp correction (pre-Hopper "
+                        "FlashAttention) is not implemented for the "
+                        "decode-context-parallel path."
+                    )
                 self._forward_with_dcp(
                     query[:num_actual_tokens],
                     key[:num_actual_tokens],
@@ -893,7 +1087,7 @@ class FlashAttentionImpl(AttentionImpl):
                 )
                 return output
             else:
-                flash_attn_varlen_func(
+                result = flash_attn_varlen_func(
                     q=query[:num_actual_tokens],
                     k=key_cache,
                     v=value_cache,
@@ -914,11 +1108,31 @@ class FlashAttentionImpl(AttentionImpl):
                     k_descale=layer._k_scale.expand(descale_shape),
                     v_descale=layer._v_scale.expand(descale_shape),
                     num_splits=attn_metadata.max_num_splits,
-                    s_aux=self.sinks,
+                    # Feed the native sink only when FA3 handles it in-kernel.
+                    # Otherwise ask for the log-sum-exp and fold the sink in
+                    # below (exact, pre-Hopper / head-group safe).
+                    s_aux=None if self.sink_via_lse_correction else self.sinks,
+                    return_softmax_lse=self.sink_via_lse_correction,
                 )
+                if self.sink_via_lse_correction:
+                    # ``out`` is already written in place; ``result`` is the
+                    # ``(out, lse)`` tuple. ``lse`` is the natural-log softmax
+                    # denominator per (query-head, token); rescaling by
+                    # ``sigmoid(lse - sink)`` adds the sink's contribution.
+                    _, lse = result
+                    self._apply_sink_lse_correction(
+                        output[:num_actual_tokens], lse, attn_metadata,
+                        num_actual_tokens,
+                    )
                 return output
 
         # Cascade attention (rare case).
+        if self.sink_via_lse_correction:
+            raise NotImplementedError(
+                "Attention-sink log-sum-exp correction (pre-Hopper "
+                "FlashAttention) is not implemented for the cascade-attention "
+                "path."
+            )
         cascade_attention(
             output[:num_actual_tokens],
             query[:num_actual_tokens],
@@ -946,6 +1160,74 @@ class FlashAttentionImpl(AttentionImpl):
             s_aux=self.sinks,
         )
         return output
+
+    def _apply_sink_lse_correction(
+        self,
+        output: torch.Tensor,
+        lse: torch.Tensor,
+        attn_metadata: FlashAttentionMetadata,
+        num_actual_tokens: int,
+    ) -> None:
+        """Fold a per-head attention sink into ``output`` in place.
+
+        FlashAttention computes attention over the real keys only. A learned
+        per-head *sink* is an extra logit added to the softmax denominator, so
+        its exact effect is a post-hoc rescale of the output:
+
+            ``o_with_sink = o * sigmoid(lse - sink)``
+
+        where ``lse`` is the natural-log softmax denominator FlashAttention
+        returns (``return_softmax_lse=True``). This mirrors the FastKVzip
+        baseline (``prefill/attention/attn.py``) and is numerically exact, so it
+        replaces the FA3-only native ``s_aux`` path on pre-Hopper GPUs.
+
+        Two output layouts are handled, distinguished by the head-group paging
+        metadata. ``lse`` always arrives as ``[query_heads, tokens]`` (the
+        FlashAttention varlen convention), so it is transposed to align with the
+        token-major ``output`` rows.
+
+        Args:
+            output: attention output slice, viewed as
+                ``[num_actual_tokens, query_heads_per_seq, head_size]``,
+                modified in place.
+            lse: ``[query_heads_per_seq, num_actual_tokens]`` log-sum-exp.
+            attn_metadata: provides the head-group layout flags.
+            num_actual_tokens: number of varlen rows written by the kernel.
+        """
+        sinks = self.sinks.to(torch.float32)
+
+        if attn_metadata.num_head_groups_per_layer > 0:
+            # Head-group (column-major) paging: each varlen sequence is one KV
+            # head carrying its GQA group of query heads. ``output`` rows are
+            # member-major, so a row encodes (kv_head, token) and a column is
+            # the query head within that group; the global query head is
+            # ``kv_head * query_heads_per_kv + column``. The row→kv_head map
+            # depends on how vllm/attention/layer.py::_forward_head_grouped
+            # flattened the tensors:
+            #   - uniform decode fast path: row = token * num_kv_heads + kv_head
+            #     (kv_head varies fastest)        -> tile the [kv, head] grid
+            #   - prefill / mixed member-major  : row = kv_head * tokens + token
+            #     (token varies fastest)          -> repeat each kv row in place
+            query_heads = self.num_queries_per_kv
+            num_kv_heads = self.num_kv_heads
+            tokens_per_member = num_actual_tokens // num_kv_heads
+            sink_grid = sinks.view(num_kv_heads, query_heads)
+            if attn_metadata.head_grouped_decode_layout:
+                sink_rows = sink_grid.repeat(tokens_per_member, 1)
+            else:
+                sink_rows = sink_grid.repeat_interleave(tokens_per_member, dim=0)
+            sink_aligned = sink_rows
+        else:
+            # Standard token-major paging: row = token, column = global query
+            # head, so the sink broadcasts directly over the token axis.
+            query_heads = self.num_heads
+            sink_aligned = sinks.view(1, query_heads)
+
+        # ``lse`` -> [tokens, query_heads]; factor matches ``output`` rows.
+        factor = torch.sigmoid(lse.transpose(0, 1) - sink_aligned)
+        out = output.view(num_actual_tokens, query_heads, self.head_size)
+        # Match the baseline's float32 accumulation before casting back.
+        out.copy_((out.to(torch.float32) * factor.unsqueeze(-1)).to(out.dtype))
 
     def _forward_with_dcp(
         self,

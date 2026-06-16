@@ -206,6 +206,24 @@ class KVCacheCoordinator(ABC):
             manager.free_blocks_by_ids(block_ids, candidate_req_ids)
         self.block_pool.free_by_block_ids(block_ids)
 
+    def null_blocks_by_ids(
+        self,
+        block_ids: np.ndarray,
+        candidate_req_ids: set[str] | None = None,
+    ) -> None:
+        """Sliding-window free path: return the named physical block ids to the
+        BlockPool while NULLING them in place in per-request bookkeeping
+        (length-preserving). Mirrors ``free_blocks_by_ids`` except the manager
+        keeps the array length (the freed slots become the null block) so the
+        next allocation does not re-grow the out-of-window front. The pool
+        reclaim is identical.
+        """
+        if block_ids.size == 0:
+            return
+        for manager in self.single_type_managers:
+            manager.null_blocks_by_ids(block_ids, candidate_req_ids)
+        self.block_pool.free_by_block_ids(block_ids)
+
     def get_num_common_prefix_blocks(self, running_request_id: str) -> list[int]:
         """
         Get the number of common prefix blocks for all requests with allocated

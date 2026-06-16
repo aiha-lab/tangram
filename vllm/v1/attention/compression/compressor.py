@@ -1,37 +1,79 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Keep-decision logic for non-uniform KV cache compression.
+"""Keep-decision logic for KV cache compression.
 
-Owns the per-request score buffers and the global-top-K keep decision.
+Owns the per-request score buffers and the keep decision. The per-(layer,
+group) kept COUNT is delegated to a pluggable selection level (axis 1; see
+selection_level.py) — non-uniform global threshold (default) or uniform count.
 KV writes and block-table updates live in the FlashAttention backend.
 """
 from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
+from typing import Protocol
 
 import numpy as np
 import torch
 from torch import nn
 
-from vllm.distributed.parallel_state import (
-    get_tensor_model_parallel_world_size,
-    get_tp_group,
-)
 from vllm.logger import init_logger
+from vllm.v1.attention.backends.head_grouped_layout import (
+    identity_member_maps,
+    load_cluster_map,
+    member_maps_from_cluster_map,
+)
 from vllm.v1.attention.compression.gate import CompressionGate, load_gates
+from vllm.v1.attention.compression.selection_level import (
+    SelectionLevel,
+    make_selection_level,
+)
+from vllm.v1.attention.compression.scorer import build_qk_scorer
 
 logger = init_logger(__name__)
 
 
+class KeepDecisionObserver(Protocol):
+    """Contract for an object notified of each finalized per-request keep
+    decision. Implemented by offline tooling (not the engine) so the keep
+    decision can be observed without entangling the production path with what
+    the observer does. ``page_group_size = 1`` makes every ``(layer, group)``
+    a single head, so the arrays below are per-(layer, head).
+
+    Args of :meth:`record`:
+        req_id: the request whose keep decision this is.
+        kept_lengths: ``[num_layers, num_groups]`` int — KV positions retained
+            per (layer, group) after eviction (sink + window + selected).
+        total_seen: ``[num_layers, num_groups]`` int — full prefill length per
+            (layer, group) before eviction.
+        sink_size: leading positions kept unconditionally (the sink).
+        win_size: trailing recent positions kept unconditionally (the window).
+        eval_len: length of the evictable region the threshold ranked over.
+    """
+
+    def record(
+        self,
+        req_id: str,
+        *,
+        kept_lengths: np.ndarray,
+        total_seen: np.ndarray,
+        sink_size: int,
+        win_size: int,
+        eval_len: int,
+    ) -> None:
+        ...
+
+
 @dataclass
 class KeepDecision:
-    """Cross-layer global threshold for one chunk: ``score > threshold ⇒ keep``.
+    """Per-chunk sink / window / ratio geometry the executor consumes.
 
     The eval region is the workspace slice ``[eval_start, eval_end)``;
-    sink / locked / window positions outside it are auto-kept.
+    sink / locked / window positions outside it are auto-kept. The kept COUNT
+    and POSITION live in the per-(layer, group) caches (``cached_k_new_cpu`` /
+    ``cached_sorted_indices``), not here — the level-specific threshold is an
+    internal of ``SelectionLevel`` and never reaches downstream consumers.
     """
-    threshold: float
     sink_size: int
     win_size: int
     adjusted_ratio: float
@@ -48,7 +90,9 @@ class _LayerCompressState:
     # [G]: kept length after the most recent compress
     # (= sink + locked + win, clamped to total_seen).
     valid_lengths_per_group: torch.Tensor | None = None
-    # [num_kv_heads, chunk_len]: this step's gate score.
+    # [num_kv_heads, accumulated_len]: gate scores accumulated across this
+    # chunk's (possibly budget-sliced) sub-chunks; consumed at the boundary
+    # step. Equals one step's score in the common unsliced case.
     pending_score: torch.Tensor | None = None
 
 
@@ -60,9 +104,9 @@ class _RequestCompressState:
     # laid out as [prior_window | pending_score].
     score_workspace: torch.Tensor | None = None
     workspace_size: int = 0
-    # [L, G, win + chunk]: workspace after head-group amax; rebuilt each chunk.
-    cached_group_scores: torch.Tensor | None = None
-    cached_sorted_indices: torch.Tensor | None = None    # [L, G, eval_len]
+    # [L, G, page_group_size, eval_len]: each KV head's own descending score
+    # ranking, placed at its (cluster, column). Rebuilt each chunk.
+    cached_sorted_indices: torch.Tensor | None = None
     cached_k_new_cpu: np.ndarray | None = None           # [L, G]
     locked_count_cpu: np.ndarray | None = None           # [L, G]
     # [L, G] int32: post-evict kept_lengths. Under TP the runner
@@ -87,11 +131,18 @@ class KVCompressor:
         block_size: int,
         dtype: torch.dtype,
         device: torch.device | str,
+        level: str = "crosslayer_head",
     ) -> None:
         assert num_kv_heads % page_group_size == 0, (
             f"num_kv_heads ({num_kv_heads}) must be divisible by "
             f"page_group_size ({page_group_size}).")
 
+        # Selection level (compression axis 1): the aggregation rule
+        # turning eval scores into a per-(layer, group) kept COUNT. ``level`` is
+        # ``cache_config.compression_level`` (see selection_level.py). Chosen
+        # once here; ``prepare_keep_decision`` calls ``self.level.compute_counts``
+        # and never branches on the level again.
+        self.level: SelectionLevel = make_selection_level(level)
         self.num_layers = num_layers
         self.num_kv_heads_per_layer = num_kv_heads
         self.page_group_size = page_group_size
@@ -103,9 +154,32 @@ class KVCompressor:
         self.device = torch.device(device) if isinstance(device, str) \
             else device
 
-        # Populated by ``load_gate_checkpoint``; kept separate so unit tests
-        # can exercise compress() without a checkpoint.
-        self.gates: list[CompressionGate] = []
+        # Per-layer score producers (axis 2). Populated by
+        # ``load_gate_checkpoint`` (FastKVZip; hidden_states) or
+        # ``set_qk_scorers`` (gate-free query/key scorers — SnapKV, KeyDiff);
+        # kept separate so unit tests can exercise compress() without one.
+        # ``scorer_consumes`` ("hidden_states" | "qk") decides which module the
+        # pre-hook attaches to (see ``attach_scorers``).
+        self.scorers: list[nn.Module] = []
+        self.scorer_consumes: str = "hidden_states"
+
+        # member->(cluster, column) maps used by the keep decision. Member row
+        # m = layer * num_kv_heads_per_layer + head; member_to_cluster[m] is the
+        # global cluster id (flat c = layer * num_head_groups_per_layer + group
+        # under the identity map) whose physical KV blocks that head shares, and
+        # member_to_col[m] the head's column within that cluster's page.
+        # Populated by ``set_cluster_map``; the keep decision requires both.
+        self.member_to_cluster: torch.Tensor | None = None
+        self.member_to_col: torch.Tensor | None = None
+
+        # Optional observer notified of every finalized per-request keep
+        # decision (see ``compute_kept_lengths_per_rank``). ``None`` in
+        # production: the keep-decision path then does no extra work. Offline
+        # tooling attaches an observer to record the decisions it needs (the
+        # head-group clustering retention profiler does this via
+        # ``vllm.v1.attention.compression.profiling``); the engine itself stays
+        # agnostic to what the observer does with them.
+        self.keep_decision_observer: KeepDecisionObserver | None = None
 
         self.req_state: dict[str, _RequestCompressState] = {}
 
@@ -114,6 +188,15 @@ class KVCompressor:
         # the batch's hidden_states. Tokens outside any triple are skipped.
         self.compress_active: bool = False
         self.pending_req_offsets: list[tuple[str, int, int]] | None = None
+        # ``pending_req_pos_offsets`` maps a compression-active ``req_id`` to
+        # the global sequence position of its chunk's first scored token
+        # (the request's ``num_computed_tokens`` this step). Query/key scorers
+        # that depend on absolute token position (StreamingLLM recency,
+        # ExpectedAttention's future-position RoPE rotation) read it via the
+        # qk hook; position-independent scorers ignore it. Kept parallel to
+        # ``pending_req_offsets`` (set/cleared together) so the batch-range
+        # tuples stay unchanged and the hidden_states hook is untouched.
+        self.pending_req_pos_offsets: dict[str, int] | None = None
 
     def load_gate_checkpoint(
         self,
@@ -128,7 +211,7 @@ class KVCompressor:
         the checkpoint was trained against; the loader shards it to this
         rank's slice ``[tp_rank * per_rank, (tp_rank + 1) * per_rank)``.
         """
-        self.gates = load_gates(
+        self.scorers = load_gates(
             model_name=model_name,
             gate_path=gate_path,
             num_layers=self.num_layers,
@@ -138,6 +221,89 @@ class KVCompressor:
             hidden_dim=self.hidden_dim,
             dtype=self.dtype,
             device=self.device,
+        )
+        self.scorer_consumes = "hidden_states"
+
+    def set_qk_scorers(
+        self,
+        scorer_name: str,
+        num_q_per_kv: int,
+        snap_window: int,
+        snap_kernel: int,
+        ea_use_covariance: bool = True,
+        ea_use_vnorm: bool = True,
+        ea_n_future_positions: int = 512,
+        ea_epsilon: float = 1e-2,
+    ) -> None:
+        """Install a gate-free query/key scorer (SnapKV, KeyDiff, StreamingLLM,
+        TOVA, ExpectedAttention): one shared stateless instance per compressible
+        layer. Scores come from the model's post-RoPE query/key, so no
+        checkpoint is loaded. ``num_q_per_kv`` is the per-rank GQA ratio (model
+        q-heads / kv-heads); scorers that ignore it (KeyDiff) simply do not use
+        it. Per-scorer hyperparameters (SnapKV ``snap_*``; ExpectedAttention
+        ``ea_*``) are forwarded but consumed only by their scorer. The concrete
+        scorer is chosen by ``build_qk_scorer`` — the one place the gate-free
+        scorer type branches — and ``scorer_consumes`` is read off the module so
+        the hook dispatch stays scorer-agnostic."""
+        scorer = build_qk_scorer(
+            scorer_name,
+            num_kv_heads=self.num_kv_heads_per_layer,
+            num_q_per_kv=num_q_per_kv,
+            head_size=self.head_size,
+            snap_window=snap_window,
+            snap_kernel=snap_kernel,
+            ea_use_covariance=ea_use_covariance,
+            ea_use_vnorm=ea_use_vnorm,
+            ea_n_future_positions=ea_n_future_positions,
+            ea_epsilon=ea_epsilon,
+        ).to(device=self.device)
+        scorer.eval()
+        # The scorer is stateless, so all layers share one instance; the list
+        # length matches ``num_layers`` for ``attach_scorers``'s zip.
+        self.scorers = [scorer for _ in range(self.num_layers)]
+        self.scorer_consumes = scorer.consumes
+
+    def set_cluster_map(self, head_group_cluster_map: str | None) -> None:
+        """Bind the member->(cluster, column) maps the keep decision uses.
+
+        ``head_group_cluster_map is None`` selects the identity map (each KV
+        head clusters with its adjacent neighbours within a layer); a loaded
+        cluster map instead assigns each head to the (possibly cross-layer)
+        cluster it shares physical KV blocks with. Either way the maps mirror
+        those the FlashAttention builder uses for paging, so scoring and
+        physical placement agree (see ``head_grouped_layout.py``). Member row
+        ``m = layer * num_kv_heads_per_layer + head``.
+        """
+        if head_group_cluster_map is None:
+            member_to_cluster, member_to_col = identity_member_maps(
+                self.num_layers,
+                self.num_kv_heads_per_layer,
+                self.page_group_size,
+                self.device,
+            )
+        else:
+            cluster_of, column_of = load_cluster_map(
+                head_group_cluster_map,
+                self.page_group_size,
+                self.num_kv_heads_per_layer,
+            )
+            if cluster_of.shape[0] != self.num_layers:
+                raise ValueError(
+                    f"head_group_cluster_map has {cluster_of.shape[0]} layers "
+                    f"but the compressor spans {self.num_layers}.")
+            member_to_cluster, member_to_col = member_maps_from_cluster_map(
+                cluster_of.to(self.device), column_of.to(self.device))
+        self.member_to_cluster = member_to_cluster
+        self.member_to_col = member_to_col
+        num_clusters = self.num_layers * self.num_head_groups_per_layer
+        logger.info(
+            "KVCompressor scoring cluster map: %s (%d clusters over %d "
+            "members, page_group_size=%d)",
+            "identity (adjacent-head)" if head_group_cluster_map is None
+            else head_group_cluster_map,
+            num_clusters,
+            self.num_layers * self.num_kv_heads_per_layer,
+            self.page_group_size,
         )
 
     def begin_request(self, req_id: str) -> None:
@@ -150,25 +316,41 @@ class KVCompressor:
         # Idempotent for worker shutdown paths.
         self.req_state.pop(req_id, None)
 
-    def receive_hidden_score(
+    def receive_score(
         self,
         req_id: str,
         layer_idx: int,
         score: torch.Tensor,
     ) -> None:
-        """Stash the gate-produced ``[num_kv_heads_per_layer, chunk_len]``
-        score for the next compress() call (consumed same-step)."""
+        """Stash the scorer-produced ``[num_kv_heads_per_layer, sub_chunk_len]``
+        score, accumulating across budget-sliced sub-chunks until the boundary
+        step consumes it. Source-agnostic (FastKVZip gate or SnapKV); both feed
+        the same buffer.
+
+        Concurrency lets the scheduler split one compression chunk into several
+        forward steps (the token budget is shared), and the scorer scores only
+        the tokens present in each step. Concatenating in arrival order
+        assembles a full ``chunk_size`` of per-token scores by the boundary
+        step that runs the keep decision. Per-token scores are chunk-invariant
+        (a token's hidden_states is identical regardless of how prefill was
+        sliced — chunked prefill keeps full KV and attention is causal), so the
+        accumulated buffer is byte-equivalent to the serial baseline's single
+        full-chunk score. ``_collect_layer_tensors`` consumes + clears it only
+        at a boundary step. The common unsliced case hits the ``prev is None``
+        fast path (plain assign, no concat)."""
         if score.shape[0] != self.num_kv_heads_per_layer:
             raise ValueError(
                 f"score head dim {score.shape[0]} != "
                 f"num_kv_heads_per_layer {self.num_kv_heads_per_layer}.")
         if req_id not in self.req_state:
             raise RuntimeError(
-                f"KVCompressor.receive_hidden_score: '{req_id}' not "
+                f"KVCompressor.receive_score: '{req_id}' not "
                 "begin_request'd.")
         layer_state = self.req_state[req_id].layer_states.setdefault(
             layer_idx, _LayerCompressState())
-        layer_state.pending_score = score
+        prev = layer_state.pending_score
+        layer_state.pending_score = (
+            score if prev is None else torch.cat([prev, score], dim=1))
 
     def prepare_keep_decision(
         self,
@@ -180,8 +362,9 @@ class KVCompressor:
         n_sink_tokens: int,
         total_prompt_tokens: int,
     ) -> KeepDecision:
-        """Cross-layer global threshold over the eval region;
-        ``score > threshold ⇒ keep``. Caches per-(layer, group) sorted
+        """Run the keep decision for one chunk: compute sink / window / ratio
+        geometry, then delegate the per-(layer, group) kept COUNT to the active
+        selection level (``self.level``). Caches per-(layer, group) sorted
         indices for the executor. Enforces the once-only invariant:
         ``prev_seq_lens_per_layer`` matches the last
         ``valid_lengths_per_group`` (or is all-zero on the first chunk)."""
@@ -195,7 +378,6 @@ class KVCompressor:
         req = self.req_state[req_id]
         num_layers = self.num_layers
         num_groups = self.num_head_groups_per_layer
-        page_group_size = self.page_group_size
         num_kv_heads = self.num_kv_heads_per_layer
 
         # Sink / window sized by the smallest (layer, group) total length.
@@ -239,7 +421,7 @@ class KVCompressor:
         if first_score is None:
             raise RuntimeError(
                 f"prepare_keep_decision({req_id}): no pending_score "
-                "— receive_hidden_score must run first.")
+                "— receive_score must run first.")
         dtype, device = first_score.dtype, first_score.device
         neg_inf = torch.finfo(dtype).min
 
@@ -253,7 +435,6 @@ class KVCompressor:
                 dtype=dtype, device=device)
             req.workspace_size = workspace_need
         workspace = req.score_workspace
-        workspace_alloc = req.workspace_size
         workspace.fill_(neg_inf)
 
         pending, prior, prev_locked = self._collect_layer_tensors(
@@ -286,53 +467,44 @@ class KVCompressor:
                     req.layer_states[layer_idx].prior_window_scores = empty
             # win > chunk_len is degenerate; leave prior unchanged.
 
-        # amax over heads-in-group → per-(layer, group) scores.
-        group_scores = workspace.view(
-            num_layers, num_groups, page_group_size,
-            workspace_alloc).amax(dim=2)
-        req.cached_group_scores = group_scores
+        # Keep decision = COUNT (per-cluster shared length) + POSITION
+        # (per-member ranking). Each KV head (member) keeps its OWN top-scored
+        # positions; a cluster then shares ONE kept length, because the
+        # cluster's members share the same physical KV blocks (so the length is
+        # single). Grouping heads with similar retention budgets via the cluster
+        # map makes that shared length approximate each member's ideal — the
+        # source of the memory saving. Per-member individual lengths are never
+        # stored; only the cluster's one length is. Both outputs need the
+        # cluster maps bound by ``set_cluster_map``.
+        if self.member_to_cluster is None or self.member_to_col is None:
+            raise RuntimeError(
+                "prepare_keep_decision: cluster maps are unset — "
+                "set_cluster_map must run after construction.")
 
-        # topk(n+1).min is O(N) vs full sort O(NlogN). Under TP, all-gather
-        # group_scores along the head-group axis so the threshold spans
-        # every rank's KV heads (same global semantic as single-process
-        # FastKVzip). Each rank's sorted_idx / k_new below stay per-rank.
-        if eval_len <= 0 or adjusted_ratio >= 1.0:
-            threshold = float('-inf')
-        elif adjusted_ratio <= 0.0:
-            threshold = float('inf')
-        else:
-            tp_world_size = get_tensor_model_parallel_world_size()
-            eval_slice = group_scores[:, :, eval_start:eval_end]
-            if tp_world_size > 1:
-                eval_slice_contiguous = eval_slice.contiguous()
-                gathered = [
-                    torch.empty_like(eval_slice_contiguous)
-                    for _ in range(tp_world_size)
-                ]
-                torch.distributed.all_gather(
-                    gathered, eval_slice_contiguous,
-                    group=get_tp_group().device_group)
-                flat = torch.cat(gathered, dim=1).reshape(-1)
+        # POSITION (ratio-independent rank) is cached whenever there is an eval
+        # region to keep from, INCLUDING the zero path (adjusted_ratio == 0):
+        # the ratio budget keeps no middle there, but floor_min can still force
+        # k_aligned > 0, and run_request indexes this ranking to pick the kept
+        # positions (omitting it subscripts None on short prompts). COUNT is
+        # cached only on the genuine path — compute_counts is undefined at
+        # ratio <= 0, and at ratio 0 the base count is 0 (floor_min supplies the
+        # retention against the ranking above).
+        if eval_len > 0 and adjusted_ratio < 1.0:
+            eval_scores = workspace[:, :, eval_start:eval_end]
+            req.cached_sorted_indices = self._rank_positions(
+                eval_scores, num_layers, num_kv_heads, num_groups)
+            if adjusted_ratio > 0.0:
+                req.cached_k_new_cpu = self.level.compute_counts(
+                    eval_scores, adjusted_ratio, self.member_to_cluster,
+                    num_layers, num_kv_heads, num_groups)
             else:
-                flat = eval_slice.reshape(-1)
-            n = max(int(flat.numel() * adjusted_ratio) - 1, 0)
-            threshold = float(torch.topk(flat, k=n + 1).values.min().item())
-
-        # Per-(layer, group) sort + k_new cache for the executor; skipped
-        # on the fast / zero paths to avoid a needless sort.
-        if eval_len > 0 and 0.0 < adjusted_ratio < 1.0:
-            sorted_vals, sorted_idx = group_scores[
-                :, :, eval_start:eval_end].sort(dim=-1, descending=True)
-            k_new = (sorted_vals > threshold).sum(dim=-1)
-            req.cached_sorted_indices = sorted_idx
-            req.cached_k_new_cpu = k_new.cpu().numpy().astype(np.int64)
+                req.cached_k_new_cpu = None
         else:
             req.cached_sorted_indices = None
             req.cached_k_new_cpu = None
         req.locked_count_cpu = locked.cpu().numpy().astype(np.int64)
 
         decision = KeepDecision(
-            threshold=threshold,
             sink_size=int(sink_size),
             win_size=int(win_size),
             adjusted_ratio=float(adjusted_ratio),
@@ -342,6 +514,35 @@ class KVCompressor:
         req.cross_layer_decision = decision
         req.cached_kept_lengths_cpu = None
         return decision
+
+    def _rank_positions(
+        self,
+        eval_scores: torch.Tensor,
+        num_layers: int,
+        num_kv_heads: int,
+        num_groups: int,
+    ) -> torch.Tensor:
+        """Per-member descending POSITION ranking, scattered into the executor's
+        ``[num_layers, num_groups, page_group_size, eval_len]`` (cluster,
+        column) layout. Shared by the uniform and non-uniform paths — the kept
+        COUNT differs between them, the POSITION ranking is the same.
+
+        Each member ranks its OWN scores descending; the executor reads
+        ``sorted_idx[layer, group, col, :k_aligned]`` for that column's head.
+        Member row ``m = layer * num_kv_heads + head``; ``member_to_cluster[m]``
+        / ``member_to_col[m]`` (bound by ``set_cluster_map``) place it.
+        """
+        num_clusters_total = num_layers * num_groups
+        eval_len = eval_scores.shape[-1]
+        member_eval = eval_scores.reshape(
+            num_layers * num_kv_heads, eval_len)
+        _, member_sorted = member_eval.sort(dim=-1, descending=True)
+        per_head_sorted = member_sorted.new_zeros(
+            num_clusters_total, self.page_group_size, eval_len)
+        per_head_sorted[
+            self.member_to_cluster, self.member_to_col] = member_sorted
+        return per_head_sorted.view(
+            num_layers, num_groups, self.page_group_size, eval_len)
 
     def compute_kept_lengths_per_rank(
         self,
@@ -421,6 +622,18 @@ class KVCompressor:
                     kept_length = total_seen_g
                 kept_lengths[layer_idx, group_idx] = kept_length
         req.cached_kept_lengths_cpu = kept_lengths
+        # Emit the finalized decision to an optional observer (None in
+        # production — no extra work). Offline tooling uses this to record
+        # per-(layer, head) retention without touching the production path.
+        if self.keep_decision_observer is not None:
+            self.keep_decision_observer.record(
+                req_id,
+                kept_lengths=kept_lengths,
+                total_seen=total_seen,
+                sink_size=sink_size,
+                win_size=win_size,
+                eval_len=eval_len,
+            )
         return kept_lengths
 
     def _assert_once_only(
@@ -488,7 +701,7 @@ class KVCompressor:
             if state is None or state.pending_score is None:
                 raise RuntimeError(
                     f"layer {layer_idx}: no pending_score "
-                    "— receive_hidden_score must run first.")
+                    "— receive_score must run first.")
             fresh = state.pending_score
             state.pending_score = None
             if fresh.shape[1] != chunk_len:
@@ -523,66 +736,131 @@ class KVCompressor:
         prev_locked = torch.stack(locked_list, dim=0)
         return pending, prior, prev_locked
 
-    def attach_to_attention_layers(
+    def attach_scorers(
         self,
-        attention_layers: list[nn.Module],
+        parents: list[nn.Module],
+        inners: list[nn.Module],
     ) -> None:
-        """Wire each layer's gate + forward pre-hook.
+        """Wire per-layer forward pre-hooks for the active scorer (axis 2).
 
-        Hook fires only when ``compress_active`` is True and
-        ``pending_req_offsets`` is non-empty; otherwise zero overhead.
-        For each ``(req_id, start, end)`` triple it scores
-        ``hidden_states[start:end]`` and stashes via
-        ``receive_hidden_score``. ``attention_layers[i]`` must correspond
-        to ``gates[i]`` — caller owns the ordering."""
-        if len(attention_layers) != len(self.gates):
+        ``parents[i]`` is layer i's outer attention block (exposes
+        hidden_states); ``inners[i]`` is its inner ``Attention`` (exposes
+        post-RoPE query/key). The hook attaches to whichever the scorer
+        consumes, and fires only when ``compress_active`` is True and
+        ``pending_req_offsets`` is non-empty (else zero overhead). Caller owns
+        the ordering: ``parents[i]`` / ``inners[i]`` must correspond to
+        ``scorers[i]``."""
+        if self.scorer_consumes not in ("hidden_states", "qk"):
             raise ValueError(
-                f"attach_to_attention_layers: got "
-                f"{len(attention_layers)} layers but "
-                f"{len(self.gates)} gates.")
+                f"attach_scorers: unknown scorer_consumes "
+                f"{self.scorer_consumes!r}.")
+        # hidden_states scorers hook the outer block; qk scorers hook the inner
+        # ``Attention`` but still need the outer block (``parent``) for its
+        # ``rotary_emb`` (ExpectedAttention), threaded into the hook closure.
+        targets = parents if self.scorer_consumes == "hidden_states" else inners
+        if len(targets) != len(self.scorers) or len(parents) != len(targets):
+            raise ValueError(
+                f"attach_scorers: got {len(targets)} target layers / "
+                f"{len(parents)} parents but {len(self.scorers)} scorers.")
+        for layer_idx, (target, scorer) in enumerate(
+                zip(targets, self.scorers)):
+            if self.scorer_consumes == "qk":
+                hook = self._make_qk_hook(
+                    layer_idx, scorer, parents[layer_idx])
+            else:
+                hook = self._make_hidden_states_hook(layer_idx, scorer)
+            target.register_forward_pre_hook(hook, with_kwargs=True)
 
-        for layer_idx, (layer, gate) in enumerate(
-                zip(attention_layers, self.gates)):
-            layer.compression_gate = gate
+    def _make_hidden_states_hook(self, layer_idx: int, scorer: nn.Module):
+        """Pre-hook for hidden_states scorers (FastKVZip gate). Concatenates
+        all compression-active request slices into a single forward per layer
+        to amortise kernel launch (per-token scores are request-independent)."""
 
-            def pre_hook(module, args, kwargs, _idx=layer_idx, _gate=gate):
-                if not self.compress_active:
-                    return None
-                offsets = self.pending_req_offsets
-                if not offsets:
-                    return None
-                hidden_states = args[0] if args else kwargs.get(
-                    "hidden_states")
-                if hidden_states is None:
-                    return None
-
-                # Concatenate all compression-active req slices into a
-                # single gate forward per layer to amortise kernel launch.
-                valid = [(req, start, end)
-                         for req, start, end in offsets if end > start]
-                if not valid:
-                    return None
-
-                with torch.no_grad():
-                    if len(valid) == 1:
-                        req, start, end = valid[0]
-                        score = _gate(hidden_states[start:end])
-                        self.receive_hidden_score(req, _idx, score)
-                    else:
-                        slices = [hidden_states[start:end]
-                                  for _, start, end in valid]
-                        full = torch.cat(slices, dim=0)
-                        # [num_kv_heads, sum(end - start)]
-                        score_full = _gate(full)
-                        cursor = 0
-                        for req, start, end in valid:
-                            length = end - start
-                            self.receive_hidden_score(
-                                req, _idx,
-                                score_full[:, cursor:cursor + length],
-                            )
-                            cursor += length
+        def pre_hook(module, args, kwargs, _idx=layer_idx, _scorer=scorer):
+            if not self.compress_active:
+                return None
+            offsets = self.pending_req_offsets
+            if not offsets:
+                return None
+            hidden_states = args[0] if args else kwargs.get("hidden_states")
+            if hidden_states is None:
                 return None
 
-            layer.register_forward_pre_hook(
-                pre_hook, with_kwargs=True)
+            valid = [(req, start, end)
+                     for req, start, end in offsets if end > start]
+            if not valid:
+                return None
+
+            with torch.no_grad():
+                if len(valid) == 1:
+                    req, start, end = valid[0]
+                    score = _scorer(hidden_states[start:end])
+                    self.receive_score(req, _idx, score)
+                else:
+                    slices = [hidden_states[start:end]
+                              for _, start, end in valid]
+                    full = torch.cat(slices, dim=0)
+                    # [num_kv_heads, sum(end - start)]
+                    score_full = _scorer(full)
+                    cursor = 0
+                    for req, start, end in valid:
+                        length = end - start
+                        self.receive_score(
+                            req, _idx,
+                            score_full[:, cursor:cursor + length],
+                        )
+                        cursor += length
+            return None
+
+        return pre_hook
+
+    def _make_qk_hook(
+        self, layer_idx: int, scorer: nn.Module, parent: nn.Module,
+    ):
+        """Pre-hook for query/key scorers (SnapKV, KeyDiff, StreamingLLM, TOVA,
+        ExpectedAttention). Scores each request's chunk independently — the
+        observation window is chunk-relative, so request slices must NOT be
+        concatenated. The hook is registered on the inner ``Attention``, whose
+        ``forward(query, key, value, ...)`` exposes ``args[0..2]`` = post-RoPE
+        query / key / value (token-major flatten).
+
+        Every qk scorer is called with the uniform contract
+        ``scorer(query, key, value, *, module, position_offset)``: ``value``
+        feeds value-norm reweighting (ExpectedAttention); ``module`` is the
+        OUTER attention block (``parent``), the one that owns ``rotary_emb`` —
+        the inner op only runs the attention kernel and has no RoPE — so
+        ExpectedAttention can recover pre-RoPE queries / build the future-
+        position rotation; ``position_offset`` is the chunk's global start
+        position (StreamingLLM recency, ExpectedAttention future positions).
+        Scorers that do not need an argument simply ignore it."""
+
+        def pre_hook(module, args, kwargs,
+                     _idx=layer_idx, _scorer=scorer, _parent=parent):
+            if not self.compress_active:
+                return None
+            offsets = self.pending_req_offsets
+            if not offsets:
+                return None
+            query = args[0] if len(args) > 0 else kwargs.get("query")
+            key = args[1] if len(args) > 1 else kwargs.get("key")
+            value = args[2] if len(args) > 2 else kwargs.get("value")
+            if query is None or key is None:
+                return None
+            pos_offsets = self.pending_req_pos_offsets or {}
+
+            with torch.no_grad():
+                for req, start, end in offsets:
+                    if end <= start:
+                        continue
+                    value_slice = None if value is None else value[start:end]
+                    score = _scorer(
+                        query[start:end],
+                        key[start:end],
+                        value_slice,
+                        module=_parent,
+                        position_offset=pos_offsets.get(req, 0),
+                    )
+                    self.receive_score(req, _idx, score)
+            return None
+
+        return pre_hook

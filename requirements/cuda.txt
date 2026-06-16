@@ -13,7 +13,7 @@ xformers==0.0.33.post1; platform_system == 'Linux' and platform_machine == 'x86_
 # FlashInfer should be updated together with the Dockerfile
 flashinfer-python==0.5.2
 
-# For benchmark scripts (e.g. benchmarks/benchmark_scbench.py): SCBench data
+# For benchmark scripts (e.g. benchmarks/tangram/benchmark_scbench.py): SCBench data
 # loading and ROUGE answer scoring. Mirrors the `datasets` entry already in
 # cpu.txt/xpu.txt/rocm.txt.
 datasets

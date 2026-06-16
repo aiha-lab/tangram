@@ -293,7 +293,15 @@ class SingleTypeKVCacheManager(ABC):
             if ids is None or ids.size == 0:
                 self.num_cached_block.pop(request_id, None)
                 return
-            self.block_pool.free_block_ids_array(ids)
+            # The sliding-window eviction path (``null_blocks_by_ids``) nulls
+            # out-of-window front blocks in place (sets them to the null id 0)
+            # after their physical blocks were already returned to the pool.
+            # Exclude the null id here so the ring is not corrupted —
+            # ``free_block_ids_array`` requires null-free, unique ids. No-op when
+            # no nulling occurred.
+            ids = ids[ids != 0]
+            if ids.size:
+                self.block_pool.free_block_ids_array(ids)
             self.num_cached_block.pop(request_id, None)
             return
         # Default to [] in case a request is freed (aborted) before alloc.
@@ -373,6 +381,52 @@ class SingleTypeKVCacheManager(ABC):
             kept = [blk for blk in blocks if blk.block_id not in block_ids]
             if len(kept) != len(blocks):
                 self.req_to_blocks[req_id] = kept
+
+    def null_blocks_by_ids(
+        self,
+        block_ids: np.ndarray,
+        candidate_req_ids: set[str] | None = None,
+    ) -> None:
+        """Null named block ids IN PLACE in the per-request lookup (head-grouped).
+
+        Length-preserving counterpart of ``free_blocks_by_ids``: instead of
+        dropping the freed ids (which lets the next allocation re-grow those
+        slots), it overwrites them with the null block id (0) and keeps the
+        array length. Used by sliding-window eviction, where the block-table row
+        stays full length — only the out-of-window FRONT blocks become null, so
+        the in-window tail keeps its position -> block mapping — while the
+        physical blocks are returned to the pool separately (caller). The next
+        ``get_num_blocks_to_allocate`` therefore counts the nulled slots as
+        present and never re-allocates them.
+        """
+        if not self.head_grouped:
+            raise AssertionError("null_blocks_by_ids is head-grouped only.")
+        if block_ids.size == 0:
+            return
+        num_pool_blocks = len(self.block_pool.blocks)
+        freed_arr = block_ids.astype(np.int64, copy=False)
+        # Drop out-of-range / null (0) ids, matching the silent no-op semantics
+        # of ``free_blocks_by_ids``; the null block must never be matched.
+        in_range = (freed_arr > 0) & (freed_arr < num_pool_blocks)
+        if not in_range.all():
+            freed_arr = freed_arr[in_range]
+            if freed_arr.size == 0:
+                return
+        bitmap = np.zeros(num_pool_blocks, dtype=bool)
+        bitmap[freed_arr] = True
+        if candidate_req_ids is None:
+            iter_ids = list(self.req_to_block_ids.keys())
+        else:
+            iter_ids = candidate_req_ids
+        for req_id in iter_ids:
+            ids = self.req_to_block_ids.get(req_id)
+            if ids is None or ids.size == 0:
+                continue
+            is_freed = bitmap[ids]
+            if not is_freed.any():
+                continue
+            # In-place overwrite with the null block id; array length preserved.
+            ids[is_freed] = 0
 
     @abstractmethod
     def get_num_common_prefix_blocks(self, running_request_id: str) -> int:

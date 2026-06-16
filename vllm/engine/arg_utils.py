@@ -550,6 +550,7 @@ class EngineArgs:
 
     # Head-group paging, compression, multi-turn.
     page_group_size: int | None = CacheConfig.page_group_size
+    head_group_cluster_map: str | None = CacheConfig.head_group_cluster_map
     enable_compression: bool = CacheConfig.enable_compression
     compression_ratio: float = CacheConfig.compression_ratio
     compression_window_size: int = CacheConfig.compression_window_size
@@ -557,6 +558,18 @@ class EngineArgs:
     compression_floor_min: int = CacheConfig.compression_floor_min
     compression_chunk_size: int = CacheConfig.compression_chunk_size
     compression_gate_path: str = CacheConfig.compression_gate_path
+    compression_level: str = CacheConfig.compression_level
+    compression_scorer: str = CacheConfig.compression_scorer
+    compression_snap_window: int = CacheConfig.compression_snap_window
+    compression_snap_kernel: int = CacheConfig.compression_snap_kernel
+    compression_ea_use_covariance: bool = \
+        CacheConfig.compression_ea_use_covariance
+    compression_ea_use_vnorm: bool = CacheConfig.compression_ea_use_vnorm
+    compression_ea_n_future_positions: int = \
+        CacheConfig.compression_ea_n_future_positions
+    compression_ea_epsilon: float = CacheConfig.compression_ea_epsilon
+    compression_retention_dump: str | None = \
+        CacheConfig.compression_retention_dump
     multi_turn: bool = CacheConfig.multi_turn
 
     additional_config: dict[str, Any] = get_field(VllmConfig, "additional_config")
@@ -963,6 +976,10 @@ class EngineArgs:
             "--page-group-size", **cache_kwargs["page_group_size"]
         )
         cache_group.add_argument(
+            "--head-group-cluster-map",
+            **cache_kwargs["head_group_cluster_map"],
+        )
+        cache_group.add_argument(
             "--enable-compression", **cache_kwargs["enable_compression"]
         )
         cache_group.add_argument(
@@ -986,6 +1003,40 @@ class EngineArgs:
         )
         cache_group.add_argument(
             "--compression-gate-path", **cache_kwargs["compression_gate_path"]
+        )
+        cache_group.add_argument(
+            "--compression-level", **cache_kwargs["compression_level"]
+        )
+        cache_group.add_argument(
+            "--compression-scorer", **cache_kwargs["compression_scorer"]
+        )
+        cache_group.add_argument(
+            "--compression-snap-window",
+            **cache_kwargs["compression_snap_window"],
+        )
+        cache_group.add_argument(
+            "--compression-snap-kernel",
+            **cache_kwargs["compression_snap_kernel"],
+        )
+        cache_group.add_argument(
+            "--compression-ea-use-covariance",
+            **cache_kwargs["compression_ea_use_covariance"],
+        )
+        cache_group.add_argument(
+            "--compression-ea-use-vnorm",
+            **cache_kwargs["compression_ea_use_vnorm"],
+        )
+        cache_group.add_argument(
+            "--compression-ea-n-future-positions",
+            **cache_kwargs["compression_ea_n_future_positions"],
+        )
+        cache_group.add_argument(
+            "--compression-ea-epsilon",
+            **cache_kwargs["compression_ea_epsilon"],
+        )
+        cache_group.add_argument(
+            "--compression-retention-dump",
+            **cache_kwargs["compression_retention_dump"],
         )
         cache_group.add_argument("--multi-turn", **cache_kwargs["multi_turn"])
 
@@ -1499,6 +1550,7 @@ class EngineArgs:
             kv_offloading_size=self.kv_offloading_size,
             kv_offloading_backend=self.kv_offloading_backend,
             page_group_size=self.page_group_size,
+            head_group_cluster_map=self.head_group_cluster_map,
             enable_compression=self.enable_compression,
             compression_ratio=self.compression_ratio,
             compression_window_size=self.compression_window_size,
@@ -1506,6 +1558,16 @@ class EngineArgs:
             compression_floor_min=self.compression_floor_min,
             compression_chunk_size=self.compression_chunk_size,
             compression_gate_path=self.compression_gate_path,
+            compression_level=self.compression_level,
+            compression_scorer=self.compression_scorer,
+            compression_snap_window=self.compression_snap_window,
+            compression_snap_kernel=self.compression_snap_kernel,
+            compression_ea_use_covariance=self.compression_ea_use_covariance,
+            compression_ea_use_vnorm=self.compression_ea_use_vnorm,
+            compression_ea_n_future_positions=(
+                self.compression_ea_n_future_positions),
+            compression_ea_epsilon=self.compression_ea_epsilon,
+            compression_retention_dump=self.compression_retention_dump,
             multi_turn=self.multi_turn,
         )
         # Populate head-count-derived fields and re-validate.

@@ -188,6 +188,11 @@ class ModelRunnerOutput:
     compression_freed_block_ids: np.ndarray | None = None
     """int32 ndarray of physical block ids freed by compression (sorted +
     deduplicated). Routed through ``KVCacheManager.free_blocks_by_ids``."""
+    sliding_freed_block_ids: np.ndarray | None = None
+    """int32 ndarray of physical block ids freed by sliding-window eviction
+    (out-of-window front blocks of sliding-window layers). Routed through
+    ``KVCacheManager.null_blocks_by_ids`` — null-in-place (length-preserving),
+    NOT the shrinking ``free_blocks_by_ids`` used for compression."""
 
 
 # ModelRunnerOutput wrapper for async scheduling.

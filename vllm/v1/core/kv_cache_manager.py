@@ -432,6 +432,18 @@ class KVCacheManager:
         """
         self.coordinator.free_blocks_by_ids(block_ids, candidate_req_ids)
 
+    def null_blocks_by_ids(
+        self,
+        block_ids: np.ndarray,
+        candidate_req_ids: set[str] | None = None,
+    ) -> None:
+        """Sliding-window callback: return the worker-reported out-of-window
+        block ids to the free pool while nulling them in place in per-request
+        bookkeeping (length-preserving, head-grouped only). Counterpart of
+        ``free_blocks_by_ids`` for the sliding-window eviction path.
+        """
+        self.coordinator.null_blocks_by_ids(block_ids, candidate_req_ids)
+
     def reset_prefix_cache(self) -> bool:
         """Reset prefix cache. This function may be used in RLHF
         flows to invalidate prefix caching after the weights are updated,
