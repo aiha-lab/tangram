@@ -85,6 +85,18 @@ class CachedRequestState:
             return self.output_token_ids[idx - self.num_prompt_tokens]
         return -1
 
+    def drop_readd_snapshot(self) -> None:
+        """Clear the head-grouped verbatim re-add snapshot as one unit.
+
+        The three fields are captured together when a request leaves the
+        InputBatch and are all stale once it is resumed from preemption (which
+        re-prefills from scratch). Clearing them as a unit avoids forgetting a
+        field and leaking a stale value into the rebuilt row.
+        """
+        self.eff_seq_lens_snapshot = None
+        self.block_table_snapshot = None
+        self.block_table_readd_increment = None
+
 
 class InputBatch:
     def __init__(

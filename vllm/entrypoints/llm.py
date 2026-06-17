@@ -222,7 +222,9 @@ class LLM:
         compilation_config: int | dict[str, Any] | CompilationConfig | None = None,
         logits_processors: list[str | type[LogitsProcessor]] | None = None,
         # Head-group paging, compression, multi-turn.
-        page_group_size: int | None = None,
+        # Default 4 matches the CLI/EngineArgs default so both entry points
+        # behave identically; None selects the legacy dense layout.
+        page_group_size: int | None = 4,
         head_group_cluster_map: str | None = None,
         enable_compression: bool = False,
         compression_ratio: float = 0.3,

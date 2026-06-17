@@ -1192,16 +1192,19 @@ class Scheduler(SchedulerInterface):
                 cm = scheduler_output.compression_metadata.get(req_id)
                 if cm is not None and cm.is_last_chunk:
                     request.compression_done = True
+        # Both freed-block channels below come only from requests that ran a
+        # compression step this iteration, and ``compression_new_eff_seq_lens``
+        # is keyed by exactly those requests — a complete superset of both
+        # channels' owners that bounds the per-request sweep. None means "sweep
+        # every running request" (the sliding-window hot path).
+        candidate_req_ids: set[str] | None = (
+            set(model_runner_output.compression_new_eff_seq_lens.keys())
+            if model_runner_output.compression_new_eff_seq_lens
+            else None
+        )
+
         freed_ids = model_runner_output.compression_freed_block_ids
         if freed_ids is not None and freed_ids.size > 0:
-            # ``compression_new_eff_seq_lens`` keys cover every owner of
-            # ``compression_freed_block_ids``, so they bound the per-request
-            # sweep.
-            candidate_req_ids: set[str] | None = (
-                set(model_runner_output.compression_new_eff_seq_lens.keys())
-                if model_runner_output.compression_new_eff_seq_lens
-                else None
-            )
             self.kv_cache_manager.free_blocks_by_ids(
                 freed_ids,
                 candidate_req_ids=candidate_req_ids,
@@ -1217,7 +1220,7 @@ class Scheduler(SchedulerInterface):
         if sliding_freed_ids is not None and sliding_freed_ids.size > 0:
             self.kv_cache_manager.null_blocks_by_ids(
                 sliding_freed_ids,
-                candidate_req_ids=None,
+                candidate_req_ids=candidate_req_ids,
             )
 
         # Keep ``compress_max_eff_seq_len`` in sync with cache occupancy on

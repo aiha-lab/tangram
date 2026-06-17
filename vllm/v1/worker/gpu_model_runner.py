@@ -954,8 +954,7 @@ class GPUModelRunner(
                 # scratch with a fresh full block list, so its stale pre-preempt
                 # snapshot must be dropped (the normal ``add_row`` path applies).
                 if resumed_from_preemption:
-                    req_state.block_table_snapshot = None
-                    req_state.block_table_readd_increment = None
+                    req_state.drop_readd_snapshot()
                 elif req_state.block_table_snapshot is not None:
                     req_state.block_table_readd_increment = new_block_ids
 

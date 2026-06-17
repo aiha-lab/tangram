@@ -1457,12 +1457,15 @@ class EngineArgs:
         """
         current_platform.pre_register_and_update()
 
-        # Compression's per-layer pre-hook is incompatible with CUDA
-        # graph capture.
+        # Compression's per-layer pre-hook runs eager Python every forward and
+        # cannot be CUDA-graph captured, so force eager mode. Warn (not info):
+        # it overrides the CUDA-graph default.
         if self.enable_compression and not self.enforce_eager:
-            logger.info(
-                "Enabling enforce_eager (required by compression's "
-                "per-layer pre-hook).")
+            logger.warning(
+                "enable_compression=True forces enforce_eager=True: "
+                "compression's per-layer pre-hook cannot run under CUDA graph "
+                "capture, so CUDA graphs are disabled for this run."
+            )
             self.enforce_eager = True
 
         device_config = DeviceConfig(device=cast(Device, current_platform.device_type))

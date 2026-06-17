@@ -34,6 +34,20 @@ MambaDType = Literal["auto", "float32"]
 PrefixCachingHashAlgo = Literal["sha256", "sha256_cbor"]
 KVOffloadingBackend = Literal["native", "lmcache"]
 
+# Resolved vLLM model classes validated for head-grouped paged attention /
+# compression. google/gemma-3-12b-it resolves to the multimodal
+# Gemma3ForConditionalGeneration (not Gemma3ForCausalLM), so both are listed.
+HEAD_GROUPED_SUPPORTED_ARCHITECTURES = frozenset(
+    {
+        "LlamaForCausalLM",
+        "Qwen2ForCausalLM",
+        "Qwen3ForCausalLM",
+        "Gemma3ForCausalLM",
+        "Gemma3ForConditionalGeneration",
+        "GptOssForCausalLM",
+    }
+)
+
 
 @config
 @dataclass
@@ -507,16 +521,41 @@ class CacheConfig:
                     "replaces prefix caching)."
                 )
 
-        # Prefix caching is incompatible with compression and head-group
-        # paging; auto-disable.
+        # Prefix caching cannot represent head-group paging's non-uniform
+        # per-(layer, group) block layout or compression's in-place block
+        # mutation, so it is disabled. Warn (not info): it is on by default and
+        # this affects throughput.
         if (self.enable_compression or self.page_group_size is not None) and (
             self.enable_prefix_caching
         ):
-            logger.info(
-                "Disabling enable_prefix_caching (incompatible with %s).",
-                "compression" if self.enable_compression else "head-group paging",
+            feature = "compression" if self.enable_compression else "head-group paging"
+            logger.warning(
+                "Disabling prefix caching: it is incompatible with %s, which "
+                "is enabled. Prefix caching will not be used for this run.",
+                feature,
             )
             self.enable_prefix_caching = False
+
+    def verify_model_support(self, architecture: str) -> None:
+        """Reject head-grouped paging / compression on unvalidated models.
+
+        Unsupported architectures fall back to the dense attention path and
+        would silently produce wrong outputs, so fail at startup instead.
+        ``architecture`` is the resolved vLLM model class.
+        """
+        if self.page_group_size is None and not self.enable_compression:
+            return
+        if architecture in HEAD_GROUPED_SUPPORTED_ARCHITECTURES:
+            return
+        feature = "compression" if self.enable_compression else "head-group paging"
+        supported = ", ".join(sorted(HEAD_GROUPED_SUPPORTED_ARCHITECTURES))
+        raise ValueError(
+            f"Model architecture '{architecture}' does not support Tangram "
+            f"{feature} (head-grouped paged attention). Supported "
+            f"architectures: {supported}. To run this model, disable the "
+            f"feature with --page-group-size=None (and --enable-compression "
+            f"left off)."
+        )
 
     def verify_with_parallel_config(
         self,

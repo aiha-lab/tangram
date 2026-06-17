@@ -350,6 +350,8 @@ class VllmConfig:
         if self.model_config is not None:
             self.model_config.verify_with_parallel_config(self.parallel_config)
             self.model_config.verify_dual_chunk_attention_config(self.load_config)
+            # Reject models that don't support head-grouped paging / compression.
+            self.cache_config.verify_model_support(self.model_config.architecture)
 
         self.cache_config.verify_with_parallel_config(self.parallel_config)
 

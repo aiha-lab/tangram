@@ -239,7 +239,9 @@ def load_gates(
     the checkpoint is missing or shape-mismatched.
     """
     file_path = _download_or_local(model_name, gate_path)
-    blob = torch.load(file_path, weights_only=False, map_location="cpu")
+    # weights_only=True: the gate file comes from a remote Hub repo (untrusted)
+    # and is a pure tensor payload, so this is both safe and lossless.
+    blob = torch.load(file_path, weights_only=True, map_location="cpu")
     state_dicts: list[dict] = blob["module"]
     if len(state_dicts) != num_layers:
         raise ValueError(
