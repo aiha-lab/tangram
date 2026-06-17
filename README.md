@@ -47,10 +47,10 @@ pip install -e .
 - SnapKV
 - KeyDiff
 - ExpectedAttention
+- FastKVzip
 
 **🚧 WIP**
 
-- FastKVzip
 - TOVA
 - PyramidKV
 
@@ -60,6 +60,8 @@ RULER 8K.
 
 ### Non-uniform
 
+Selection level: `CrossLayerClusterLevel` (cross-layer threshold, cluster-calibrated; exact budget).
+
 <table>
 <thead>
 <tr>
@@ -68,19 +70,20 @@ RULER 8K.
 <th colspan="4">SnapKV</th>
 <th colspan="4">KeyDiff</th>
 <th colspan="4">ExpectedAttention</th>
+<th colspan="4">FastKVzip</th>
 </tr>
 <tr>
+<th>75%</th><th>50%</th><th>25%</th><th>10%</th>
 <th>75%</th><th>50%</th><th>25%</th><th>10%</th>
 <th>75%</th><th>50%</th><th>25%</th><th>10%</th>
 <th>75%</th><th>50%</th><th>25%</th><th>10%</th>
 </tr>
 </thead>
 <tbody>
-<tr><td>qwen3-4b</td><td>93.7</td><td>90.8</td><td>82.5</td><td>71.2</td><td>59.8</td><td>93.8</td><td>93.7</td><td>90.3</td><td>73.8</td><td>93.6</td><td>84.3</td><td>48.9</td><td>22.4</td></tr>
-<tr><td>llama3.1-8b</td><td>93.1</td><td>91.8</td><td>87.8</td><td>76.6</td><td>60.6</td><td>92.9</td><td>91.9</td><td>84.9</td><td>73.8</td><td>92.2</td><td>84.4</td><td>61.4</td><td>32.7</td></tr>
-<tr><td>gemma3-12b</td><td>91.7</td><td>85.2</td><td>72.3</td><td>61.4</td><td>54.5</td><td>91.3</td><td>89.3</td><td>79.2</td><td>67.9</td><td>90.5</td><td>72.4</td><td>40.0</td><td>21.6</td></tr>
-<tr><td>gptoss-20b</td><td>83.7</td><td>83.5</td><td>80.3</td><td>69.4</td><td>56.2</td><td>83.5</td><td>83.4</td><td>71.2</td><td>40.4</td><td>83.7</td><td>74.9</td><td>44.0</td><td>20.3</td></tr>
-<tr><td>qwen3-30b</td><td>95.3</td><td>90.8</td><td>85.1</td><td>74.7</td><td>66.6</td><td>95.3</td><td>95.2</td><td>93.8</td><td>81.7</td><td>94.6</td><td>85.5</td><td>51.4</td><td>26.5</td></tr>
+<tr><td>qwen3-4b</td><td>93.8</td><td>90.3</td><td>80.4</td><td>69.4</td><td>59.8</td><td>93.8</td><td>93.8</td><td>84.4</td><td>70.4</td><td>88.4</td><td>71.5</td><td>26.5</td><td>10.0</td><td>93.8</td><td>93.7</td><td>93.2</td><td>84.7</td></tr>
+<tr><td>llama3.1-8b</td><td>94.6</td><td>92.2</td><td>88.0</td><td>75.1</td><td>60.7</td><td>94.6</td><td>93.2</td><td>83.0</td><td>71.3</td><td>93.3</td><td>88.7</td><td>55.2</td><td>19.6</td><td>94.6</td><td>94.5</td><td>94.0</td><td>88.4</td></tr>
+<tr><td>gemma3-12b</td><td>91.6</td><td>80.1</td><td>68.4</td><td>59.6</td><td>52.3</td><td>81.1</td><td>77.5</td><td>68.2</td><td>50.9</td><td>85.4</td><td>77.3</td><td>11.7</td><td>9.7</td><td>91.4</td><td>91.1</td><td>86.2</td><td>52.1</td></tr>
+<tr><td>gptoss-20b</td><td>83.4</td><td>82.2</td><td>76.8</td><td>65.2</td><td>52.0</td><td>84.3</td><td>85.2</td><td>69.6</td><td>42.7</td><td>82.5</td><td>79.7</td><td>51.1</td><td>46.8</td><td>82.3</td><td>81.5</td><td>85.2</td><td>74.0</td></tr>
 </tbody>
 </table>
 
