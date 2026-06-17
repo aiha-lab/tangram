@@ -404,59 +404,18 @@ class BlockTable:
         # Reset row counts so a subsequent append_row writes from offset 0.
         self.num_blocks_per_row.fill(0)
 
-    def compact_after_compress_for_layer(
-        self,
-        row_idx: int,
-        layer_first_group: int,
-        num_head_groups_per_layer: int,
-        new_num_blocks: np.ndarray,
-    ) -> list[int]:
-        """Trim trailing block ids for one layer's groups in ``row_idx``.
-
-        For each layer-local group, block_table entries in
-        ``[new_num_blocks[g], old_num_blocks[g])`` are zeroed and their
-        physical ids returned (caller releases them via
-        ``KVCacheManager.free_blocks_by_ids``).
-        """
-        assert self.head_grouped, (
-            "compact_after_compress_for_layer is head-grouped only.")
-        num_groups = num_head_groups_per_layer
-        new_num_blocks = np.asarray(new_num_blocks, dtype=np.int32)
-        assert new_num_blocks.shape == (num_groups,), (
-            f"new_num_blocks shape {new_num_blocks.shape} != "
-            f"({num_groups},)")
-        end_group = layer_first_group + num_groups
-        old = self.num_blocks_per_row[row_idx, layer_first_group:end_group]
-        assert (new_num_blocks <= old).all(), (
-            "compact_after_compress_for_layer cannot grow num_blocks; "
-            f"old={old.tolist()} new={new_num_blocks.tolist()}")
-
-        block_table_np = self.block_table.np
-        freed: list[int] = []
-        for group_idx in range(num_groups):
-            old_n = int(old[group_idx])
-            new_n = int(new_num_blocks[group_idx])
-            if new_n == old_n:
-                continue
-            row_group = layer_first_group + group_idx
-            slice_view = block_table_np[row_idx, row_group, new_n:old_n]
-            freed.extend(int(x) for x in slice_view.tolist())
-            slice_view[:] = 0
-        self.num_blocks_per_row[
-            row_idx, layer_first_group:end_group] = new_num_blocks
-        return freed
-
     def compact_after_compress_all_layers(
         self,
         row_idx: int,
         num_head_groups_per_layer: int,
         new_num_blocks_per_layer: np.ndarray,
     ) -> np.ndarray:
-        """Batched ``compact_after_compress_for_layer`` across all layers.
+        """Trim trailing block ids for every layer's groups in ``row_idx``.
 
-        Fuses the per-layer loop into one numpy-vectorised scan.
-        ``new_num_blocks_per_layer`` has shape
-        ``[num_layers, num_head_groups_per_layer]``.
+        For each (layer, group), block_table entries in
+        ``[new_num_blocks[g], old_num_blocks[g])`` are zeroed and their physical
+        ids returned (caller releases them via ``free_blocks_by_ids``).
+        ``new_num_blocks_per_layer`` has shape ``[num_layers, groups]``.
         """
         assert self.head_grouped, (
             "compact_after_compress_all_layers is head-grouped only.")

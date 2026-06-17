@@ -51,9 +51,12 @@ import math
 import torch
 from torch import nn
 
+from vllm.logger import init_logger
 from vllm.model_executor.layers.rotary_embedding.common import (
     apply_rotary_emb_torch,
 )
+
+logger = init_logger(__name__)
 
 
 class ExpectedAttentionScorer(nn.Module):
@@ -101,6 +104,8 @@ class ExpectedAttentionScorer(nn.Module):
         cache = rotary_emb.cos_sin_cache.to(
             device=positions.device, dtype=torch.float32)
         max_pos = cache.shape[0]
+        # Safety net: positions past the cache collapse onto the last entry.
+        # Callers warn when this is reachable (see the future-position site).
         positions = positions.clamp_max(max_pos - 1)
         cos, sin = cache.index_select(0, positions).chunk(2, dim=-1)
         return cos, sin
@@ -157,6 +162,16 @@ class ExpectedAttentionScorer(nn.Module):
 
         # --- 3. average future-position rotation, applied to the keys as Rᵀ ---
         seq_end = position_offset + T
+        # The look-ahead window can run past the rotary cache near the model's
+        # max position; _cos_sin then clamps it, making the averaged future
+        # rotation approximate for the tail. Warn once (computed from ints, no
+        # device sync).
+        rope_max = rotary_emb.cos_sin_cache.shape[0]
+        if seq_end + self.n_future_positions > rope_max:
+            logger.warning_once(
+                "ExpectedAttention: look-ahead positions exceed the rotary "
+                "cache (%d); clamping to the last entry, so the future "
+                "rotation is approximate near the context tail.", rope_max)
         future = torch.arange(
             seq_end, seq_end + self.n_future_positions, device=query.device)
         fcos, fsin = self._cos_sin(rotary_emb, future)           # [F, rd/2]

@@ -1224,17 +1224,19 @@ class Scheduler(SchedulerInterface):
             )
 
         # Keep ``compress_max_eff_seq_len`` in sync with cache occupancy on
-        # non-compression steps too — mirrors the worker-side
-        # ``effective_seq_lens_cpu`` increment. Without this, decode writes
-        # would spill back into block 0 once they exceeded the post-
-        # compression block count.
-        for req_id, num_tokens in num_scheduled_tokens.items():
-            if num_tokens <= 0 or req_id in compressed_this_step:
-                continue
-            request = self.requests.get(req_id)
-            if (request is not None
-                    and request.compress_max_eff_seq_len is not None):
-                request.compress_max_eff_seq_len += num_tokens
+        # decode steps too — mirrors the worker-side ``effective_seq_lens_cpu``
+        # increment. Without this, decode writes would spill back into block 0
+        # once they exceeded the post-compression block count. Gated on
+        # enable_compression so this per-step scan is skipped entirely when
+        # compression is off (the field is always None then).
+        if self.cache_config.enable_compression:
+            for req_id, num_tokens in num_scheduled_tokens.items():
+                if num_tokens <= 0 or req_id in compressed_this_step:
+                    continue
+                request = self.requests.get(req_id)
+                if (request is not None
+                        and request.compress_max_eff_seq_len is not None):
+                    request.compress_max_eff_seq_len += num_tokens
 
         # NOTE(woosuk): As len(num_scheduled_tokens) can be up to 1K or more,
         # the below loop can be a performance bottleneck. We should do our best

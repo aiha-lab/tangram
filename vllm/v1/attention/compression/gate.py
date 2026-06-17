@@ -22,6 +22,9 @@ logger = init_logger(__name__)
 # Hub repo hosting the trained gate checkpoints, laid out as per-model
 # subdirectories (e.g. ``qwen3-4b-instruct-2507/q4_dim16_sink16.pt``).
 _GATE_HF_REPO = "hmkim97/tangram-gate"
+# Pin to an immutable commit so a later push to the repo can't silently swap
+# the weights behind an unchanged filename (reproducibility).
+_GATE_HF_REVISION = "06a628fab229ff3075f69b61f43fa0ef6631c875"
 _GATE_SHORT_ID_ALIASES = {
     "llama-3.1-8b-instruct": "llama3.1-8b-instruct",
 }
@@ -145,28 +148,79 @@ def _resolve_gate_filename(model_name: str, gate_path: str) -> str:
     return os.path.join(short, fname + ".pt")
 
 
-def _download_or_local(model_name: str, gate_path: str) -> str:
-    # Priority: (1) absolute local path, (2) the tangram-gate Hub repo,
-    # (3) ~/FastKVzip/result_gate local fallback.
-    if os.path.isabs(gate_path) and os.path.exists(gate_path):
-        return gate_path
-    resolved = _resolve_gate_filename(model_name, gate_path)
+def _local_gate_path(resolved: str) -> str | None:
+    # Local Fast-KVzip output dir, checked before any network so air-gapped
+    # deployments work. None when absent.
+    candidate = os.path.expanduser(
+        os.path.join("~", "FastKVzip", "result_gate", resolved))
+    return candidate if os.path.exists(candidate) else None
+
+
+def _hf_cached_gate_path(resolved: str) -> str | None:
+    # HF cache lookup only, no network (local_files_only); None on a miss.
+    from huggingface_hub import hf_hub_download
+    from huggingface_hub.utils import (EntryNotFoundError,
+                                       LocalEntryNotFoundError)
     try:
-        from huggingface_hub import hf_hub_download
         return hf_hub_download(
             repo_id=_GATE_HF_REPO,
             filename=resolved,
             repo_type="model",
+            revision=_GATE_HF_REVISION,
+            local_files_only=True,
         )
-    except Exception as e:
-        fallback = os.path.expanduser(
-            os.path.join("~", "FastKVzip", "result_gate", resolved))
-        if os.path.exists(fallback):
-            return fallback
+    except (LocalEntryNotFoundError, EntryNotFoundError):
+        return None
+
+
+def _hf_download_gate_path(resolved: str, gate_path: str) -> str:
+    # Download from the pinned revision; on failure raise with the cause
+    # distinguished instead of a generic "not found".
+    from huggingface_hub import hf_hub_download
+    from huggingface_hub.utils import (EntryNotFoundError, GatedRepoError,
+                                       HfHubHTTPError, OfflineModeIsEnabled,
+                                       RepositoryNotFoundError,
+                                       RevisionNotFoundError)
+    try:
+        return hf_hub_download(
+            repo_id=_GATE_HF_REPO,
+            filename=resolved,
+            repo_type="model",
+            revision=_GATE_HF_REVISION,
+        )
+    except (RepositoryNotFoundError, GatedRepoError) as e:
+        raise RuntimeError(
+            f"Compression gate repo '{_GATE_HF_REPO}' is inaccessible "
+            f"(deleted, made private, or the HF token is missing/"
+            f"unauthorized). Set a valid HF token, or stage the checkpoint "
+            f"locally so no Hub access is needed.") from e
+    except RevisionNotFoundError as e:
+        raise RuntimeError(
+            f"Compression gate repo '{_GATE_HF_REPO}' has no revision "
+            f"'{_GATE_HF_REVISION}' (the pinned commit was rewritten or "
+            f"removed).") from e
+    except EntryNotFoundError as e:
         raise FileNotFoundError(
             f"Compression gate checkpoint '{gate_path}' (resolved to "
-            f"'{resolved}') not found in the {_GATE_HF_REPO} Hub repo and no "
-            f"local fallback at '{fallback}'.") from e
+            f"'{resolved}') does not exist in '{_GATE_HF_REPO}' at revision "
+            f"'{_GATE_HF_REVISION}'.") from e
+    except (OfflineModeIsEnabled, HfHubHTTPError) as e:
+        raise RuntimeError(
+            f"Could not reach the compression gate repo '{_GATE_HF_REPO}' "
+            f"(offline mode or network error) and '{resolved}' is not in the "
+            f"local cache. Stage the checkpoint locally for offline use.") \
+            from e
+
+
+def _download_or_local(model_name: str, gate_path: str) -> str:
+    # Try every offline source before the network, in order:
+    # (1) absolute path, (2) local FastKVzip dir, (3) HF cache, (4) download.
+    if os.path.isabs(gate_path) and os.path.exists(gate_path):
+        return gate_path
+    resolved = _resolve_gate_filename(model_name, gate_path)
+    return (_local_gate_path(resolved)
+            or _hf_cached_gate_path(resolved)
+            or _hf_download_gate_path(resolved, gate_path))
 
 
 def _shard_gate_state_dict(
@@ -273,17 +327,16 @@ def load_gates(
             f"must be a multiple of num_kv_heads_per_rank "
             f"({num_kv_heads_per_rank}).")
 
-    # Filename-encoded sink dim wins if it differs from the tensor —
-    # mirrors official loader.
+    # k_base's third dim is the authoritative sink count (the gate is built and
+    # weight-loaded against it). A differing filename-encoded count means a
+    # mislabeled checkpoint — fail loudly, like the mismatch checks above.
     m = re.search(r"sink(\d+)", os.path.basename(file_path))
-    if m:
-        sink_from_name = int(m.group(1))
-        if sink_from_name != sink_dim:
-            logger.warning(
-                "Compression gate sink_dim mismatch: ckpt-tensor=%d, "
-                "ckpt-filename=%d; trusting tensor shape.",
-                sink_dim, sink_from_name,
-            )
+    if m and int(m.group(1)) != sink_dim:
+        raise ValueError(
+            f"Compression gate sink_dim mismatch for '{gate_path}': "
+            f"checkpoint tensor has sink_dim={sink_dim} but the filename "
+            f"encodes sink_dim={int(m.group(1))}. The checkpoint is "
+            f"mislabeled or wrongly paired.")
 
     gates: list[CompressionGate] = []
     for layer_idx, state_dict in enumerate(state_dicts):

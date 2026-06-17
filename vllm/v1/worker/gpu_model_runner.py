@@ -2898,6 +2898,11 @@ class GPUModelRunner(
         if cache_config.compression_retention_dump is not None:
             from vllm.v1.attention.compression.profiling import (
                 RetentionProfileObserver)
+            logger.warning(
+                "compression_retention_dump is set to '%s': attaching the "
+                "offline retention profiler. This writes a dump file per keep "
+                "decision and adds overhead — leave it unset in production.",
+                cache_config.compression_retention_dump)
             # Tag dumps with the TP rank: each rank observes only its own KV-head
             # shard, and all ranks share the dump directory.
             self.compressor.keep_decision_observer = RetentionProfileObserver(
@@ -3367,12 +3372,13 @@ class GPUModelRunner(
         ):
             scheduler_output = deepcopy(scheduler_output)
 
-        # Clear last step's compression results; they remain non-empty
-        # across the step so external probes see them after
-        # ``llm.generate`` returns.
-        self.last_compression_new_eff_seq_lens = {}
-        self.last_compression_freed_block_ids = np.empty(0, dtype=np.int32)
-        self.last_sliding_freed_block_ids = np.empty(0, dtype=np.int32)
+        # Clear last step's compression results (kept across the step so probes
+        # see them after ``llm.generate`` returns). Only compression populates
+        # these, so skip the per-step allocations when it is off.
+        if self.compressor is not None:
+            self.last_compression_new_eff_seq_lens = {}
+            self.last_compression_freed_block_ids = np.empty(0, dtype=np.int32)
+            self.last_sliding_freed_block_ids = np.empty(0, dtype=np.int32)
 
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         with record_function_or_nullcontext("gpu_model_runner: preprocess"):

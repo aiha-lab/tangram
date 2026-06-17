@@ -438,6 +438,13 @@ _LEVELS: dict[str, type[SelectionLevel]] = {
 #: (config validation imports this rather than re-listing the names).
 SELECTION_LEVELS: tuple[str, ...] = tuple(_LEVELS)
 
+#: Levels that only support TP=1, derived from the registry so a new cluster
+#: level is covered automatically. Their per-cluster max-pool would need a
+#: cross-rank gather of sharded member scores (see ``_ClusterLevel``).
+TP1_ONLY_SELECTION_LEVELS: frozenset[str] = frozenset(
+    name for name, cls in _LEVELS.items() if issubclass(cls, _ClusterLevel)
+)
+
 
 def make_selection_level(level: str) -> SelectionLevel:
     """Axis-1 dispatch — the ONE place the level is chosen. ``level`` is

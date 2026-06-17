@@ -331,9 +331,24 @@ class CacheConfig:
             "num_hidden_layers",
             "num_head_groups",
             "num_head_groups_per_layer",
+            # Runtime KV-eviction policy (scheduler / compressor, outside the
+            # compiled forward) — no effect on graph shape. enable_compression
+            # and page_group_size stay hashed (they change graph / backend).
             "compression_ratio",
             "compression_floor_min",
             "compression_chunk_size",
+            "compression_window_size",
+            "compression_n_sink_tokens",
+            "compression_gate_path",
+            "compression_level",
+            "compression_scorer",
+            "compression_snap_window",
+            "compression_snap_kernel",
+            "compression_ea_use_covariance",
+            "compression_ea_use_vnorm",
+            "compression_ea_n_future_positions",
+            "compression_ea_epsilon",
+            "compression_retention_dump",
             # Cluster map relabels physical KV placement only; it does not
             # change the compiled graph shape or kernel selection.
             "head_group_cluster_map",
@@ -577,3 +592,21 @@ class CacheConfig:
             raise ValueError("Too large swap space. " + msg)
         elif cpu_memory_usage > 0.4 * total_cpu_memory:
             logger.warning("Possibly too large swap space. %s", msg)
+
+        # Cluster-calibrated levels max-pool over a cluster's member KV heads,
+        # which TP shards across ranks; the cross-rank gather is not yet
+        # implemented, so reject the combination at startup instead of crashing
+        # on the first compression request.
+        # TODO: implement the cross-rank member-score gather and lift this.
+        if self.enable_compression and parallel_config.tensor_parallel_size > 1:
+            from vllm.v1.attention.compression.selection_level import (
+                TP1_ONLY_SELECTION_LEVELS,
+            )
+
+            if self.compression_level in TP1_ONLY_SELECTION_LEVELS:
+                raise ValueError(
+                    f"compression_level='{self.compression_level}' is only "
+                    f"supported with tensor_parallel_size=1, got "
+                    f"{parallel_config.tensor_parallel_size}. Use a non-cluster "
+                    f"compression_level (e.g. 'crosslayer_head') for TP>1."
+                )
