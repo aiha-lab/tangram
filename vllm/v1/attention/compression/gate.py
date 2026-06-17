@@ -22,6 +22,9 @@ logger = init_logger(__name__)
 # Hub repo hosting the trained gate checkpoints, laid out as per-model
 # subdirectories (e.g. ``qwen3-4b-instruct-2507/q4_dim16_sink16.pt``).
 _GATE_HF_REPO = "hmkim97/tangram-gate"
+_GATE_SHORT_ID_ALIASES = {
+    "llama-3.1-8b-instruct": "llama3.1-8b-instruct",
+}
 
 
 class _RMSNorm(nn.Module):
@@ -138,6 +141,7 @@ def _resolve_gate_filename(model_name: str, gate_path: str) -> str:
     num_groups = cfg.num_attention_heads // cfg.num_key_value_heads
     fname = f"q{num_groups}_dim16_sink16"
     short = model_name.rstrip("/").split("/")[-1].lower()
+    short = _GATE_SHORT_ID_ALIASES.get(short, short)
     return os.path.join(short, fname + ".pt")
 
 
