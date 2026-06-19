@@ -228,6 +228,7 @@ benchmarks/tangram/data/
 benchmarks/tangram/run_ruler_sweep.py
 benchmarks/tangram/run_uniform_sweep.py
 benchmarks/tangram/summarize_ruler_sweep.py
+benchmarks/tangram/run_scbench_sweep.sh
 
 # Linting
 actionlint

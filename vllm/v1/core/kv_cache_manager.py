@@ -14,7 +14,7 @@ from vllm.v1.core.kv_cache_coordinator import get_kv_cache_coordinator
 from vllm.v1.core.kv_cache_utils import KVCacheBlock
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.metrics.stats import PrefixCacheStats
-from vllm.v1.request import Request
+from vllm.v1.request import Request, RequestStatus
 
 logger = init_logger(__name__)
 
@@ -152,6 +152,7 @@ class KVCacheManager:
         enable_kv_cache_events: bool = False,
         dcp_world_size: int = 1,
         pcp_world_size: int = 1,
+        watermark: float = 0.0,
     ) -> None:
         self.max_model_len = max_model_len
 
@@ -192,6 +193,11 @@ class KVCacheManager:
         self.num_kv_cache_groups = len(kv_cache_config.kv_cache_groups)
         self.block_pool = self.coordinator.block_pool
         self.kv_cache_config = kv_cache_config
+        # Headroom (in blocks) kept free when admitting waiting/preempted
+        # requests, to avoid greedy admission consuming the last free block and
+        # triggering a preemption on the next decode step. 0 => no-op.
+        assert watermark >= 0.0, "watermark must be non-negative"
+        self.watermark_blocks = int(watermark * kv_cache_config.num_blocks)
         # Head-grouped: any single-type manager in this mode flips the flag,
         # so allocate / get_blocks return int32 ndarrays via
         # ``KVCacheBlocks.block_ids_array``.
@@ -280,6 +286,53 @@ class KVCacheManager:
 
         return self.create_kv_cache_blocks(computed_blocks), num_new_computed_tokens
 
+    def _admission_watermark_blocks(
+        self, request: Request, has_scheduled_reqs: bool
+    ) -> int:
+        """Number of free blocks to keep as headroom when admitting ``request``.
+
+        The watermark is reserved only for requests entering the running queue
+        (those in the ``WAITING`` or ``PREEMPTED`` state) and only when the
+        running queue is already non-empty (``has_scheduled_reqs``) — that is,
+        at least one request is already running from a prior step or has already
+        been admitted earlier in this step. That guard lets an otherwise-empty
+        running queue always admit at least one request, so a request can never
+        be starved by the watermark alone. Already-running requests and a
+        disabled watermark both yield 0, which leaves the free-block check
+        identical to the pre-watermark behavior.
+        """
+        if has_scheduled_reqs and request.status in (
+            RequestStatus.WAITING,
+            RequestStatus.PREEMPTED,
+        ):
+            return self.watermark_blocks
+        return 0
+
+    def _full_sequence_fits(
+        self,
+        request: Request,
+        new_computed_blocks: tuple[Sequence[KVCacheBlock], ...],
+        num_encoder_tokens: int,
+        watermark_blocks: int,
+    ) -> bool:
+        """Whether the request's entire input sequence, plus the admission
+        watermark, fits in the currently free KV cache blocks.
+
+        Reserves the uncompressed sequence length; when compression is enabled a
+        tighter, compression-aware estimate could be used instead.
+        """
+        full_num_tokens = min(request.num_tokens, self.max_model_len)
+        full_blocks_needed = self.coordinator.get_num_blocks_to_allocate(
+            request_id=request.request_id,
+            num_tokens=full_num_tokens,
+            new_computed_blocks=new_computed_blocks,
+            num_encoder_tokens=num_encoder_tokens,
+        )
+        return (
+            full_blocks_needed + watermark_blocks
+            <= self.block_pool.get_num_free_blocks()
+        )
+
     def allocate_slots(
         self,
         request: Request,
@@ -290,6 +343,8 @@ class KVCacheManager:
         delay_cache_blocks: bool = False,
         num_encoder_tokens: int = 0,
         effective_num_cached_tokens: int | None = None,
+        full_sequence_must_fit: bool = False,
+        has_scheduled_reqs: bool = False,
     ) -> KVCacheBlocks | None:
         """Add slots for a request with new tokens to append.
 
@@ -334,6 +389,21 @@ class KVCacheManager:
         else:
             new_computed_block_list = self.empty_kv_cache_blocks.blocks
 
+        # Admission headroom kept free so a greedy admission does not consume
+        # the last free block and force a preemption on the next decode step.
+        # See ``_admission_watermark_blocks`` for the no-starvation guarantee.
+        watermark_blocks = self._admission_watermark_blocks(
+            request, has_scheduled_reqs
+        )
+
+        # Gate admission on the request's full input sequence fitting (not just
+        # the first chunk) to prevent over-admission and preemption thrashing
+        # under chunked prefill.
+        if full_sequence_must_fit and not self._full_sequence_fits(
+            request, new_computed_block_list, num_encoder_tokens, watermark_blocks
+        ):
+            return None
+
         # Free the blocks that are skipped during the attention computation
         # (e.g., tokens outside the sliding window).
         # We can do this even if we cannot schedule this request due to
@@ -368,7 +438,11 @@ class KVCacheManager:
             num_encoder_tokens=num_encoder_tokens,
         )
 
-        if num_blocks_to_allocate > self.block_pool.get_num_free_blocks():
+        # Apply the same admission headroom to the per-step allocation check.
+        if (
+            num_blocks_to_allocate + watermark_blocks
+            > self.block_pool.get_num_free_blocks()
+        ):
             # Cannot allocate new blocks
             return None
 

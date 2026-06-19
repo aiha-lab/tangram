@@ -187,6 +187,13 @@ class Scheduler(SchedulerInterface):
             enable_kv_cache_events=self.enable_kv_cache_events,
             dcp_world_size=self.dcp_world_size,
             pcp_world_size=self.pcp_world_size,
+            watermark=self.scheduler_config.watermark,
+        )
+        # Admission control: gate new requests on the full input sequence
+        # fitting in the KV cache (not just the first chunk), to prevent
+        # over-admission and preemption thrashing under chunked prefill.
+        self.scheduler_reserve_full_isl = (
+            self.scheduler_config.scheduler_reserve_full_isl
         )
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
         self.use_v2_model_runner = envs.VLLM_USE_V2_MODEL_RUNNER
@@ -634,6 +641,12 @@ class Scheduler(SchedulerInterface):
                     delay_cache_blocks=load_kv_async,
                     num_encoder_tokens=num_encoder_tokens,
                     effective_num_cached_tokens=effective_num_cached_tokens,
+                    full_sequence_must_fit=self.scheduler_reserve_full_isl,
+                    # A non-empty running queue (carryover from a prior step or
+                    # requests admitted earlier in this step) means the watermark
+                    # can be enforced without risking starvation; an empty queue
+                    # always admits at least one request.
+                    has_scheduled_reqs=bool(self.running),
                 )
 
                 if new_blocks is None:

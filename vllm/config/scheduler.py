@@ -70,6 +70,19 @@ class SchedulerConfig:
     In real usage, this should be set in `EngineArgs.create_engine_config`.
     """
 
+    watermark: float = Field(default=0.0, ge=0.0, lt=1.0)
+    """Fraction of total KV cache blocks to keep free (the watermark) when
+    admitting waiting or preempted requests into the running queue. This
+    headroom helps avoid frequent KV cache eviction and the resulting repeated
+    preemption of requests when GPU memory is scarce. 0.0 reproduces the
+    pre-watermark behavior exactly."""
+
+    scheduler_reserve_full_isl: bool = True
+    """If True, the scheduler checks whether the full input sequence length
+    (``isl``) fits in the KV cache before admitting a new request, rather than
+    only checking the first chunk. Prevents over-admission and KV cache
+    thrashing with chunked prefill."""
+
     is_multimodal_model: bool = False
     """True if the model is multimodal."""
 

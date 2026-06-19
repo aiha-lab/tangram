@@ -439,6 +439,8 @@ class EngineArgs:
     max_num_partial_prefills: int = SchedulerConfig.max_num_partial_prefills
     max_long_partial_prefills: int = SchedulerConfig.max_long_partial_prefills
     long_prefill_token_threshold: int = SchedulerConfig.long_prefill_token_threshold
+    watermark: float = SchedulerConfig.watermark
+    scheduler_reserve_full_isl: bool = SchedulerConfig.scheduler_reserve_full_isl
     max_num_seqs: int | None = None
     max_logprobs: int = ModelConfig.max_logprobs
     logprobs_mode: LogprobsMode = ModelConfig.logprobs_mode
@@ -1168,6 +1170,13 @@ class EngineArgs:
             "--long-prefill-token-threshold",
             **scheduler_kwargs["long_prefill_token_threshold"],
         )
+        scheduler_group.add_argument(
+            "--watermark", **scheduler_kwargs["watermark"]
+        )
+        scheduler_group.add_argument(
+            "--scheduler-reserve-full-isl",
+            **scheduler_kwargs["scheduler_reserve_full_isl"],
+        )
         # multi-step scheduling has been removed; corresponding arguments
         # are no longer supported.
         scheduler_group.add_argument(
@@ -1806,6 +1815,8 @@ class EngineArgs:
             max_num_partial_prefills=self.max_num_partial_prefills,
             max_long_partial_prefills=self.max_long_partial_prefills,
             long_prefill_token_threshold=self.long_prefill_token_threshold,
+            watermark=self.watermark,
+            scheduler_reserve_full_isl=self.scheduler_reserve_full_isl,
             disable_hybrid_kv_cache_manager=self.disable_hybrid_kv_cache_manager,
             async_scheduling=self.async_scheduling,
             stream_interval=self.stream_interval,
