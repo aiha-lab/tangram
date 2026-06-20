@@ -94,7 +94,6 @@ def main() -> None:
     extra: dict = {}
     if args.enable_compression:
         extra.update(
-            enable_compression=True,
             compression_ratio=args.compression_ratio,
             compression_gate_path=args.compression_gate_path,
         )

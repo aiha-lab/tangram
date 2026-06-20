@@ -23,7 +23,7 @@ the ``LLM`` entrypoint that is just a keyword argument:
 
     from vllm import LLM
 
-    llm = LLM(model=..., enable_compression=True, page_group_size=1,
+    llm = LLM(model=..., compression_ratio=0.3, page_group_size=1,
               compression_retention_dump=dump_dir, ...)
     llm.generate(prompts, ...)          # each keep decision is written to disk
     # then aggregate dump_dir into a profile (build_profile.py --backend vllm)

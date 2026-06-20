@@ -1,15 +1,35 @@
 # Head-group cluster maps
 
-Prebuilt head-group cluster maps consumed at runtime via
-`--head-group-cluster-map <path>` (CLI) / `head_group_cluster_map=<path>` (LLM
-kwarg). Each map assigns every `(layer, kv_head)` to a `(cluster, column)` so
-heads with similar retention budgets — possibly across different layers — share
-physical KV blocks, removing the head-group max-pool waste. See
+Prebuilt head-group cluster maps consumed at runtime. Each map assigns every
+`(layer, kv_head)` to a `(cluster, column)` so heads with similar retention
+budgets — possibly across different layers — share physical KV blocks, removing
+the head-group max-pool waste. See
 `../../../tangram_impl/tangram-asp/17-head-group-clustering/HANDOFF.md` for the
 design.
 
-Passing no map (default `None`) uses the identity map (adjacent-head grouping
-within a layer), i.e. the original head-group paging.
+## How a map is selected (`head_group_cluster_map`)
+
+The `head_group_cluster_map` config (CLI `--head-group-cluster-map`, LLM kwarg
+`head_group_cluster_map=...`) takes one of three forms, resolved once at engine
+startup (`CacheConfig.resolve_head_group_cluster_map`):
+
+- **`None` (default) — auto-resolve.** When compression is enabled, the engine
+  looks up the bundled map matching the running model, `compression_scorer`,
+  `page_group_size`, and `compression_level` under this directory and uses it;
+  if none matches (or under TP>1, or for a scorer/level that ships no map) it
+  falls back to the identity map (adjacent-head grouping) with a warning. The
+  lookup follows the naming convention below; the map's `meta` is cross-checked
+  against the model (scope, source model, `page_group_size`, `num_kv_heads`)
+  before it is accepted, so a slug collision cannot silently load a wrong map.
+- **An explicit `.npz` path** — load that map strictly (a missing or mismatched
+  file raises). Bypasses auto-resolution.
+- **The literal `"identity"`** — force the identity map (adjacent-head grouping
+  within a layer, i.e. the original head-group paging); opt out of
+  auto-resolution.
+
+Add new maps by dropping a file that follows the convention below — auto-resolve
+picks it up with no code change. The resolver derives the directory from the
+installed package; set `TANGRAM_CLUSTER_MAPS_DIR` to point at a relocated tree.
 
 ## Naming convention
 

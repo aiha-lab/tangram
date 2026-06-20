@@ -350,6 +350,21 @@ def load_cluster_map(
     )
 
 
+def read_cluster_map_meta(path: str) -> dict | None:
+    """Return a cluster map's ``meta`` JSON (provenance: ``source_model``,
+    ``page_group_size``, ``cluster_scope``, ``static_layer_ids``, ...), or
+    ``None`` for older maps without it. Sole reader of that blob.
+    """
+    import json
+
+    import numpy as np
+
+    data = np.load(path, allow_pickle=False)
+    if "meta" not in data:
+        return None
+    return json.loads(bytes(data["meta"]).decode("utf-8"))
+
+
 def read_cluster_map_static_layer_ids(path: str) -> list[int] | None:
     """Return the ``static_layer_ids`` a cluster map records in its metadata,
     or ``None`` if absent.
@@ -360,14 +375,9 @@ def read_cluster_map_static_layer_ids(path: str) -> list[int] | None:
     the running model's full-attention layers (not just their count). Dense
     maps and older maps without the field return ``None``.
     """
-    import json
-
-    import numpy as np
-
-    data = np.load(path, allow_pickle=False)
-    if "meta" not in data:
+    meta = read_cluster_map_meta(path)
+    if meta is None:
         return None
-    meta = json.loads(bytes(data["meta"]).decode("utf-8"))
     static_layer_ids = meta.get("static_layer_ids")
     if static_layer_ids is None:
         return None

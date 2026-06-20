@@ -553,7 +553,6 @@ class EngineArgs:
     # Head-group paging, compression, multi-turn.
     page_group_size: int | None = CacheConfig.page_group_size
     head_group_cluster_map: str | None = CacheConfig.head_group_cluster_map
-    enable_compression: bool = CacheConfig.enable_compression
     compression_ratio: float = CacheConfig.compression_ratio
     compression_window_size: int = CacheConfig.compression_window_size
     compression_n_sink_tokens: int = CacheConfig.compression_n_sink_tokens
@@ -980,9 +979,6 @@ class EngineArgs:
         cache_group.add_argument(
             "--head-group-cluster-map",
             **cache_kwargs["head_group_cluster_map"],
-        )
-        cache_group.add_argument(
-            "--enable-compression", **cache_kwargs["enable_compression"]
         )
         cache_group.add_argument(
             "--compression-ratio", **cache_kwargs["compression_ratio"]
@@ -1469,11 +1465,12 @@ class EngineArgs:
         # Compression's per-layer pre-hook runs eager Python every forward and
         # cannot be CUDA-graph captured, so force eager mode. Warn (not info):
         # it overrides the CUDA-graph default.
-        if self.enable_compression and not self.enforce_eager:
+        if self.compression_ratio < 1.0 and not self.enforce_eager:
             logger.warning(
-                "enable_compression=True forces enforce_eager=True: "
-                "compression's per-layer pre-hook cannot run under CUDA graph "
-                "capture, so CUDA graphs are disabled for this run."
+                "compression (compression_ratio=%s < 1.0) forces "
+                "enforce_eager=True: compression's per-layer pre-hook cannot "
+                "run under CUDA graph capture, so CUDA graphs are disabled for "
+                "this run.", self.compression_ratio
             )
             self.enforce_eager = True
 
@@ -1563,7 +1560,6 @@ class EngineArgs:
             kv_offloading_backend=self.kv_offloading_backend,
             page_group_size=self.page_group_size,
             head_group_cluster_map=self.head_group_cluster_map,
-            enable_compression=self.enable_compression,
             compression_ratio=self.compression_ratio,
             compression_window_size=self.compression_window_size,
             compression_n_sink_tokens=self.compression_n_sink_tokens,
@@ -1827,13 +1823,13 @@ class EngineArgs:
         # in a step. This rules out the co-batching scenarios (multi-req
         # prefill+compress, mixed prefill+compress + decode) that would
         # need extra cross-request bookkeeping.
-        if cache_config.enable_compression:
+        if cache_config.compression_enabled:
             if (
                 scheduler_config.max_num_batched_tokens
                 != cache_config.compression_chunk_size
             ):
                 raise ValueError(
-                    "When --enable-compression is set, "
+                    "When compression is on (compression_ratio < 1.0), "
                     "--max-num-batched-tokens must equal "
                     f"--compression-chunk-size. Got "
                     f"max_num_batched_tokens="
@@ -2198,10 +2194,10 @@ class EngineArgs:
             # With compression on, default ``max_num_batched_tokens`` to
             # ``compression_chunk_size`` so at most one request's chunk
             # fits in a step.
-            if self.enable_compression and self.compression_chunk_size:
+            if self.compression_ratio < 1.0 and self.compression_chunk_size:
                 self.max_num_batched_tokens = int(self.compression_chunk_size)
                 logger.debug(
-                    "enable_compression=True — defaulting "
+                    "compression on (compression_ratio < 1.0) — defaulting "
                     "max_num_batched_tokens to compression_chunk_size=%d.",
                     self.max_num_batched_tokens,
                 )
