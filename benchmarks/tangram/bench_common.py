@@ -385,7 +385,6 @@ def build_llm(args: argparse.Namespace) -> LLM:
     # stays cold so we get a true reference point against the swept ratios.
     if args.ratio < 1.0:
         llm_kwargs.update(
-            enable_compression=True,
             compression_ratio=args.ratio,
             compression_chunk_size=args.compression_chunk_size,
             compression_n_sink_tokens=args.compression_n_sink_tokens,

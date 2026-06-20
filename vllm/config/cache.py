@@ -167,21 +167,22 @@ class CacheConfig:
     """Head-group size; ``None`` disables head-group paging.
     Must divide ``num_kv_heads``."""
     head_group_cluster_map: str | None = None
-    """Path to a head-group cluster map ``.npz`` with integer arrays
-    ``cluster_of`` and ``column_of`` (built by ``tools/head_group_clustering``).
-    Default ``None`` uses the identity map (adjacent-head grouping). When set,
-    KV heads are clustered by retention-budget similarity (possibly across
-    layers); requires ``page_group_size`` set and matching the map's
-    ``page_group_size``. Only the physical placement of each head's KV changes,
-    so at no compression the output is identical to the identity map."""
+    """Head-group cluster map ``.npz`` (``cluster_of`` / ``column_of`` arrays
+    built by ``tools/head_group_clustering``) clustering KV heads by retention
+    similarity, possibly across layers. Only physical KV placement changes, so
+    at no compression the output matches the identity map. Three forms: ``None``
+    (default) auto-resolves the bundled map for this model / ``compression_scorer``
+    / ``page_group_size`` / ``compression_level``, falling back to identity when
+    none matches; an explicit path loads strictly; ``"identity"`` forces the
+    identity (adjacent-head) map. Requires ``page_group_size`` set."""
 
     # KV cache compression. Generalized over two orthogonal axes: selection
     # level (``compression_level``) and score producer (``compression_scorer``).
-    enable_compression: bool = False
-    """Enable KV cache compression (head-group paging required)."""
-    compression_ratio: float = 0.3
-    """Fraction of tokens kept per chunk; each chunk keeps
-    ``floor(ratio * re_eval_size)`` tokens."""
+    compression_ratio: float = 1.0
+    """Fraction of tokens kept per chunk (``floor(ratio * re_eval_size)``), and
+    the compression on/off switch: ``1.0`` (default) keeps everything (no
+    compression), ``< 1.0`` enables compression (requires ``page_group_size``).
+    Must satisfy ``0 < compression_ratio <= 1``; see ``compression_enabled``."""
     compression_window_size: int = 32
     """Recent tokens always kept during scoring."""
     compression_n_sink_tokens: int = 4
@@ -197,27 +198,30 @@ class CacheConfig:
     from ``hmkim97/tangram-gate``; a local path is also accepted."""
 
     # --- Compression: two orthogonal axes (selection level + scorer) ---
-    compression_level: str = "crosslayer_head"
+    compression_level: str = "crosslayer_cluster"
     """Axis 1 — selection level (the rule turning eval scores into a per-(layer,
     group) kept count). Named ``{scope}_{granularity}`` over two orthogonal axes:
     threshold scope (``crosslayer`` global vs ``perlayer``) and calibration
     granularity (``head`` -> max-pool inflates the budget; ``cluster`` -> exact
-    budget). One of:
+    budget). The cluster-calibrated levels are TP=1 only; under TP>1 they are
+    downgraded to their head-calibrated counterpart of the same scope (see
+    ``verify_with_parallel_config``). One of:
 
-    * ``"crosslayer_head"`` (default) — a single CROSS-layer global threshold,
+    * ``"crosslayer_head"`` — a single CROSS-layer global threshold,
       head-calibrated (reference ``pair``). Each (layer, group) keeps a divergent
       count: strong clusters keep more, weak ones less. Sensitive to cross-layer
       score-scale disparity (a layer with systematically larger scores
-      monopolises budget).
+      monopolises budget). Tangram's historical default.
     * ``"perlayer_head"`` — a SEPARATE threshold per layer (AdaKV-style),
       head-calibrated, so every layer keeps its own top ``compression_ratio``
       fraction while heads within a layer still diverge. Immune to cross-layer
       scale disparity; the validated pairing for ``compression_scorer ==
       "expected_attention"`` (its kvpress reference uses AdaKV per-layer budgets).
-    * ``"crosslayer_cluster"`` — cross-layer global threshold, cluster-calibrated
-      (the exact-budget counterpart of ``"crosslayer_head"``: cross-layer block
-      sharing without max-pool inflation). Needs a cross-layer (global) cluster
-      map; shares ``"crosslayer_head"``'s scale-disparity sensitivity; TP=1 only.
+    * ``"crosslayer_cluster"`` (default) — cross-layer global threshold,
+      cluster-calibrated (the exact-budget counterpart of ``"crosslayer_head"``:
+      cross-layer block sharing without max-pool inflation). Needs a cross-layer
+      (global) cluster map; shares ``"crosslayer_head"``'s scale-disparity
+      sensitivity; TP=1 only.
     * ``"perlayer_cluster"`` — per-layer threshold, cluster-calibrated: the budget
       is decided at the cluster (shared-block) granularity so the physical KV is
       exactly ``compression_ratio`` (no max-pool inflation). Needs a within-layer
@@ -332,8 +336,9 @@ class CacheConfig:
             "num_head_groups",
             "num_head_groups_per_layer",
             # Runtime KV-eviction policy (scheduler / compressor, outside the
-            # compiled forward) — no effect on graph shape. enable_compression
-            # and page_group_size stay hashed (they change graph / backend).
+            # compiled forward) — no effect on graph shape. page_group_size
+            # stays hashed (it changes graph / backend); the compression on/off
+            # bit is hashed separately below via ``compression_enabled``.
             "compression_ratio",
             "compression_floor_min",
             "compression_chunk_size",
@@ -357,6 +362,9 @@ class CacheConfig:
         from vllm.config.utils import get_hash_factors, hash_factors
 
         factors = get_hash_factors(self, ignored_factors)
+        # Hash the on/off gate (it forces eager / changes the forward path), not
+        # the continuous ratio, now that ``enable_compression`` is gone.
+        factors["compression_enabled"] = self.compression_enabled
         return hash_factors(factors)
 
     def metrics_info(self):
@@ -391,6 +399,13 @@ class CacheConfig:
         self.num_hidden_layers = model_config.get_total_num_hidden_layers()
         self._derive_head_groups()
         self._validate_extended_fields()
+
+    @property
+    def compression_enabled(self) -> bool:
+        """Whether KV cache compression runs: ``compression_ratio < 1.0``
+        (``1.0`` keeps every token, the no-op baseline). Single source of truth
+        for the gate — consumers read this rather than re-deriving the test."""
+        return self.compression_ratio < 1.0
 
     def _derive_head_groups(self) -> None:
         if self.page_group_size is None:
@@ -430,17 +445,19 @@ class CacheConfig:
                     "head-grouped paging / compression)."
                 )
 
-        # Compression.
-        if self.enable_compression:
+        # Compression. The ratio is the on/off gate, so validate its range
+        # unconditionally (an out-of-range value must error, not read as "off").
+        if not (0.0 < self.compression_ratio <= 1.0):
+            raise ValueError(
+                f"compression_ratio must satisfy 0 < r <= 1, got "
+                f"{self.compression_ratio}."
+            )
+        if self.compression_enabled:
             if self.page_group_size is None:
                 raise ValueError(
-                    "enable_compression=True requires page_group_size to be "
-                    "set; compression operates on top of head-group paging."
-                )
-            if not (0.0 < self.compression_ratio <= 1.0):
-                raise ValueError(
-                    f"compression_ratio must satisfy 0 < r <= 1, got "
-                    f"{self.compression_ratio}."
+                    "compression (compression_ratio < 1.0) requires "
+                    "page_group_size to be set; compression operates on top of "
+                    "head-group paging."
                 )
             if self.compression_window_size <= 0:
                 raise ValueError(
@@ -540,10 +557,12 @@ class CacheConfig:
         # per-(layer, group) block layout or compression's in-place block
         # mutation, so it is disabled. Warn (not info): it is on by default and
         # this affects throughput.
-        if (self.enable_compression or self.page_group_size is not None) and (
+        if (self.compression_enabled or self.page_group_size is not None) and (
             self.enable_prefix_caching
         ):
-            feature = "compression" if self.enable_compression else "head-group paging"
+            feature = (
+                "compression" if self.compression_enabled
+                else "head-group paging")
             logger.warning(
                 "Disabling prefix caching: it is incompatible with %s, which "
                 "is enabled. Prefix caching will not be used for this run.",
@@ -558,18 +577,19 @@ class CacheConfig:
         would silently produce wrong outputs, so fail at startup instead.
         ``architecture`` is the resolved vLLM model class.
         """
-        if self.page_group_size is None and not self.enable_compression:
+        if self.page_group_size is None and not self.compression_enabled:
             return
         if architecture in HEAD_GROUPED_SUPPORTED_ARCHITECTURES:
             return
-        feature = "compression" if self.enable_compression else "head-group paging"
+        feature = (
+            "compression" if self.compression_enabled else "head-group paging")
         supported = ", ".join(sorted(HEAD_GROUPED_SUPPORTED_ARCHITECTURES))
         raise ValueError(
             f"Model architecture '{architecture}' does not support Tangram "
             f"{feature} (head-grouped paged attention). Supported "
             f"architectures: {supported}. To run this model, disable the "
-            f"feature with --page-group-size=None (and --enable-compression "
-            f"left off)."
+            f"feature with --page-group-size=None (and --compression-ratio=1.0 "
+            f"for no compression)."
         )
 
     def verify_with_parallel_config(
@@ -593,20 +613,70 @@ class CacheConfig:
         elif cpu_memory_usage > 0.4 * total_cpu_memory:
             logger.warning("Possibly too large swap space. %s", msg)
 
-        # Cluster-calibrated levels max-pool over a cluster's member KV heads,
-        # which TP shards across ranks; the cross-rank gather is not yet
-        # implemented, so reject the combination at startup instead of crashing
-        # on the first compression request.
-        # TODO: implement the cross-rank member-score gather and lift this.
-        if self.enable_compression and parallel_config.tensor_parallel_size > 1:
+        # Cluster-calibrated levels need a cross-rank member-score gather not yet
+        # implemented, so under TP>1 downgrade to the same-scope head-calibrated
+        # level (which all-gathers and works under TP) rather than reject.
+        # TODO: implement the gather and run cluster levels under TP directly.
+        if self.compression_enabled and parallel_config.tensor_parallel_size > 1:
             from vllm.v1.attention.compression.selection_level import (
                 TP1_ONLY_SELECTION_LEVELS,
+                TP_FALLBACK_LEVEL,
             )
 
+            # A TP1-only level with no registered fallback is a startup error,
+            # not a late runtime crash (guards drift between the two tables).
             if self.compression_level in TP1_ONLY_SELECTION_LEVELS:
-                raise ValueError(
-                    f"compression_level='{self.compression_level}' is only "
-                    f"supported with tensor_parallel_size=1, got "
-                    f"{parallel_config.tensor_parallel_size}. Use a non-cluster "
-                    f"compression_level (e.g. 'crosslayer_head') for TP>1."
-                )
+                fallback = TP_FALLBACK_LEVEL.get(self.compression_level)
+                if fallback is None:
+                    raise ValueError(
+                        f"compression_level='{self.compression_level}' is TP=1 "
+                        f"only but has no TP>1 fallback registered in "
+                        f"TP_FALLBACK_LEVEL; add one or select a head-calibrated "
+                        f"level for tensor_parallel_size="
+                        f"{parallel_config.tensor_parallel_size}.")
+                logger.warning(
+                    "compression_level='%s' is TP=1 only (got "
+                    "tensor_parallel_size=%d); downgrading to '%s' (same "
+                    "threshold scope, head-calibrated) for this run.",
+                    self.compression_level,
+                    parallel_config.tensor_parallel_size, fallback)
+                self.compression_level = fallback
+
+    def resolve_head_group_cluster_map(
+        self,
+        model_config: Any,
+        parallel_config: ParallelConfig,
+    ) -> None:
+        """Freeze ``head_group_cluster_map`` to a concrete path or ``None``
+        (identity), once, so the compressor and the attention builder read the
+        SAME map and placement can never disagree with scoring. Must run after
+        ``verify_with_parallel_config`` (which may downgrade ``compression_level``
+        under TP). Resolves the three field forms (see its docstring) to the two
+        the consumers understand: a path or ``None``.
+        """
+        raw = self.head_group_cluster_map
+        if raw == "identity":  # explicit opt-out -> identity map
+            self.head_group_cluster_map = None
+            return
+        if raw is not None:  # explicit path: load_cluster_map loads it strictly
+            return
+        # raw is None -> auto-resolve. Skip when the map is never exercised.
+        if not self.compression_enabled or self.page_group_size is None:
+            return
+
+        from vllm.v1.attention.backends.cluster_map_resolver import (
+            resolve_bundled_cluster_map,
+        )
+        from vllm.v1.attention.compression.selection_level import (
+            CLUSTER_MAP_SCOPE_BY_LEVEL,
+        )
+
+        self.head_group_cluster_map = resolve_bundled_cluster_map(
+            scorer=self.compression_scorer,
+            model_name=model_config.model,
+            page_group_size=self.page_group_size,
+            cluster_map_scope=CLUSTER_MAP_SCOPE_BY_LEVEL.get(
+                self.compression_level),
+            num_kv_heads=self.num_kv_heads,
+            tp_world_size=parallel_config.tensor_parallel_size,
+        )

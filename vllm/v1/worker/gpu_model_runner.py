@@ -1399,7 +1399,7 @@ class GPUModelRunner(
         cache_cfg = self.cache_config
         effective_seq_lens_cpu = self.input_batch.effective_seq_lens_cpu
         use_effective_for_slot = (
-            getattr(cache_cfg, "enable_compression", False)
+            cache_cfg.compression_enabled
             and cache_cfg.page_group_size is not None
             and effective_seq_lens_cpu is not None
         )
@@ -1664,7 +1664,7 @@ class GPUModelRunner(
             # post-compression cache view.
             effective_seq_lens_cpu_arg: np.ndarray | None = None
             if (
-                getattr(self.cache_config, "enable_compression", False)
+                self.cache_config.compression_enabled
                 and self.cache_config.page_group_size is not None
                 and self.input_batch.effective_seq_lens_cpu is not None
             ):
@@ -2742,7 +2742,7 @@ class GPUModelRunner(
         executor live per-rank.
         """
         cache_config = self.cache_config
-        assert cache_config.enable_compression
+        assert cache_config.compression_enabled
         assert cache_config.page_group_size is not None
         assert cache_config.num_kv_heads is not None
         num_layers = cache_config.num_hidden_layers
@@ -3278,7 +3278,7 @@ class GPUModelRunner(
         if active:
             assert self.compressor is not None, (
                 "scheduler emitted compression_metadata but the runner has "
-                "no KVCompressor; cache_config.enable_compression must be set."
+                "no KVCompressor; compression_ratio < 1.0 must be set."
             )
             self._begin_compression_step(scheduler_output, compression_metadata)
         try:
@@ -4160,7 +4160,7 @@ class GPUModelRunner(
         # Build compressor + executor and wire per-layer gate pre-hooks
         # before cudagraph wrapping so hooks attach to plain
         # ``nn.Module`` instances.
-        if self.cache_config.enable_compression:
+        if self.cache_config.compression_enabled:
             self._init_compression()
 
         mm_config = self.model_config.multimodal_config

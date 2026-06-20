@@ -355,6 +355,13 @@ class VllmConfig:
 
         self.cache_config.verify_with_parallel_config(self.parallel_config)
 
+        if self.model_config is not None:
+            # Resolve the head-group cluster map once, now that the model and
+            # (TP-adjusted) level are final, and freeze it so all consumers
+            # read the same map. Needs the model id, hence the guard.
+            self.cache_config.resolve_head_group_cluster_map(
+                self.model_config, self.parallel_config)
+
         if self.lora_config is not None:
             self.lora_config.verify_with_model_config(self.model_config)
 

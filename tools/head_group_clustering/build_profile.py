@@ -306,7 +306,7 @@ def measure_all(args, tokenizer, mix, base_ratios):
             tensor_parallel_size=tp,
             gpu_memory_utilization=0.85, max_model_len=max_model_len,
             enable_prefix_caching=False, max_num_seqs=8,
-            enable_compression=True, page_group_size=1,
+            page_group_size=1,
             compression_ratio=ratio, compression_scorer=args.scorer,
             compression_level=args.level,
             compression_window_size=args.window_size,

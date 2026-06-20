@@ -218,7 +218,7 @@ class Scheduler(SchedulerInterface):
         or when the next boundary already lies beyond the requested span.
         """
         if not (
-            self.cache_config.enable_compression
+            self.cache_config.compression_enabled
             and self.cache_config.compression_chunk_size is not None
             and num_computed_tokens < num_prompt_tokens
         ):
@@ -386,7 +386,7 @@ class Scheduler(SchedulerInterface):
                     # cycle again. Reset compression bookkeeping and absorb
                     # already-sampled output tokens into the prompt so the
                     # resumed cycle reattends them.
-                    if self.cache_config.enable_compression:
+                    if self.cache_config.compression_enabled:
                         preempted_req.compression_done = False
                         preempted_req.compress_max_eff_seq_len = None
                         preempted_req.absorb_output_into_prompt()
@@ -848,7 +848,7 @@ class Scheduler(SchedulerInterface):
         re-enters at ``num_computed_tokens == 0``, so the flag still fires
         correctly there.
         """
-        if not self.cache_config.enable_compression:
+        if not self.cache_config.compression_enabled:
             return
         if request.compression_done:
             return
@@ -1240,9 +1240,9 @@ class Scheduler(SchedulerInterface):
         # decode steps too — mirrors the worker-side ``effective_seq_lens_cpu``
         # increment. Without this, decode writes would spill back into block 0
         # once they exceeded the post-compression block count. Gated on
-        # enable_compression so this per-step scan is skipped entirely when
+        # compression_enabled so this per-step scan is skipped entirely when
         # compression is off (the field is always None then).
-        if self.cache_config.enable_compression:
+        if self.cache_config.compression_enabled:
             for req_id, num_tokens in num_scheduled_tokens.items():
                 if num_tokens <= 0 or req_id in compressed_this_step:
                     continue

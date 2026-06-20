@@ -77,6 +77,12 @@ class SelectionLevel(ABC):
     #: ``compression_level`` config value that selects this level.
     name: str
 
+    #: Cluster-map scope this level pairs with: ``"global"`` (cross-layer),
+    #: ``"per_layer"``, or ``None`` (uses no cluster map). The bundled-map
+    #: resolver reads it to pick the map file; declared here since pairing the
+    #: wrong scope is silently incorrect.
+    cluster_map_scope: str | None = None
+
     @abstractmethod
     def compute_counts(
         self,
@@ -167,6 +173,7 @@ class CrossLayerHeadLevel(_HeadLevel):
     the cluster's physical KV blocks, so they carry a single length)."""
 
     name = "crosslayer_head"
+    cluster_map_scope = "global"
 
     def _per_head_counts(
         self,
@@ -219,6 +226,7 @@ class PerLayerHeadLevel(_HeadLevel):
     on."""
 
     name = "perlayer_head"
+    cluster_map_scope = "per_layer"
 
     def _per_head_counts(
         self,
@@ -347,6 +355,7 @@ class CrossLayerClusterLevel(_ClusterLevel):
     layer systematically larger scores lets that layer monopolise the budget."""
 
     name = "crosslayer_cluster"
+    cluster_map_scope = "global"
 
     def _counts_from_cluster_scores(
         self,
@@ -381,6 +390,7 @@ class PerLayerClusterLevel(_ClusterLevel):
     unrelated clusters — pair this level with a per-layer map."""
 
     name = "perlayer_cluster"
+    cluster_map_scope = "per_layer"
 
     def _counts_from_cluster_scores(
         self,
@@ -445,16 +455,30 @@ TP1_ONLY_SELECTION_LEVELS: frozenset[str] = frozenset(
     name for name, cls in _LEVELS.items() if issubclass(cls, _ClusterLevel)
 )
 
+#: ``compression_level`` -> cluster-map scope it pairs with, derived from the
+#: level classes (the bundled-map resolver reads this).
+CLUSTER_MAP_SCOPE_BY_LEVEL: dict[str, str | None] = {
+    name: cls.cluster_map_scope for name, cls in _LEVELS.items()
+}
+
+#: Head-calibrated level (same scope) each TP=1-only cluster level downgrades to
+#: under TP>1; config validation uses this instead of rejecting.
+TP_FALLBACK_LEVEL: dict[str, str] = {
+    "crosslayer_cluster": "crosslayer_head",
+    "perlayer_cluster": "perlayer_head",
+}
+
 
 def make_selection_level(level: str) -> SelectionLevel:
     """Axis-1 dispatch — the ONE place the level is chosen. ``level`` is
     ``cache_config.compression_level``, named ``{scope}_{granularity}``:
 
-    * ``"crosslayer_head"`` (default) — cross-layer global threshold,
-      head-calibrated (inflating).
+    * ``"crosslayer_head"`` — cross-layer global threshold, head-calibrated
+      (inflating). Tangram's historical default.
     * ``"perlayer_head"`` — per-layer threshold (AdaKV-style), head-calibrated.
-    * ``"crosslayer_cluster"`` — cross-layer global threshold, cluster-calibrated
-      (exact budget with cross-layer block sharing; global map; TP=1).
+    * ``"crosslayer_cluster"`` (default) — cross-layer global threshold,
+      cluster-calibrated (exact budget with cross-layer block sharing; global
+      map; TP=1).
     * ``"perlayer_cluster"`` — per-layer threshold, cluster-calibrated (exact
       per-layer budget; needs a per-layer cluster map; TP=1).
     * ``"uniform"`` — fixed per-(layer, group) count (no threshold)."""

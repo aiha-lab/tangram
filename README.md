@@ -36,10 +36,30 @@ and easy-to-use library for LLM inference and serving. See the
 [vLLM documentation](https://docs.vllm.ai/en/latest/) for the underlying engine
 and supported models.
 
-Install from source:
+### Installation
 
 ```bash
-pip install -e .
+git clone https://github.com/aiha-lab/tangram.git
+cd tangram
+uv venv --python 3.12
+source .venv/bin/activate
+VLLM_USE_PRECOMPILED=1 uv pip install --editable . --torch-backend=auto
+```
+
+### Quickstart
+
+```python
+from vllm import LLM, SamplingParams
+
+llm = LLM(
+    model="Qwen/Qwen3-4B-Instruct-2507",
+    compression_ratio=0.5,                  # keep 50% of the KV cache (1.0 = no compression)
+    compression_scorer="snapkv",            # snapkv | keydiff | expected_attention | fastkvzip
+    compression_level="crosslayer_cluster", # "crosslayer_cluster", "perlayer_cluster"(non-uniform) and "uniform"
+)
+
+out = llm.generate(["What is KV cache compression?"], SamplingParams(max_tokens=128))
+print(out[0].outputs[0].text)
 ```
 
 ## Supported Compression
@@ -56,9 +76,10 @@ pip install -e .
 
 ## Accuracy
 
-RULER 8K.
+[RULER](https://arxiv.org/abs/2404.06654) 8K
 
-### Non-uniform, H<sub>p</sub> = 4
+<details>
+<summary><b>Non-uniform (<code>perlayer_cluster</code>), H<sub>p</sub> = 4</b></summary>
 
 Selection level: `PerLayerClusterLevel` (per-layer threshold, cluster-calibrated; exact budget).
 
@@ -87,7 +108,10 @@ Selection level: `PerLayerClusterLevel` (per-layer threshold, cluster-calibrated
 </tbody>
 </table>
 
-### Uniform, H<sub>p</sub> = 4
+</details>
+
+<details>
+<summary><b>Uniform (<code>uniform</code>), H<sub>p</sub> = 4</b></summary>
 
 <table>
 <thead>
@@ -112,6 +136,8 @@ Selection level: `PerLayerClusterLevel` (per-layer threshold, cluster-calibrated
 <tr><td>qwen3-30b</td><td>95.3</td><td>87.5</td><td>80.7</td><td>74.3</td><td>64.7</td><td>88.7</td><td>82.0</td><td>74.4</td><td>66.9</td><td>60.6</td><td>40.5</td><td>29.0</td><td>18.5</td></tr>
 </tbody>
 </table>
+
+</details>
 
 ## Evaluate on RULER
 

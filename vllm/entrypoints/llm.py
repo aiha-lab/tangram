@@ -226,8 +226,7 @@ class LLM:
         # behave identically; None selects the legacy dense layout.
         page_group_size: int | None = 4,
         head_group_cluster_map: str | None = None,
-        enable_compression: bool = False,
-        compression_ratio: float = 0.3,
+        compression_ratio: float = 1.0,
         compression_window_size: int = 32,
         compression_n_sink_tokens: int = 4,
         compression_floor_min: int = 512,
@@ -349,7 +348,6 @@ class LLM:
             logits_processors=logits_processors,
             page_group_size=page_group_size,
             head_group_cluster_map=head_group_cluster_map,
-            enable_compression=enable_compression,
             compression_ratio=compression_ratio,
             compression_window_size=compression_window_size,
             compression_n_sink_tokens=compression_n_sink_tokens,

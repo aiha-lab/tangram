@@ -58,7 +58,7 @@ def main() -> None:
         gpu_memory_utilization=args.gpu_memory_utilization, enforce_eager=True,
     )
     if pgs is not None and args.ratio < 1.0:
-        kw.update(enable_compression=True, compression_ratio=args.ratio,
+        kw.update(compression_ratio=args.ratio,
                   compression_chunk_size=8192, compression_window_size=4096,
                   compression_n_sink_tokens=32, compression_floor_min=0)
     llm = LLM(**kw)

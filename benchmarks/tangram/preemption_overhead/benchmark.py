@@ -118,7 +118,6 @@ def run_one(args: argparse.Namespace, reserve_full_isl: bool) -> dict:
     # knobs mirror bench_common.build_llm exactly.
     if args.ratio < 1.0:
         llm_kwargs.update(
-            enable_compression=True,
             compression_ratio=args.ratio,
             compression_chunk_size=args.compression_chunk_size,
             compression_n_sink_tokens=args.compression_n_sink_tokens,
