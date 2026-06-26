@@ -74,6 +74,24 @@ print(out[0].outputs[0].text)
 - TOVA
 - PyramidKV
 
+### Ragged Paging and Configurations
+
+Key knobs for Tangram Framework:
+
+| Config | Description |
+| ------ | ----------- |
+| `compression_ratio` | KV retention fraction; `1.0` = FullKV (no compression). |
+| `compression_scorer` | Importance scorer: `snapkv` \| `keydiff` \| `expected_attention` \| `fastkvzip`. |
+| `compression_level` | KV-budget scope — see the options below. |
+| H<sub>p</sub> | Heads per page: attention heads managed together in one KV-cache page; they share one paged budget. |
+
+**`compression_level` options** — the two cluster levels give an exact (= ratio)
+footprint and need a cluster map; otherwise heads are grouped by adjacency.
+
+- `crosslayer_cluster` — one budget shared across all layers (they compete for it).
+- `perlayer_cluster` — each layer budgeted independently; immune to cross-layer score-scale skew.
+- `uniform` — every attention head keeps the same budget `floor(ratio × len)`; only positions differ per head.
+
 ## Accuracy
 
 [RULER](https://arxiv.org/abs/2404.06654) 8K
@@ -153,7 +171,17 @@ bash benchmark_ruler.sh
 
 - `SCORER` — `snapkv` | `keydiff` | `expected_attention`
 - `RATIOS` — KV retention fraction (`1.0` = FullKV reference)
-- `LEVEL` — `crosslayer_cluster` (non-uniform) | `uniform`
+- `LEVEL` — selection level; see [Ragged Paging and Configurations](#ragged-paging-and-configurations) above
+
+### Measure Speedup
+
+A quick, lightweight example measuring end-to-end generation speedup of Tangram — wall-clock at `r=1.0` (uncompressed) vs compressed ratios on an
+SCBench task.
+
+```bash
+cd benchmarks/tangram/speedup
+./run_speedup.sh
+```
 
 ---
 
