@@ -83,7 +83,7 @@ Key knobs for Tangram Framework:
 | `compression_ratio` | KV retention fraction; `1.0` = FullKV (no compression). |
 | `compression_scorer` | Importance scorer: `snapkv` \| `keydiff` \| `expected_attention` \| `fastkvzip`. |
 | `compression_level` | KV-budget scope — see the options below. |
-| H<sub>p</sub> | Heads per page: attention heads managed together in one KV-cache page; they share one paged budget. |
+| `page_group_size` | Heads per page (H<sub>p</sub>): attention heads managed together in one KV-cache page; they share one paged budget. |
 
 **`compression_level` options** — the two cluster levels give an exact (= ratio)
 footprint and need a cluster map; otherwise heads are grouped by adjacency.
