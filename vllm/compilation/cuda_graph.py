@@ -96,13 +96,17 @@ class CUDAGraphWrapper:
         self.concrete_cudagraph_entries: dict[BatchDescriptor, CUDAGraphEntry] = {}
 
     def __getattr__(self, key: str):
-        # allow accessing the attributes of the runnable.
-        if hasattr(self.runnable, key):
+        # Allow accessing the attributes of the runnable. A single getattr
+        # with try/except instead of hasattr+getattr: this method sits on the
+        # per-call hot path (any attribute miss on the wrapper lands here), and
+        # hasattr performs the same lookup a second time (upstream #37425).
+        try:
             return getattr(self.runnable, key)
-        raise AttributeError(
-            f"Attribute {key} not exists in the runnable of "
-            f"cudagraph wrapper: {self.runnable}"
-        )
+        except AttributeError:
+            raise AttributeError(
+                f"Attribute {key} not exists in the runnable of "
+                f"cudagraph wrapper: {self.runnable}"
+            ) from None
 
     def unwrap(self) -> Callable:
         # in case we need to access the original runnable.
@@ -161,8 +165,16 @@ class CUDAGraphWrapper:
                     # across layers will make the cudagraph capture very slow.
                     # therefore, we only run gc for the first graph,
                     # and disable gc for the rest of the graphs.
-                    stack.enter_context(patch("gc.collect", lambda: None))
-                    stack.enter_context(patch("torch.cuda.empty_cache", lambda: None))
+                    # The no-op replacements must accept the original
+                    # signatures: gc.collect(generation=2) takes an optional
+                    # generation and callers inside capture may pass it
+                    # (upstream #41235).
+                    stack.enter_context(
+                        patch("gc.collect", lambda *args, **kwargs: None)
+                    )
+                    stack.enter_context(
+                        patch("torch.cuda.empty_cache", lambda *args, **kwargs: None)
+                    )
 
                 if self.graph_pool is not None:
                     set_graph_pool_id(self.graph_pool)
