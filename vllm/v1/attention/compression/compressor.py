@@ -9,6 +9,7 @@ KV writes and block-table updates live in the FlashAttention backend.
 """
 from __future__ import annotations
 
+import inspect
 import math
 from dataclasses import dataclass, field
 from typing import Protocol
@@ -17,7 +18,9 @@ import numpy as np
 import torch
 from torch import nn
 
+from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
+from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.v1.attention.backends.head_grouped_layout import (
     identity_member_maps,
     load_cluster_map,
@@ -741,12 +744,29 @@ class KVCompressor:
         parents: list[nn.Module],
         inners: list[nn.Module],
     ) -> None:
-        """Wire per-layer forward pre-hooks for the active scorer (axis 2).
+        """Wire the per-layer scorer into the model (axis 2), compile-safely.
 
         ``parents[i]`` is layer i's outer attention block (exposes
         hidden_states); ``inners[i]`` is its inner ``Attention`` (exposes
-        post-RoPE query/key). The hook attaches to whichever the scorer
-        consumes, and fires only when ``compress_active`` is True and
+        post-RoPE query/key). Neither uses module forward hooks: torch.compile
+        skips hooks when it inlines module forwards, which would silently drop
+        all scoring under compilation. Instead, both scorer kinds are
+        delivered through custom ops that are piecewise *splitting ops*
+        (listed in ``CompilationConfig._attention_ops``), so their Python
+        bodies execute eagerly between captured CUDA-graph pieces on every
+        step:
+
+        - query/key scorers (SnapKV, KeyDiff, ...) are stored on the inner
+          ``Attention`` as ``compression_qk_scorer`` and invoked at the top of
+          the ``vllm::unified_attention_head_grouped`` op body, which receives
+          the same token-major query/key/value the old pre-hook saw.
+        - hidden_states scorers (FastKVZip gate) are stored on the inner
+          ``Attention`` as ``compression_gate_capture`` and invoked by a
+          ``vllm::tangram_gate_capture`` op call inserted in front of the
+          outer block's forward (instance-level wrap; dynamo traces the
+          wrapper and keeps the op as an opaque graph node).
+
+        Every delivered fn fires only when ``compress_active`` is True and
         ``pending_req_offsets`` is non-empty (else zero overhead). Caller owns
         the ordering: ``parents[i]`` / ``inners[i]`` must correspond to
         ``scorers[i]``."""
@@ -754,42 +774,42 @@ class KVCompressor:
             raise ValueError(
                 f"attach_scorers: unknown scorer_consumes "
                 f"{self.scorer_consumes!r}.")
-        # hidden_states scorers hook the outer block; qk scorers hook the inner
-        # ``Attention`` but still need the outer block (``parent``) for its
-        # ``rotary_emb`` (ExpectedAttention), threaded into the hook closure.
-        targets = parents if self.scorer_consumes == "hidden_states" else inners
-        if len(targets) != len(self.scorers) or len(parents) != len(targets):
+        if len(inners) != len(self.scorers) or len(parents) != len(inners):
             raise ValueError(
-                f"attach_scorers: got {len(targets)} target layers / "
+                f"attach_scorers: got {len(inners)} inner layers / "
                 f"{len(parents)} parents but {len(self.scorers)} scorers.")
-        for layer_idx, (target, scorer) in enumerate(
-                zip(targets, self.scorers)):
+        for layer_idx, (parent, inner, scorer) in enumerate(
+                zip(parents, inners, self.scorers)):
             if self.scorer_consumes == "qk":
-                hook = self._make_qk_hook(
-                    layer_idx, scorer, parents[layer_idx])
+                # ``parent`` is threaded through because ExpectedAttention
+                # needs the outer block's ``rotary_emb`` (the inner op only
+                # runs the attention kernel and has no RoPE).
+                inner.compression_qk_scorer = self._make_qk_scorer(
+                    layer_idx, scorer, parent)
             else:
-                hook = self._make_hidden_states_hook(layer_idx, scorer)
-            target.register_forward_pre_hook(hook, with_kwargs=True)
+                inner.compression_gate_capture = (
+                    self._make_hidden_states_capture(layer_idx, scorer))
+                _wrap_forward_with_gate_capture(parent, inner.layer_name)
 
-    def _make_hidden_states_hook(self, layer_idx: int, scorer: nn.Module):
-        """Pre-hook for hidden_states scorers (FastKVZip gate). Concatenates
-        all compression-active request slices into a single forward per layer
-        to amortise kernel launch (per-token scores are request-independent)."""
+    def _make_hidden_states_capture(self, layer_idx: int, scorer: nn.Module):
+        """Capture fn for hidden_states scorers (FastKVZip gate), invoked by
+        the ``vllm::tangram_gate_capture`` op with the outer block's input
+        hidden_states. Concatenates all compression-active request slices into
+        a single forward per layer to amortise kernel launch (per-token scores
+        are request-independent)."""
 
-        def pre_hook(module, args, kwargs, _idx=layer_idx, _scorer=scorer):
+        def capture(hidden_states: torch.Tensor,
+                    _idx=layer_idx, _scorer=scorer) -> None:
             if not self.compress_active:
-                return None
+                return
             offsets = self.pending_req_offsets
             if not offsets:
-                return None
-            hidden_states = args[0] if args else kwargs.get("hidden_states")
-            if hidden_states is None:
-                return None
+                return
 
             valid = [(req, start, end)
                      for req, start, end in offsets if end > start]
             if not valid:
-                return None
+                return
 
             with torch.no_grad():
                 if len(valid) == 1:
@@ -810,19 +830,18 @@ class KVCompressor:
                             score_full[:, cursor:cursor + length],
                         )
                         cursor += length
-            return None
 
-        return pre_hook
+        return capture
 
-    def _make_qk_hook(
+    def _make_qk_scorer(
         self, layer_idx: int, scorer: nn.Module, parent: nn.Module,
     ):
-        """Pre-hook for query/key scorers (SnapKV, KeyDiff, StreamingLLM, TOVA,
-        ExpectedAttention). Scores each request's chunk independently — the
-        observation window is chunk-relative, so request slices must NOT be
-        concatenated. The hook is registered on the inner ``Attention``, whose
-        ``forward(query, key, value, ...)`` exposes ``args[0..2]`` = post-RoPE
-        query / key / value (token-major flatten).
+        """Scorer fn for query/key scorers (SnapKV, KeyDiff, StreamingLLM,
+        TOVA, ExpectedAttention), invoked from the head-grouped attention op
+        body with the op's token-major query / key / value (post-RoPE — the
+        same tensors the inner ``Attention``'s forward receives). Scores each
+        request's chunk independently — the observation window is
+        chunk-relative, so request slices must NOT be concatenated.
 
         Every qk scorer is called with the uniform contract
         ``scorer(query, key, value, *, module, position_offset)``: ``value``
@@ -834,18 +853,14 @@ class KVCompressor:
         position (StreamingLLM recency, ExpectedAttention future positions).
         Scorers that do not need an argument simply ignore it."""
 
-        def pre_hook(module, args, kwargs,
-                     _idx=layer_idx, _scorer=scorer, _parent=parent):
+        def score_qk(query: torch.Tensor, key: torch.Tensor,
+                     value: torch.Tensor | None,
+                     _idx=layer_idx, _scorer=scorer, _parent=parent) -> None:
             if not self.compress_active:
-                return None
+                return
             offsets = self.pending_req_offsets
             if not offsets:
-                return None
-            query = args[0] if len(args) > 0 else kwargs.get("query")
-            key = args[1] if len(args) > 1 else kwargs.get("key")
-            value = args[2] if len(args) > 2 else kwargs.get("value")
-            if query is None or key is None:
-                return None
+                return
             pos_offsets = self.pending_req_pos_offsets or {}
 
             with torch.no_grad():
@@ -861,6 +876,79 @@ class KVCompressor:
                         position_offset=pos_offsets.get(req, 0),
                     )
                     self.receive_score(req, _idx, score)
-            return None
 
-        return pre_hook
+        return score_qk
+
+
+def _wrap_forward_with_gate_capture(parent: nn.Module, layer_name: str) -> None:
+    """Install a ``vllm::tangram_gate_capture`` call in front of ``parent``'s
+    forward via an instance-level forward override.
+
+    A forward pre-hook cannot be used: torch.compile inlines module forwards
+    and skips their hooks. An instance-level ``forward`` IS traced by dynamo
+    (``nn.Module.__call__`` resolves ``self.forward`` through the instance),
+    and the op call inside it becomes an opaque graph node that piecewise
+    compilation splits on, so the capture body runs eagerly on every step.
+
+    ``layer_name`` identifies the layer's inner ``Attention`` in the forward
+    context; the op body reads the capture fn off it. The hidden_states
+    argument position is resolved once here — attention-block forwards differ
+    across models (e.g. ``(positions, hidden_states)`` for Qwen/Llama).
+    """
+    if getattr(parent, "_tangram_gate_capture_wrapped", False):
+        return
+    orig_forward = parent.forward
+    params = list(inspect.signature(orig_forward).parameters)
+    try:
+        hs_index = params.index("hidden_states")
+    except ValueError as exc:
+        raise RuntimeError(
+            f"Gate capture: attention block {type(parent).__name__} has no "
+            f"'hidden_states' parameter (found {params}); cannot deliver "
+            "hidden states to the FastKVZip gate scorer."
+        ) from exc
+
+    def forward_with_gate_capture(*args, **kwargs):
+        if "hidden_states" in kwargs:
+            hidden_states = kwargs["hidden_states"]
+        else:
+            hidden_states = args[hs_index]
+        torch.ops.vllm.tangram_gate_capture(hidden_states, layer_name)
+        return orig_forward(*args, **kwargs)
+
+    parent.forward = forward_with_gate_capture
+    parent._tangram_gate_capture_wrapped = True
+
+
+def tangram_gate_capture(hidden_states: torch.Tensor, layer_name: str) -> None:
+    """Deliver an attention block's input hidden_states to the compression
+    gate scorer (FastKVZip).
+
+    INVARIANT: this op must remain in ``CompilationConfig._attention_ops``
+    (piecewise splitting ops). Its entire purpose is the Python side effect of
+    scoring + stashing; a splitting op executes eagerly between CUDA-graph
+    pieces on every step, whereas an op captured inside a graph would run at
+    capture time only and be silently skipped on every replay.
+
+    Declared as mutating ``hidden_states`` (it never actually writes) so the
+    schema neither aliases input to output nor lets the node be eliminated as
+    dead code; ``vllm::maybe_calc_kv_scales`` uses the same pattern.
+    """
+    forward_context = get_forward_context()
+    capture = forward_context.no_compile_layers[layer_name].compression_gate_capture
+    if capture is not None:
+        capture(hidden_states)
+
+
+def tangram_gate_capture_fake(
+    hidden_states: torch.Tensor, layer_name: str
+) -> None:
+    return
+
+
+direct_register_custom_op(
+    op_name="tangram_gate_capture",
+    op_func=tangram_gate_capture,
+    mutates_args=["hidden_states"],
+    fake_impl=tangram_gate_capture_fake,
+)

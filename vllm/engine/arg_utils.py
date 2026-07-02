@@ -1462,17 +1462,11 @@ class EngineArgs:
         """
         current_platform.pre_register_and_update()
 
-        # Compression's per-layer pre-hook runs eager Python every forward and
-        # cannot be CUDA-graph captured, so force eager mode. Warn (not info):
-        # it overrides the CUDA-graph default.
-        if self.compression_ratio < 1.0 and not self.enforce_eager:
-            logger.warning(
-                "compression (compression_ratio=%s < 1.0) forces "
-                "enforce_eager=True: compression's per-layer pre-hook cannot "
-                "run under CUDA graph capture, so CUDA graphs are disabled for "
-                "this run.", self.compression_ratio
-            )
-            self.enforce_eager = True
+        # Compression no longer forces enforce_eager: scoring is delivered
+        # through piecewise splitting ops (unified_attention_head_grouped /
+        # tangram_gate_capture) that run eagerly between CUDA-graph pieces,
+        # and VllmConfig.__post_init__ downgrades full-cudagraph modes to
+        # PIECEWISE whenever page_group_size is set.
 
         device_config = DeviceConfig(device=cast(Device, current_platform.device_type))
 

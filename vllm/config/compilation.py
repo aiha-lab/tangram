@@ -497,6 +497,13 @@ class CompilationConfig:
         # between CUDA-graph pieces. See
         # vllm/attention/layer.py::unified_attention_head_grouped.
         "vllm::unified_attention_head_grouped",
+        # Compression gate scoring (Tangram, FastKVZip). Same invariant: the
+        # op exists purely for its eager Python side effect (hidden-states
+        # scoring); captured inside a graph it would run at capture time
+        # only. Listing an op that never appears in a given graph (non-gate
+        # scorers) is harmless — splitting matches nodes present in the
+        # graph. See compression/compressor.py::tangram_gate_capture.
+        "vllm::tangram_gate_capture",
         "vllm::unified_mla_attention",
         "vllm::unified_mla_attention_with_output",
         "vllm::mamba_mixer2",

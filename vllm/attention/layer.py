@@ -362,6 +362,17 @@ class Attention(nn.Module, AttentionLayerBase):
         ):
             self.query_quant = QuantFP8(static=True, group_shape=GroupShape.PER_TENSOR)
 
+        # Compression scorer delivery (Tangram). Populated by
+        # ``KVCompressor.attach_scorers``: ``compression_qk_scorer`` is
+        # invoked at the top of the ``unified_attention_head_grouped`` op
+        # body with this layer's token-major query/key/value;
+        # ``compression_gate_capture`` is invoked by the
+        # ``tangram_gate_capture`` op with the outer block's hidden_states.
+        # Plain attributes instead of module forward hooks because
+        # torch.compile skips hooks when inlining module forwards.
+        self.compression_qk_scorer: Callable | None = None
+        self.compression_gate_capture: Callable | None = None
+
         # Head-grouped paging derived sizes. ``page_group_size is None``
         # turns the branch in ``forward()`` off and keeps this layer
         # byte-identical to base vLLM.
@@ -1084,6 +1095,15 @@ def _head_grouped_attention_impl(
         "Head-grouped paging requires backends that accept an output "
         "buffer (FlashAttention does)."
     )
+
+    # Compression scoring (Tangram): query/key scorers run here — inside the
+    # eager splitting op, on the same unreshaped token-major tensors the
+    # replaced module pre-hook used to see — because torch.compile skips
+    # pre-hooks when inlining module forwards. Request offsets are unpadded,
+    # so scorer slices never touch capture-size padding rows. No-op unless
+    # the runner marked this step compression-active.
+    if layer.compression_qk_scorer is not None:
+        layer.compression_qk_scorer(query, key, value)
 
     num_groups = layer.num_groups_per_layer
     assert layer.page_group_size is not None

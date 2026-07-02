@@ -362,9 +362,19 @@ class CacheConfig:
         from vllm.config.utils import get_hash_factors, hash_factors
 
         factors = get_hash_factors(self, ignored_factors)
-        # Hash the on/off gate (it forces eager / changes the forward path), not
-        # the continuous ratio, now that ``enable_compression`` is gone.
+        # Hash the on/off gate (it changes the forward path), not the
+        # continuous ratio, now that ``enable_compression`` is gone.
         factors["compression_enabled"] = self.compression_enabled
+        # ``compression_scorer`` itself is excluded above, but its
+        # hidden-states-vs-qk axis DOES change the traced graph: the
+        # FastKVZip gate wraps every attention block's forward with a
+        # ``vllm::tangram_gate_capture`` op node, which qk scorers (SnapKV,
+        # ...) do not emit. Without this bit a compile cache written under
+        # one scorer kind would be silently reused for the other, dropping
+        # (or spuriously adding) the gate-capture nodes.
+        factors["gate_capture_installed"] = (
+            self.compression_enabled and self.compression_scorer == "fastkvzip"
+        )
         return hash_factors(factors)
 
     def metrics_info(self):
