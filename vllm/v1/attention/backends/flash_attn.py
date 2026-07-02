@@ -661,8 +661,9 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
             scheduler_metadata = self.scheduler_metadata[:n]
 
         # Precompute per-step views consumed by
-        # ``Attention._forward_head_grouped``; layout selected by
-        # ``head_grouped_decode_layout``.
+        # ``layer.py::_head_grouped_attention_impl`` (the body of the
+        # ``vllm::unified_attention_head_grouped`` custom op); layout selected
+        # by ``head_grouped_decode_layout``.
         head_grouped_decode_layout = False
         if self._head_grouped:
             # Terminology in this block: a *head-group* and a *cluster* are the
@@ -784,14 +785,14 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
                 )
             else:
                 # Member-major path (prefill / mixed): the data copy in
-                # ``_forward_head_grouped`` is required because (req, member)
-                # sequences are not contiguous in any token-major view when
-                # sequence lengths vary.
+                # ``_head_grouped_attention_impl`` is required because
+                # (req, member) sequences are not contiguous in any
+                # token-major view when sequence lengths vary.
                 slot_mapping_grouped = slot_mapping_member
                 seq_lens_grouped = seq_lens_member
                 # cu_seqlens for the (num_kv_heads_per_layer × num_reqs)
                 # member sequences per layer; the layer slice happens in
-                # ``Attention._forward_head_grouped``.
+                # ``layer.py::_head_grouped_attention_impl``.
                 query_start_head = query_start_loc[:num_reqs]
                 offsets = torch.arange(
                     num_kv_heads_per_layer,
@@ -1202,7 +1203,8 @@ class FlashAttentionImpl(AttentionImpl):
             # member-major, so a row encodes (kv_head, token) and a column is
             # the query head within that group; the global query head is
             # ``kv_head * query_heads_per_kv + column``. The row→kv_head map
-            # depends on how vllm/attention/layer.py::_forward_head_grouped
+            # depends on how
+            # vllm/attention/layer.py::_head_grouped_attention_impl
             # flattened the tensors:
             #   - uniform decode fast path: row = token * num_kv_heads + kv_head
             #     (kv_head varies fastest)        -> tile the [kv, head] grid

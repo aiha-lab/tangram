@@ -491,6 +491,12 @@ class CompilationConfig:
     _attention_ops: ClassVar[list[str]] = [
         "vllm::unified_attention",
         "vllm::unified_attention_with_output",
+        # Head-grouped paging (Tangram). MUST stay a splitting op: the op
+        # body performs per-layer metadata selection (and compression
+        # scoring) in Python, which only executes when the op runs eagerly
+        # between CUDA-graph pieces. See
+        # vllm/attention/layer.py::unified_attention_head_grouped.
+        "vllm::unified_attention_head_grouped",
         "vllm::unified_mla_attention",
         "vllm::unified_mla_attention_with_output",
         "vllm::mamba_mixer2",
