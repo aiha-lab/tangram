@@ -30,8 +30,8 @@ class SnapKVScorer(nn.Module):
     Output: scores ``[num_kv_heads, T]`` (float32), higher = more important.
     """
 
-    # Axis-2 dispatch: this scorer hooks the inner ``Attention`` (sees q/k),
-    # not the outer block (which sees hidden_states).
+    # Axis-2 dispatch: this scorer reads the inner ``Attention``'s q/k,
+    # not the outer block's hidden_states.
     consumes = "qk"
     name = "snapkv"
 

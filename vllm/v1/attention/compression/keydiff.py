@@ -37,8 +37,8 @@ class KeyDiffScorer(nn.Module):
             (kept); lower = more redundant (evicted first).
     """
 
-    # Axis-2 dispatch: this scorer hooks the inner ``Attention`` (sees q/k),
-    # not the outer block (which sees hidden_states).
+    # Axis-2 dispatch: this scorer reads the inner ``Attention``'s q/k,
+    # not the outer block's hidden_states.
     consumes = "qk"
     name = "keydiff"
 
@@ -62,8 +62,8 @@ class KeyDiffScorer(nn.Module):
         position_offset: int = 0,
     ) -> torch.Tensor:
         # KeyDiff is key-only; ``query`` / ``value`` / ``module`` /
-        # ``position_offset`` are accepted only so the qk scorer hook can call
-        # every scorer with the same uniform contract.
+        # ``position_offset`` are accepted only so the query/key scorer path
+        # can call every scorer with the same uniform contract.
         del query, value, module, position_offset
 
         chunk_len = key.shape[0]

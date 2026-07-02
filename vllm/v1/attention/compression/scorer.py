@@ -43,8 +43,8 @@ def build_qk_scorer(
     scorers that ignore it (KeyDiff) simply do not use it. Per-scorer
     hyperparameters (SnapKV's ``snap_window`` / ``snap_kernel``;
     ExpectedAttention's ``ea_*``) are likewise consumed only by the scorer that
-    needs them. The returned module exposes ``consumes`` / ``name`` for the hook
-    dispatch in ``attach_scorers``.
+    needs them. The returned module exposes ``consumes`` / ``name`` for the
+    delivery dispatch in ``attach_scorers``.
     """
     if name == "snapkv":
         return SnapKVScorer(

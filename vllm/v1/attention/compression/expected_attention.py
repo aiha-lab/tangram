@@ -25,7 +25,7 @@ per-KV-head distribution) are essential to match the reference; see kvpress's
 ``repeat_kv`` + ``scores.view(...).mean(dim=2)``.
 
 tangram adaptations (all faithful within the chunk-based constraint):
-* The qk hook supplies POST-RoPE query/key/value (the reference recomputes
+* The scorer receives POST-RoPE query/key/value (the reference recomputes
   pre-RoPE queries from hidden_states). We recover the pre-RoPE query by
   UN-ROTATING the post-RoPE query at its true global position — exact, since
   RoPE is orthogonal, and it also preserves the model's q-norm (applied before
@@ -39,10 +39,11 @@ tangram adaptations (all faithful within the chunk-based constraint):
   the reference's full-sequence mean, except the first few are dropped as
   outliers exactly as the reference does (chunk-relative, ``_QUERY_OUTLIER_SINK``).
 
-RoPE access: the qk hook passes the OUTER attention block as ``module``; its
-``module.rotary_emb`` (a vLLM ``RotaryEmbedding``) provides ``cos_sin_cache``,
-``rotary_dim``, and ``is_neox_style``. Models without that standard rotary
-(e.g. mRoPE / deepseek-scaling) are out of scope for this scorer.
+RoPE access: the query/key scorer path passes the OUTER attention block as
+``module``; its ``module.rotary_emb`` (a vLLM ``RotaryEmbedding``) provides
+``cos_sin_cache``, ``rotary_dim``, and ``is_neox_style``. Models without that
+standard rotary (e.g. mRoPE / deepseek-scaling) are out of scope for this
+scorer.
 """
 from __future__ import annotations
 

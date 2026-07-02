@@ -121,7 +121,8 @@ class KVCompressor:
     """One instance per model; per-request state held in ``req_state``.
 
     ``compress_active`` is flipped by the ModelRunner around the compress
-    forward pass and read by the per-layer pre-hook.
+    forward pass and read by the per-layer scorers (delivered through the
+    attention / gate-capture custom ops; see ``attach_scorers``).
     """
 
     def __init__(
@@ -161,8 +162,10 @@ class KVCompressor:
         # ``load_gate_checkpoint`` (FastKVZip; hidden_states) or
         # ``set_qk_scorers`` (gate-free query/key scorers — SnapKV, KeyDiff);
         # kept separate so unit tests can exercise compress() without one.
-        # ``scorer_consumes`` ("hidden_states" | "qk") decides which module the
-        # pre-hook attaches to (see ``attach_scorers``).
+        # ``scorer_consumes`` ("hidden_states" | "qk") decides how the scorer
+        # is delivered: a query/key scorer stored on the inner ``Attention``,
+        # or a hidden_states gate wrapped around the outer block (see
+        # ``attach_scorers``).
         self.scorers: list[nn.Module] = []
         self.scorer_consumes: str = "hidden_states"
 
@@ -195,10 +198,10 @@ class KVCompressor:
         # the global sequence position of its chunk's first scored token
         # (the request's ``num_computed_tokens`` this step). Query/key scorers
         # that depend on absolute token position (StreamingLLM recency,
-        # ExpectedAttention's future-position RoPE rotation) read it via the
-        # qk hook; position-independent scorers ignore it. Kept parallel to
-        # ``pending_req_offsets`` (set/cleared together) so the batch-range
-        # tuples stay unchanged and the hidden_states hook is untouched.
+        # ExpectedAttention's future-position RoPE rotation) read it in the
+        # query/key scorer; position-independent scorers ignore it. Kept
+        # parallel to ``pending_req_offsets`` (set/cleared together) so the
+        # batch-range tuples stay unchanged and the gate scorer is untouched.
         self.pending_req_pos_offsets: dict[str, int] | None = None
 
     def load_gate_checkpoint(
@@ -247,7 +250,7 @@ class KVCompressor:
         ``ea_*``) are forwarded but consumed only by their scorer. The concrete
         scorer is chosen by ``build_qk_scorer`` — the one place the gate-free
         scorer type branches — and ``scorer_consumes`` is read off the module so
-        the hook dispatch stays scorer-agnostic."""
+        the delivery dispatch in ``attach_scorers`` stays scorer-agnostic."""
         scorer = build_qk_scorer(
             scorer_name,
             num_kv_heads=self.num_kv_heads_per_layer,

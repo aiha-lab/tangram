@@ -43,8 +43,8 @@ class StreamingLLMScorer(nn.Module):
             recent (kept), lower = older (evicted first).
     """
 
-    # Axis-2 dispatch: this scorer hooks the inner ``Attention`` (the qk hook),
-    # so it shares the call signature even though it reads neither q nor k.
+    # Axis-2 dispatch: this scorer uses the query/key delivery path, so it
+    # shares the call signature even though it reads neither q nor k.
     consumes = "qk"
     name = "streamingllm"
 

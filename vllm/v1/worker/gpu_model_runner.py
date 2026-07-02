@@ -2736,8 +2736,8 @@ class GPUModelRunner(
             self.prepare_inputs_event.record()
 
     def _init_compression(self) -> None:
-        """Build the compressor + executor and register per-layer gate
-        hooks. Called from ``load_model`` after the model is constructed.
+        """Build the compressor + executor and wire per-layer scorers.
+        Called from ``load_model`` after the model is constructed.
         ``cache_config.num_kv_heads`` is model-global; the compressor and
         executor live per-rank.
         """
@@ -2771,9 +2771,10 @@ class GPUModelRunner(
         # full-attention layer. For a dense model every layer is full-attention,
         # so this reduces exactly to the prior all-layers path.
         #
-        # Hook the *outer* attention block (e.g. Qwen2Attention) so the pre-hook
-        # can read hidden_states; the inner ``Attention`` only sees the
-        # already-projected q/k/v but exposes ``sliding_window`` for the split.
+        # The *outer* attention block (e.g. Qwen2Attention) exposes
+        # hidden_states for the gate scorer; the inner ``Attention`` only sees
+        # the already-projected q/k/v but exposes ``sliding_window`` for the
+        # split.
         from vllm.attention import Attention as _InnerAttention
         from vllm.model_executor.models.utils import extract_layer_index
 
@@ -2781,9 +2782,9 @@ class GPUModelRunner(
             self.vllm_config, _InnerAttention
         )
         # ``layer_to_parent`` feeds the hidden_states scorer (FastKVZip gate);
-        # ``layer_to_inner`` feeds the query/key scorer (SnapKV), which hooks
-        # the inner ``Attention`` to read its post-RoPE q/k. Both are keyed by
-        # physical layer index so ``attach_scorers`` can pick by scorer type.
+        # ``layer_to_inner`` feeds the query/key scorer (SnapKV), which reads
+        # the inner ``Attention``'s post-RoPE q/k. Both are keyed by physical
+        # layer index so ``attach_scorers`` can pick by scorer type.
         layer_to_parent: dict[int, nn.Module] = {}
         layer_to_inner: dict[int, nn.Module] = {}
         for layer_name, inner in inner_attn_layers.items():
@@ -2909,11 +2910,11 @@ class GPUModelRunner(
                 cache_config.compression_retention_dump,
                 rank=get_tensor_model_parallel_rank())
 
-        # Attach scorer pre-hooks to the compressible layers in ascending
+        # Attach the scorers to the compressible layers in ascending
         # physical-layer order (matching the scorer ordering and the
         # compressor's per-compressed-layer state). The hidden_states scorer
-        # hooks the outer block; the query/key scorer hooks the inner Attention
-        # — attach_scorers picks per scorer type.
+        # is delivered through the outer block; the query/key scorer through
+        # the inner Attention — attach_scorers picks per scorer type.
         static_parents = [layer_to_parent[i] for i in static_layer_ids]
         static_inners = [layer_to_inner[i] for i in static_layer_ids]
         self.compressor.attach_scorers(static_parents, static_inners)
@@ -2935,7 +2936,7 @@ class GPUModelRunner(
         """Activate the compressor for this step. Computes each
         compression-active request's token range in the upcoming forward's
         ``hidden_states`` (prefix-sum over scheduled token counts) and
-        stashes them as ``pending_req_offsets`` for the per-layer pre-hook.
+        stashes them as ``pending_req_offsets`` for the per-layer scorers.
         """
         assert self.compressor is not None
         if not compression_metadata:
@@ -2946,7 +2947,8 @@ class GPUModelRunner(
         offsets: list[tuple[str, int, int]] = []
         # ``req_id -> global position of this chunk's first scored token`` (the
         # request's num_computed_tokens this step). Position-dependent qk
-        # scorers (StreamingLLM, ExpectedAttention) read it via the qk hook.
+        # scorers (StreamingLLM, ExpectedAttention) read it in the query/key
+        # scorer.
         pos_offsets: dict[str, int] = {}
         cursor = 0
         for req_index, req_id in enumerate(req_ids):
@@ -3519,7 +3521,7 @@ class GPUModelRunner(
             self.calculate_kv_scales = False
 
         # Compressor stays active across forward + post-forward loop so
-        # the gate pre-hook can stash scores during forward; state is
+        # the gate scorer can stash scores during forward; state is
         # auto-cleared on context exit even if either raises.
         compression_metadata: dict[str, "CompressionRequestMetadata"] = (
             getattr(scheduler_output, "compression_metadata", {}) or {}
@@ -4157,9 +4159,9 @@ class GPUModelRunner(
         )
         prepare_communication_buffer_for_model(self.model)
 
-        # Build compressor + executor and wire per-layer gate pre-hooks
-        # before cudagraph wrapping so hooks attach to plain
-        # ``nn.Module`` instances.
+        # Build compressor + executor and wire per-layer scorers before
+        # cudagraph wrapping, so the gate scorer's forward override lands on
+        # the plain ``nn.Module`` instances rather than the graph wrapper.
         if self.cache_config.compression_enabled:
             self._init_compression()
 
