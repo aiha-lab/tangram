@@ -319,6 +319,22 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
         else AttentionCGSupport.UNIFORM_BATCH
     )
 
+    @classmethod
+    def get_cudagraph_support(
+        cls,
+        vllm_config: VllmConfig,
+        kv_cache_spec: AttentionSpec,
+    ) -> AttentionCGSupport:
+        # Head-grouped paging cannot put attention inside a FULL cudagraph:
+        # build() allocates fresh metadata tensors every step (virtual block
+        # tables, member seq-lens, per-layer overlays), so a captured graph
+        # would replay against freed capture-time addresses. Piecewise
+        # cudagraphs remain fully supported — the head-grouped attention op
+        # is a splitting op and runs eagerly between captured pieces.
+        if isinstance(kv_cache_spec, HeadGroupedAttentionSpec):
+            return AttentionCGSupport.NEVER
+        return cls._cudagraph_support
+
     def __init__(
         self,
         kv_cache_spec: AttentionSpec,

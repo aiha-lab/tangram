@@ -498,6 +498,27 @@ class VllmConfig:
                         "Overriding cudagraph_mode to PIECEWISE."
                     )
                     self.compilation_config.cudagraph_mode = CUDAGraphMode.PIECEWISE
+                # Head-grouped paging (Tangram) cannot capture attention in a
+                # FULL cudagraph: its metadata builder allocates fresh
+                # per-step tensors (virtual block tables, per-layer
+                # overlays), so full-graph replay would read freed
+                # capture-time addresses. The attention op is a piecewise
+                # splitting op, so PIECEWISE keeps the rest of the model in
+                # CUDA graphs while attention runs eagerly between pieces.
+                # This must be resolved here at config time: the model
+                # runner's later support check raises for FULL modes rather
+                # than downgrading them.
+                elif (
+                    self.cache_config is not None
+                    and self.cache_config.page_group_size is not None
+                ):
+                    logger.warning_once(
+                        "Head-grouped KV paging (page_group_size=%d) is "
+                        "incompatible with full CUDA graphs. "
+                        "Overriding cudagraph_mode to PIECEWISE.",
+                        self.cache_config.page_group_size,
+                    )
+                    self.compilation_config.cudagraph_mode = CUDAGraphMode.PIECEWISE
                 elif self.model_config is not None:
                     if self.model_config.pooler_config is not None:
                         logger.warning_once(
