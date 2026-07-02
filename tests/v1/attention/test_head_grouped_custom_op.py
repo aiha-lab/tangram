@@ -98,6 +98,10 @@ def _make_layer(impl) -> SimpleNamespace:
         num_kv_heads=NUM_KV_HEADS,
         layer_idx=LAYER_IDX,
         impl=impl,
+        # Part of the Attention layer contract read by the op body: the
+        # compression qk scorer installed by KVCompressor.attach_scorers
+        # (None when no compression scorer is attached).
+        compression_qk_scorer=None,
     )
 
 
@@ -279,6 +283,29 @@ def test_member_major_layer_slice():
     # row = member * num_reqs + req after the permute in the op body.
     got_row = call.block_table[member * NUM_REQS + req].to(torch.int64)
     assert torch.equal(got_row, expected_row)
+
+
+def test_qk_scorer_invoked_with_original_tensors():
+    """When a compression qk scorer is installed, the op body must invoke it
+    exactly once per call with the original (token-major, possibly padded)
+    query/key/value — the same tensors the replaced module pre-hook received.
+    Request offsets are unpadded, so the scorer's own slicing stays below
+    ``num_actual_tokens``."""
+    impl = _RecordingImpl()
+    layer = _make_layer(impl)
+    seen = []
+    layer.compression_qk_scorer = lambda q, k, v: seen.append((q, k, v))
+
+    metadata = _decode_metadata()
+    q, k, v = _qkv(NUM_REQS)
+    q, k, v = (_pad(q, PADDED_TOKENS), _pad(k, PADDED_TOKENS),
+               _pad(v, PADDED_TOKENS))
+    output = torch.empty(PADDED_TOKENS, HIDDEN)
+    _head_grouped_attention_impl(
+        layer, q, k, v, output, metadata, torch.empty(0))
+
+    assert len(seen) == 1
+    assert seen[0][0] is q and seen[0][1] is k and seen[0][2] is v
 
 
 def test_none_metadata_zero_fills_output():
