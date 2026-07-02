@@ -20,6 +20,7 @@ any driver that includes both groups can construct the engine unchanged.
 """
 
 import argparse
+import os
 from collections.abc import Iterable, Sequence
 from typing import Any
 
@@ -364,7 +365,11 @@ def build_llm(args: argparse.Namespace) -> LLM:
         "tensor_parallel_size": args.tensor_parallel_size,
         "trust_remote_code": True,
         "gpu_memory_utilization": args.gpu_memory_utilization,
-        "enforce_eager": True,
+        # TANGRAM_GRAPH=1 runs the engine in its compiled mode (VLLM_COMPILE
+        # + CUDA graphs; head-grouped runs are pinned to PIECEWISE at config
+        # time). Default stays eager so existing sweep results remain
+        # directly comparable.
+        "enforce_eager": os.environ.get("TANGRAM_GRAPH", "0") != "1",
         "max_model_len": args.max_model_len,
         "enable_prefix_caching": args.enable_prefix_caching,
         "disable_log_stats": not args.enable_log_stats,
