@@ -265,7 +265,7 @@ class KVCacheCoordinator(ABC):
         return tuple(
             (
                 manager.get_req_block_ids_array(request_id)
-                if getattr(manager, "ragged", False)
+                if manager.ragged
                 else manager.get_req_blocks(request_id)
             )
             for manager in self.single_type_managers

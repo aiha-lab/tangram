@@ -202,7 +202,7 @@ class KVCacheManager:
         # so allocate / get_blocks return int32 ndarrays via
         # ``KVCacheBlocks.block_ids_array``.
         self.ragged = any(
-            getattr(m, "ragged", False)
+            m.ragged
             for m in self.coordinator.single_type_managers
         )
 
