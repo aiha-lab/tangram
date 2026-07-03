@@ -44,12 +44,11 @@ from vllm.platforms.interface import DeviceCapability
 from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backends.ragged_layout import (
     as_virtual_block_view,
+    build_ragged_step_views,
     identity_member_maps,
     load_cluster_map,
     member_maps_from_cluster_map,
-    member_seq_lens,
     member_virtual_block_table,
-    member_virtual_slots,
     physical_member_maps_from_static_cluster_map,
     read_cluster_map_static_layer_ids,
 )
@@ -676,158 +675,40 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
             self.scheduler_metadata[n:] = 0
             scheduler_metadata = self.scheduler_metadata[:n]
 
-        # Precompute per-step views consumed by
+        # Precompute the ragged-paging per-step views consumed by
         # ``layer.py::_ragged_attention_impl`` (the body of the
-        # ``vllm::unified_attention_ragged`` custom op); layout selected
-        # by ``ragged_decode_layout``.
+        # ``vllm::unified_attention_ragged`` custom op). The layout arithmetic
+        # lives in ``ragged_layout.build_ragged_step_views`` so a second
+        # attention backend can reuse it; the builder supplies only its cached
+        # member-map resolver and this step's raw tensors.
         ragged_decode_layout = False
         if self._ragged:
-            # Terminology in this block: a *head-group* and a *cluster* are the
-            # same thing — one shared-retention-budget unit owning a set of
-            # physical blocks. ("head-group" is the kv-cache-manager term;
-            # "cluster" is the layout/compression term; they are synonyms.) Its
-            # per-page columns are *members*, one KV head each, so expanding the
-            # cluster axis by ``page_group_size`` yields the member axis.
-            if block_table_tensor.ndim != 3:
-                raise RuntimeError(
-                    "ragged path expects 3D block_table_tensor "
-                    "[num_reqs, num_head_groups_total, max_blocks_per_req], "
-                    f"got shape {tuple(block_table_tensor.shape)}.")
-            num_head_groups_total = block_table_tensor.shape[1]
-            num_head_groups_per_layer = self._num_head_groups_per_layer
-            if num_head_groups_total % num_head_groups_per_layer != 0:
-                raise RuntimeError(
-                    f"num_head_groups_total ({num_head_groups_total}) is not "
-                    "divisible by num_head_groups_per_layer "
-                    f"({num_head_groups_per_layer}).")
-            num_layers_local = (
-                num_head_groups_total // num_head_groups_per_layer)
-            if slot_mapping.ndim != 2:
-                raise RuntimeError(
-                    "ragged path expects 2D slot_mapping "
-                    "[num_head_groups_total, num_actual_tokens], "
-                    f"got shape {tuple(slot_mapping.shape)}.")
-            effective_seq_lens_cpu = (
-                common_attn_metadata.effective_seq_lens_cpu)
-            ragged_decode_layout = max_query_len == 1
-
-            num_kv_heads_per_layer = self._num_kv_heads_per_layer
-
-            # Per-CLUSTER sequence lengths in group-major form
-            # [num_clusters_total, num_reqs]; the decode overlay is just a
-            # reshape of this, so both layouts share one construction. With
-            # compression the cache holds effective[cluster] post-compression
-            # tokens plus this step's chunk; otherwise the full length.
-            if effective_seq_lens_cpu is not None:
-                query_start_loc_cpu = (
-                    common_attn_metadata.query_start_loc_cpu[: num_reqs + 1])
-                num_scheduled_np = (
-                    query_start_loc_cpu[1:].cpu().numpy()
-                    - query_start_loc_cpu[:-1].cpu().numpy()
-                )
-                effective_np = np.asarray(
-                    effective_seq_lens_cpu, dtype=np.int32)
-                seq_lens_cluster_np = (
-                    effective_np[:num_reqs].T.astype(np.int32)
-                    + num_scheduled_np.astype(np.int32)[None, :]
-                )
-                seq_lens_cluster = torch.from_numpy(
-                    seq_lens_cluster_np).to(seq_lens.device).contiguous()
-            else:
-                seq_lens_cluster = (
-                    seq_lens.unsqueeze(0)
-                    .expand(num_head_groups_total, -1)
-                    .contiguous()
-                )
-
-            # Gather per-cluster physical metadata into per-member (per-KV-head)
-            # column-major virtual addressing. member row m = layer *
-            # num_kv_heads_per_layer + head; member_to_cluster[m] is the
-            # (possibly cross-layer) cluster that head reads/writes, member_to_col
-            # its column. The identity map reproduces adjacent-head grouping.
-            # Gathering on the FLAT cluster axis before the per-layer
-            # reshape is what lets a cluster span layers. See
-            # vllm/v1/attention/backends/ragged_layout.py.
-            member_to_cluster, member_to_col = self._member_maps(
-                num_layers_local, seq_lens.device)
-            # Cluster block table trimmed to the blocks the batch occupies, plus
-            # the static per-layer (cluster, column) maps; each attention call
-            # builds its own virtual block table from these on demand.
-            # block_table_tensor: [num_reqs, num_clusters_total, max_blocks].
-            max_blocks = cdiv(max_seq_len, self.block_size)
-            cluster_block_table = block_table_tensor[:, :, :max_blocks]
-            clusters_per_layer = member_to_cluster.view(
-                num_layers_local, num_kv_heads_per_layer)
-            cols_per_layer = member_to_col.view(
-                num_layers_local, num_kv_heads_per_layer)
-            # slot_mapping / seq_lens member views carry no block axis, so the
-            # all-member form is cheap; keep it.
-            # slot_mapping: [num_clusters_total, num_actual_tokens].
-            slot_mapping_member = member_virtual_slots(
-                slot_mapping, member_to_cluster, member_to_col,
-                self._page_group_size, self.block_size, cluster_axis=0)
-            # seq_lens_cluster: [num_clusters_total, num_reqs].
-            seq_lens_member = member_seq_lens(
-                seq_lens_cluster, member_to_cluster, cluster_axis=0)
-
-            if ragged_decode_layout:
-                # Uniform decode: every (req, member) varlen sequence has
-                # length 1 so num_actual_tokens == num_reqs.
-                if num_actual_tokens != num_reqs:
-                    raise RuntimeError(
-                        "uniform-decode ragged path expects "
-                        f"num_actual_tokens ({num_actual_tokens}) == num_reqs "
-                        f"({num_reqs}).")
-                # member axis splits into (layer, head); the per-layer block
-                # table is built in the overlay loop below.
-                # [num_members_total, num_reqs] as
-                # [num_layers, num_kv_heads, num_reqs]
-                # → [num_layers, num_reqs, num_kv_heads].
-                slot_mapping_grouped = (
-                    slot_mapping_member
-                    .view(num_layers_local, num_kv_heads_per_layer, num_reqs)
-                    .permute(0, 2, 1)
-                    .contiguous()
-                )
-                seq_lens_grouped = (
-                    seq_lens_member
-                    .view(num_layers_local, num_kv_heads_per_layer, num_reqs)
-                    .permute(0, 2, 1)
-                    .contiguous()
-                )
-                # Every (req, member) sequence has length 1, so cu_seqlens is
-                # ``[0, 1, ..., num_kv_heads × num_reqs]``.
-                query_start_loc_grouped = torch.arange(
-                    num_kv_heads_per_layer * num_reqs + 1,
-                    device=query_start_loc.device,
-                    dtype=query_start_loc.dtype,
-                )
-            else:
-                # Member-major path (prefill / mixed): the data copy in
-                # ``_ragged_attention_impl`` is required because
-                # (req, member) sequences are not contiguous in any
-                # token-major view when sequence lengths vary.
-                slot_mapping_grouped = slot_mapping_member
-                seq_lens_grouped = seq_lens_member
-                # cu_seqlens for the (num_kv_heads_per_layer × num_reqs)
-                # member sequences per layer; the layer slice happens in
-                # ``layer.py::_ragged_attention_impl``.
-                query_start_head = query_start_loc[:num_reqs]
-                offsets = torch.arange(
-                    num_kv_heads_per_layer,
-                    device=query_start_head.device,
-                    dtype=query_start_head.dtype,
-                ) * num_actual_tokens
-                query_start_grouped_head = (
-                    query_start_head.unsqueeze(0) + offsets.unsqueeze(1)
-                ).reshape(-1)
-                query_start_grouped_tail = torch.tensor(
-                    [num_kv_heads_per_layer * num_actual_tokens],
-                    device=query_start_head.device,
-                    dtype=query_start_head.dtype,
-                )
-                query_start_loc_grouped = torch.cat(
-                    [query_start_grouped_head, query_start_grouped_tail])
+            views = build_ragged_step_views(
+                block_table_tensor=block_table_tensor,
+                slot_mapping=slot_mapping,
+                seq_lens=seq_lens,
+                query_start_loc=query_start_loc,
+                query_start_loc_cpu=common_attn_metadata.query_start_loc_cpu,
+                effective_seq_lens_cpu=(
+                    common_attn_metadata.effective_seq_lens_cpu),
+                num_reqs=num_reqs,
+                num_actual_tokens=num_actual_tokens,
+                max_query_len=max_query_len,
+                max_seq_len=max_seq_len,
+                num_head_groups_per_layer=self._num_head_groups_per_layer,
+                page_group_size=self._page_group_size,
+                block_size=self.block_size,
+                num_kv_heads_per_layer=self._num_kv_heads_per_layer,
+                member_maps_fn=self._member_maps,
+            )
+            num_layers_local = views.num_layers_local
+            ragged_decode_layout = views.ragged_decode_layout
+            cluster_block_table = views.cluster_block_table
+            clusters_per_layer = views.clusters_per_layer
+            cols_per_layer = views.cols_per_layer
+            seq_lens_grouped = views.seq_lens_grouped
+            slot_mapping_grouped = views.slot_mapping_grouped
+            query_start_loc_grouped = views.query_start_loc_grouped
         else:
             cluster_block_table = None
             clusters_per_layer = None
