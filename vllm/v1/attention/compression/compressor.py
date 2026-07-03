@@ -557,13 +557,16 @@ class KVCompressor:
         chunk_len: int,
         floor_min: int,
     ) -> np.ndarray:
-        """Per-(layer, group) post-evict kept_lengths for this chunk.
+        """Compute this chunk's per-(layer, group) post-evict kept_lengths.
 
-        Mirrors :py:meth:`CompressionExecutor.run_request` arithmetic
-        without touching KV cache. Result is cached on
-        ``req.cached_kept_lengths_cpu`` so the executor can read it back;
-        under TP the caller may cross-rank MAX-reduce the cache before
-        ``run_request`` to keep the block pool consistent."""
+        This is the single source of truth for how many token slots each
+        (layer, group) keeps. It touches no KV cache; the result is cached on
+        ``req.cached_kept_lengths_cpu`` and :py:meth:`CompressionExecutor.run_request`
+        reads it back (deriving its top-k span from it via
+        ``_new_region_from_kept_length``) rather than recomputing — so the two
+        stay consistent by construction. Under TP the caller may cross-rank
+        MAX-reduce the cache before ``run_request`` to keep the block pool
+        consistent."""
         req = self.req_state.get(req_id)
         if req is None or req.cross_layer_decision is None:
             raise RuntimeError(

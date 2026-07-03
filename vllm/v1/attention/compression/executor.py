@@ -18,6 +18,28 @@ from vllm.v1.attention.compression.compressor import KVCompressor
 from vllm.v1.worker.block_table import BlockTable
 
 
+def _new_region_from_kept_length(
+    kept_length: int,
+    sink_size: int,
+    locked: int,
+    win_size: int,
+    eval_len: int | None = None,
+) -> int:
+    """Recover the block-aligned top-k ("new") span from ``kept_length``.
+
+    ``kept_length`` is produced once by
+    ``KVCompressor.compute_kept_lengths_per_rank`` and packs
+    ``sink + locked + new + window`` slots; the writeback needs the ``new``
+    region back out. ``eval_len`` clamps it to the scored region when the
+    caller slices ``sorted_idx``; the keep-all fast path takes no slice and
+    omits the clamp.
+    """
+    new = max(0, kept_length - sink_size - locked - win_size)
+    if eval_len is not None:
+        new = min(new, eval_len)
+    return new
+
+
 @dataclass
 class CompressionMetadata:
     """Per-(request, step) compression info passed to ``run_request``.
@@ -193,9 +215,8 @@ class CompressionExecutor:
                     locked = int(locked_cpu[static_idx, group_idx])
                     kept_length = int(
                         kept_lengths_all[static_idx, group_idx])
-                    k_aligned = max(
-                        0,
-                        kept_length - sink_size - locked - win_size)
+                    k_aligned = _new_region_from_kept_length(
+                        kept_length, sink_size, locked, win_size)
                     new_locked_all[static_idx, group_idx] = (
                         locked + k_aligned)
                 continue
@@ -210,10 +231,8 @@ class CompressionExecutor:
                 # the cross-rank-MAX-reduced kept_length; sorted_idx
                 # already holds eval_len positions so the slice is safe.
                 kept_length = int(kept_lengths_all[static_idx, group_idx])
-                k_aligned = max(
-                    0, kept_length - sink_size - locked - win_size)
-                if k_aligned > eval_len:
-                    k_aligned = eval_len
+                k_aligned = _new_region_from_kept_length(
+                    kept_length, sink_size, locked, win_size, eval_len)
                 new_locked_all[static_idx, group_idx] = locked + k_aligned
 
                 if kept_length == 0:
