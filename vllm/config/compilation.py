@@ -502,7 +502,7 @@ class CompilationConfig:
         # scoring); captured inside a graph it would run at capture time
         # only. Listing an op that never appears in a given graph (non-gate
         # scorers) is harmless — splitting matches nodes present in the
-        # graph. See compression/compressor.py::tangram_gate_capture.
+        # graph. See compression/gate_capture.py::tangram_gate_capture.
         "vllm::tangram_gate_capture",
         "vllm::unified_mla_attention",
         "vllm::unified_mla_attention_with_output",
