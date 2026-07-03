@@ -537,10 +537,11 @@ class Attention(nn.Module, AttentionLayerBase):
         assert self.attn_type == AttentionType.DECODER
         page_group_size = vllm_config.cache_config.page_group_size
         if page_group_size is not None:
-            assert not vllm_config.model_config.use_mla, (
-                "MLA is not compatible with ragged paging "
-                "(page_group_size); these features are mutually exclusive."
-            )
+            if vllm_config.model_config.use_mla:
+                raise ValueError(
+                    "MLA is not compatible with ragged paging "
+                    "(page_group_size); these features are mutually "
+                    "exclusive.")
             return RaggedAttentionSpec(
                 block_size=block_size,
                 num_kv_heads=self.num_kv_heads,

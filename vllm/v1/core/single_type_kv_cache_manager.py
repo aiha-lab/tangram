@@ -400,7 +400,7 @@ class SingleTypeKVCacheManager(ABC):
         present and never re-allocates them.
         """
         if not self.ragged:
-            raise AssertionError("null_blocks_by_ids is ragged only.")
+            raise RuntimeError("null_blocks_by_ids is ragged only.")
         if block_ids.size == 0:
             return
         num_pool_blocks = len(self.block_pool.blocks)

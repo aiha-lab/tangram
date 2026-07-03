@@ -688,22 +688,25 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
             # "cluster" is the layout/compression term; they are synonyms.) Its
             # per-page columns are *members*, one KV head each, so expanding the
             # cluster axis by ``page_group_size`` yields the member axis.
-            assert block_table_tensor.ndim == 3, (
-                "ragged path expects 3D block_table_tensor "
-                "[num_reqs, num_head_groups_total, max_blocks_per_req], "
-                f"got shape {tuple(block_table_tensor.shape)}.")
+            if block_table_tensor.ndim != 3:
+                raise RuntimeError(
+                    "ragged path expects 3D block_table_tensor "
+                    "[num_reqs, num_head_groups_total, max_blocks_per_req], "
+                    f"got shape {tuple(block_table_tensor.shape)}.")
             num_head_groups_total = block_table_tensor.shape[1]
             num_head_groups_per_layer = self._num_head_groups_per_layer
-            assert num_head_groups_total % num_head_groups_per_layer == 0, (
-                f"num_head_groups_total ({num_head_groups_total}) is not "
-                "divisible by num_head_groups_per_layer "
-                f"({num_head_groups_per_layer}).")
+            if num_head_groups_total % num_head_groups_per_layer != 0:
+                raise RuntimeError(
+                    f"num_head_groups_total ({num_head_groups_total}) is not "
+                    "divisible by num_head_groups_per_layer "
+                    f"({num_head_groups_per_layer}).")
             num_layers_local = (
                 num_head_groups_total // num_head_groups_per_layer)
-            assert slot_mapping.ndim == 2, (
-                "ragged path expects 2D slot_mapping "
-                "[num_head_groups_total, num_actual_tokens], "
-                f"got shape {tuple(slot_mapping.shape)}.")
+            if slot_mapping.ndim != 2:
+                raise RuntimeError(
+                    "ragged path expects 2D slot_mapping "
+                    "[num_head_groups_total, num_actual_tokens], "
+                    f"got shape {tuple(slot_mapping.shape)}.")
             effective_seq_lens_cpu = (
                 common_attn_metadata.effective_seq_lens_cpu)
             ragged_decode_layout = max_query_len == 1
@@ -770,11 +773,11 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
             if ragged_decode_layout:
                 # Uniform decode: every (req, member) varlen sequence has
                 # length 1 so num_actual_tokens == num_reqs.
-                assert num_actual_tokens == num_reqs, (
-                    "uniform-decode ragged path expects "
-                    f"num_actual_tokens ({num_actual_tokens}) == num_reqs "
-                    f"({num_reqs})."
-                )
+                if num_actual_tokens != num_reqs:
+                    raise RuntimeError(
+                        "uniform-decode ragged path expects "
+                        f"num_actual_tokens ({num_actual_tokens}) == num_reqs "
+                        f"({num_reqs}).")
                 # member axis splits into (layer, head); the per-layer block
                 # table is built in the overlay loop below.
                 # [num_members_total, num_reqs] as

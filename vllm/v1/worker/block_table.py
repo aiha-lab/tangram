@@ -194,13 +194,13 @@ class BlockTable:
         # ``num_required`` must be an integer; otherwise allocator and
         # append are out of sync (e.g. stale ``num_required_blocks``).
         if (sum_starts + total) % num_groups != 0:
-            raise AssertionError(
+            raise RuntimeError(
                 f"ragged append_row: total {total} + existing "
                 f"{sum_starts} not divisible by num_head_groups "
                 f"({num_groups}); uniform per-group target unrecoverable.")
         num_required = (sum_starts + total) // num_groups
         if num_required < int(starts.max()):
-            raise AssertionError(
+            raise RuntimeError(
                 f"ragged append_row: num_required {num_required} < "
                 f"max(starts) {int(starts.max())}; cannot shrink groups "
                 "via append.")
@@ -216,7 +216,11 @@ class BlockTable:
                 row_idx, group_idx, start : start + num_new
             ] = block_ids_np[pos : pos + num_new]
             pos += num_new
-        assert pos == total, (pos, total)
+        if pos != total:
+            raise RuntimeError(
+                f"ragged append_row: consumed {pos} block ids but received "
+                f"{total}; per-group block counts are inconsistent and the "
+                "KV block table would be corrupted.")
         self.num_blocks_per_row[row_idx, :] = num_required
 
     def add_row(self, block_ids: list[int], row_idx: int) -> None:
@@ -431,7 +435,7 @@ class BlockTable:
         old_2d = self.num_blocks_per_row[row_idx, :total_groups].reshape(
             num_layers, num_groups)
         if (new_counts > old_2d).any():
-            raise AssertionError(
+            raise RuntimeError(
                 "compact_after_compress_all_layers cannot grow num_blocks; "
                 f"max old={old_2d.max(axis=0).tolist()} "
                 f"max new={new_counts.max(axis=0).tolist()}.")
