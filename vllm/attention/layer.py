@@ -37,12 +37,12 @@ from vllm.utils.torch_utils import (
     direct_register_custom_op,
     kv_cache_dtype_str_to_dtype,
 )
-from vllm.v1.attention.backends.head_grouped_layout import (
+from vllm.v1.attention.backends.ragged_layout import (
     member_virtual_block_table,
 )
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
-    HeadGroupedAttentionSpec,
+    RaggedAttentionSpec,
     KVCacheSpec,
     MLAAttentionSpec,
     SlidingWindowSpec,
@@ -364,7 +364,7 @@ class Attention(nn.Module, AttentionLayerBase):
 
         # Compression scorer delivery (Tangram). Populated by
         # ``KVCompressor.attach_scorers``: ``compression_qk_scorer`` is
-        # invoked at the top of the ``unified_attention_head_grouped`` op
+        # invoked at the top of the ``unified_attention_ragged`` op
         # body with this layer's token-major query/key/value;
         # ``compression_gate_capture`` is invoked by the
         # ``tangram_gate_capture`` op with the outer block's hidden_states.
@@ -373,7 +373,7 @@ class Attention(nn.Module, AttentionLayerBase):
         self.compression_qk_scorer: Callable | None = None
         self.compression_gate_capture: Callable | None = None
 
-        # Head-grouped paging derived sizes. ``page_group_size is None``
+        # Ragged paging derived sizes. ``page_group_size is None``
         # turns the branch in ``forward()`` off and keeps this layer
         # byte-identical to base vLLM.
         self.page_group_size: int | None = None
@@ -401,7 +401,7 @@ class Attention(nn.Module, AttentionLayerBase):
             except (AssertionError, ValueError) as exc:
                 raise ValueError(
                     f"Could not extract a numeric layer index from layer "
-                    f"prefix {prefix!r}; head-grouped paging requires it for "
+                    f"prefix {prefix!r}; ragged paging requires it for "
                     f"per-layer metadata slicing."
                 ) from exc
 
@@ -439,9 +439,9 @@ class Attention(nn.Module, AttentionLayerBase):
             if self.impl.supports_quant_query_input():
                 query, _ = self.query_quant(query, self._q_scale)
 
-        # Head-grouped paging: the member-major reshape and the per-layer
+        # Ragged paging: the member-major reshape and the per-layer
         # metadata selection run inside a dedicated custom op
-        # (``vllm::unified_attention_head_grouped``). The op is a piecewise
+        # (``vllm::unified_attention_ragged``). The op is a piecewise
         # splitting point, so under compilation this attention runs eagerly
         # between captured CUDA-graph pieces while the rest of the model is
         # compiled — the traced region here is only the output allocation
@@ -455,11 +455,11 @@ class Attention(nn.Module, AttentionLayerBase):
                 if isinstance(attn_metadata, dict):
                     attn_metadata = attn_metadata[self.layer_name]
                 self_kv_cache = self.kv_cache[forward_context.virtual_engine]
-                _head_grouped_attention_impl(
+                _ragged_attention_impl(
                     self, query, key, value, output, attn_metadata, self_kv_cache
                 )
             else:
-                torch.ops.vllm.unified_attention_head_grouped(
+                torch.ops.vllm.unified_attention_ragged(
                     query, key, value, output, self.layer_name
                 )
             return output
@@ -538,10 +538,10 @@ class Attention(nn.Module, AttentionLayerBase):
         page_group_size = vllm_config.cache_config.page_group_size
         if page_group_size is not None:
             assert not vllm_config.model_config.use_mla, (
-                "MLA is not compatible with head-grouped paging "
+                "MLA is not compatible with ragged paging "
                 "(page_group_size); these features are mutually exclusive."
             )
-            return HeadGroupedAttentionSpec(
+            return RaggedAttentionSpec(
                 block_size=block_size,
                 num_kv_heads=self.num_kv_heads,
                 head_size=self.head_size,
@@ -1064,7 +1064,7 @@ direct_register_custom_op(
 )
 
 
-def _head_grouped_attention_impl(
+def _ragged_attention_impl(
     layer: Attention,
     query: torch.Tensor,
     key: torch.Tensor,
@@ -1073,17 +1073,17 @@ def _head_grouped_attention_impl(
     attn_metadata,
     kv_cache: torch.Tensor,
 ) -> None:
-    """Head-grouped attention body, writing into ``output`` in place.
+    """Ragged attention body, writing into ``output`` in place.
 
     Each (request, KV-head member) is one varlen sequence: column-major paging
     makes every KV head its own sequence, carrying its GQA group of query
-    heads (see vllm/v1/attention/backends/head_grouped_layout.py). Decode uses
+    heads (see vllm/v1/attention/backends/ragged_layout.py). Decode uses
     a single reshape per Q/K/V/O against precomputed per-layer metadata;
     prefill / mixed batches copy token-major → member-major to handle varying
     sequence lengths.
 
     This body always executes eagerly: under piecewise compilation the
-    wrapping custom op (``vllm::unified_attention_head_grouped``) is a
+    wrapping custom op (``vllm::unified_attention_ragged``) is a
     splitting point, so it runs between captured CUDA-graph pieces. Inputs may
     therefore be padded to a CUDA-graph capture size — every path below slices
     Q/K/V to ``attn_metadata.num_actual_tokens`` first and writes only the
@@ -1092,7 +1092,7 @@ def _head_grouped_attention_impl(
     does for the standard attention path.
     """
     assert layer.use_output, (
-        "Head-grouped paging requires backends that accept an output "
+        "Ragged paging requires backends that accept an output "
         "buffer (FlashAttention does)."
     )
 
@@ -1133,7 +1133,7 @@ def _head_grouped_attention_impl(
     num_actual = attn_metadata.num_actual_tokens
     output_2d = output.view(-1, hidden)
 
-    if attn_metadata.head_grouped_decode_layout:
+    if attn_metadata.ragged_decode_layout:
         # Uniform-decode fast path: token-major Q/K/V flattens directly
         # into member-major (one sequence per KV head) because every
         # (req, member) sequence is one row. Per-layer metadata is
@@ -1252,14 +1252,14 @@ def _head_grouped_attention_impl(
 
 
 @maybe_transfer_kv_layer
-def unified_attention_head_grouped(
+def unified_attention_ragged(
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
     output: torch.Tensor,
     layer_name: str,
 ) -> None:
-    """Head-grouped attention as a custom op, writing into ``output``.
+    """Ragged attention as a custom op, writing into ``output``.
 
     INVARIANT: this op must remain in ``CompilationConfig._attention_ops``
     (piecewise splitting ops). Its body runs Python that only exists at op
@@ -1270,12 +1270,12 @@ def unified_attention_head_grouped(
     every replay.
     """
     attn_metadata, self, kv_cache = get_attention_context(layer_name)
-    _head_grouped_attention_impl(
+    _ragged_attention_impl(
         self, query, key, value, output, attn_metadata, kv_cache
     )
 
 
-def unified_attention_head_grouped_fake(
+def unified_attention_ragged_fake(
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
@@ -1286,10 +1286,10 @@ def unified_attention_head_grouped_fake(
 
 
 direct_register_custom_op(
-    op_name="unified_attention_head_grouped",
-    op_func=unified_attention_head_grouped,
+    op_name="unified_attention_ragged",
+    op_func=unified_attention_ragged,
     mutates_args=["output"],
-    fake_impl=unified_attention_head_grouped_fake,
+    fake_impl=unified_attention_ragged_fake,
 )
 
 

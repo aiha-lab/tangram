@@ -21,7 +21,7 @@ from torch import nn
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.utils.torch_utils import direct_register_custom_op
-from vllm.v1.attention.backends.head_grouped_layout import (
+from vllm.v1.attention.backends.ragged_layout import (
     identity_member_maps,
     load_cluster_map,
     member_maps_from_cluster_map,
@@ -277,7 +277,7 @@ class KVCompressor:
         cluster map instead assigns each head to the (possibly cross-layer)
         cluster it shares physical KV blocks with. Either way the maps mirror
         those the FlashAttention builder uses for paging, so scoring and
-        physical placement agree (see ``head_grouped_layout.py``). Member row
+        physical placement agree (see ``ragged_layout.py``). Member row
         ``m = layer * num_kv_heads_per_layer + head``.
         """
         if head_group_cluster_map is None:
@@ -761,7 +761,7 @@ class KVCompressor:
 
         - query/key scorers (SnapKV, KeyDiff, ...) are stored on the inner
           ``Attention`` as ``compression_qk_scorer`` and invoked at the top of
-          the ``vllm::unified_attention_head_grouped`` op body, which receives
+          the ``vllm::unified_attention_ragged`` op body, which receives
           the same token-major query/key/value the old pre-hook saw.
         - hidden_states scorers (FastKVZip gate) are stored on the inner
           ``Attention`` as ``compression_gate_capture`` and invoked by a
@@ -840,7 +840,7 @@ class KVCompressor:
         self, layer_idx: int, scorer: nn.Module, parent: nn.Module,
     ):
         """Scorer fn for query/key scorers (SnapKV, KeyDiff, StreamingLLM,
-        TOVA, ExpectedAttention), invoked from the head-grouped attention op
+        TOVA, ExpectedAttention), invoked from the ragged attention op
         body with the op's token-major query / key / value (post-RoPE — the
         same tensors the inner ``Attention``'s forward receives). Scores each
         request's chunk independently — the observation window is

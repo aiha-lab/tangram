@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Unit tests for ``_head_grouped_attention_impl`` (the body of the
-``vllm::unified_attention_head_grouped`` custom op).
+"""Unit tests for ``_ragged_attention_impl`` (the body of the
+``vllm::unified_attention_ragged`` custom op).
 
 These run on CPU with a mock ``impl.forward``: they prove that the op body
 hands the backend exactly the same member-major tensors and per-layer
@@ -16,8 +16,8 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from vllm.attention.layer import _head_grouped_attention_impl
-from vllm.v1.attention.backends.head_grouped_layout import (
+from vllm.attention.layer import _ragged_attention_impl
+from vllm.v1.attention.backends.ragged_layout import (
     identity_member_clusters,
     identity_member_columns,
 )
@@ -37,7 +37,7 @@ PADDED_TOKENS = 8  # capture-size padding applied on top of the actual tokens
 
 @dataclasses.dataclass
 class _FakeMetadata:
-    """Just the fields ``_head_grouped_attention_impl`` reads.
+    """Just the fields ``_ragged_attention_impl`` reads.
 
     A dataclass because the member-major path rebuilds per-layer metadata via
     ``dataclasses.replace``.
@@ -46,7 +46,7 @@ class _FakeMetadata:
     num_actual_tokens: int
     num_head_groups_per_layer: int
     page_group_size: int
-    head_grouped_decode_layout: bool
+    ragged_decode_layout: bool
     per_layer_md: list | None = None
     cluster_block_table: torch.Tensor | None = None
     clusters_per_layer: torch.Tensor | None = None
@@ -148,7 +148,7 @@ def _decode_metadata() -> _FakeMetadata:
         num_actual_tokens=NUM_REQS,
         num_head_groups_per_layer=NUM_KV_HEADS // PAGE_GROUP_SIZE,
         page_group_size=PAGE_GROUP_SIZE,
-        head_grouped_decode_layout=True,
+        ragged_decode_layout=True,
         per_layer_md=per_layer_md,
     )
 
@@ -189,7 +189,7 @@ def _member_major_metadata(num_actual_tokens: int) -> _FakeMetadata:
         num_actual_tokens=num_actual_tokens,
         num_head_groups_per_layer=num_clusters_per_layer,
         page_group_size=PAGE_GROUP_SIZE,
-        head_grouped_decode_layout=False,
+        ragged_decode_layout=False,
         cluster_block_table=cluster_block_table,
         clusters_per_layer=clusters.view(NUM_LAYERS, NUM_KV_HEADS),
         cols_per_layer=cols.view(NUM_LAYERS, NUM_KV_HEADS),
@@ -208,7 +208,7 @@ def _run(metadata: _FakeMetadata, num_tokens: int, num_actual: int):
         q, k, v = _pad(q, num_tokens), _pad(k, num_tokens), _pad(v, num_tokens)
     output = torch.full((num_tokens, HIDDEN), float("nan"))
     kv_cache = torch.empty(0)
-    _head_grouped_attention_impl(layer, q, k, v, output, metadata, kv_cache)
+    _ragged_attention_impl(layer, q, k, v, output, metadata, kv_cache)
     assert len(impl.calls) == 1
     return impl.calls[0], output, q
 
@@ -301,7 +301,7 @@ def test_qk_scorer_invoked_with_original_tensors():
     q, k, v = (_pad(q, PADDED_TOKENS), _pad(k, PADDED_TOKENS),
                _pad(v, PADDED_TOKENS))
     output = torch.empty(PADDED_TOKENS, HIDDEN)
-    _head_grouped_attention_impl(
+    _ragged_attention_impl(
         layer, q, k, v, output, metadata, torch.empty(0))
 
     assert len(seen) == 1
@@ -315,7 +315,7 @@ def test_none_metadata_zero_fills_output():
     layer = _make_layer(impl)
     q, k, v = _qkv(PADDED_TOKENS)
     output = torch.full((PADDED_TOKENS, HIDDEN), float("nan"))
-    _head_grouped_attention_impl(
+    _ragged_attention_impl(
         layer, q, k, v, output, None, torch.empty(0))
     assert impl.calls == []
     assert torch.equal(output, torch.zeros_like(output))

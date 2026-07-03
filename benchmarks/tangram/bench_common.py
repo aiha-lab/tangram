@@ -366,7 +366,7 @@ def build_llm(args: argparse.Namespace) -> LLM:
         "trust_remote_code": True,
         "gpu_memory_utilization": args.gpu_memory_utilization,
         # TANGRAM_GRAPH=1 runs the engine in its compiled mode (VLLM_COMPILE
-        # + CUDA graphs; head-grouped runs are pinned to PIECEWISE at config
+        # + CUDA graphs; ragged runs are pinned to PIECEWISE at config
         # time). Default stays eager so existing sweep results remain
         # directly comparable.
         "enforce_eager": os.environ.get("TANGRAM_GRAPH", "0") != "1",

@@ -14,7 +14,7 @@ from vllm.v1.kv_cache_interface import (
     ChunkedLocalAttentionSpec,
     CrossAttentionSpec,
     FullAttentionSpec,
-    HeadGroupedAttentionSpec,
+    RaggedAttentionSpec,
     KVCacheSpec,
     MambaSpec,
     MLAAttentionSpec,
@@ -52,26 +52,26 @@ class SingleTypeKVCacheManager(ABC):
         self.kv_cache_spec = kv_cache_spec
         self.block_pool = block_pool
 
-        # Head-grouped paging: a token-position requires
+        # Ragged paging: a token-position requires
         # ``num_head_groups_total = num_head_groups_per_layer × num_layers``
         # globally-unique block ids, popped in one
         # ``BlockPool.get_new_blocks`` call.
-        self.head_grouped = isinstance(kv_cache_spec, HeadGroupedAttentionSpec)
-        if self.head_grouped:
+        self.ragged = isinstance(kv_cache_spec, RaggedAttentionSpec)
+        if self.ragged:
             self.num_head_groups_total = block_pool.num_head_groups
             assert self.num_head_groups_total is not None, (
                 "BlockPool.num_head_groups must be set for "
-                "HeadGroupedAttentionSpec.")
+                "RaggedAttentionSpec.")
         else:
             self.num_head_groups_total = 1
 
         # Per-request allocated blocks. Source of truth for the non-
-        # head-grouped path; left empty in head-grouped mode (see
+        # ragged path; left empty in ragged mode (see
         # ``req_to_block_ids``).
         self.req_to_blocks: defaultdict[str, list[KVCacheBlock]] = defaultdict(
             list)
 
-        # Head-grouped only: per-request int32 ndarray of physical block
+        # Ragged only: per-request int32 ndarray of physical block
         # ids, ordered group-major within a layer (matches
         # ``BlockTable.append_row``). Source of truth here because
         # compression-driven frees update it via a numpy bitmap filter
@@ -103,7 +103,7 @@ class SingleTypeKVCacheManager(ABC):
                 tokens that are already allocated).
             new_computed_blocks: The new computed blocks just hitting the
                 prefix caching. Accepts ``Sequence[KVCacheBlock]`` (base
-                path) or ``np.ndarray`` of block ids (head-grouped path
+                path) or ``np.ndarray`` of block ids (ragged path
                 — always empty since prefix caching is disabled there).
 
         Returns:
@@ -115,7 +115,7 @@ class SingleTypeKVCacheManager(ABC):
         is_ndarray = isinstance(new_computed_blocks, np.ndarray)
         num_computed = (int(new_computed_blocks.size) if is_ndarray
                         else len(new_computed_blocks))
-        if self.head_grouped:
+        if self.ragged:
             ids = self.req_to_block_ids.get(request_id)
             existing_len = 0 if ids is None else int(ids.size)
         else:
@@ -124,7 +124,7 @@ class SingleTypeKVCacheManager(ABC):
             num_required_blocks * num_groups - num_computed - existing_len)
         # If a computed block is an eviction candidate (ref_cnt == 0), it
         # will be revived during allocation so it counts as new. The
-        # ndarray branch carries no per-block ref_cnt (head-grouped caching
+        # ndarray branch carries no per-block ref_cnt (ragged caching
         # is disabled) and the count is always 0.
         if is_ndarray:
             num_evictable_computed_blocks = 0
@@ -146,13 +146,13 @@ class SingleTypeKVCacheManager(ABC):
             request_id: The request ID.
             new_computed_blocks: The new computed blocks just hitting the
                 prefix cache. ``Sequence[KVCacheBlock]`` (base path) or
-                ``np.ndarray`` of block ids (head-grouped path).
+                ``np.ndarray`` of block ids (ragged path).
         """
         is_ndarray = isinstance(new_computed_blocks, np.ndarray)
         num_computed = (int(new_computed_blocks.size) if is_ndarray
                         else len(new_computed_blocks))
         if request_id not in self.num_cached_block:
-            if self.head_grouped:
+            if self.ragged:
                 assert (
                     request_id not in self.req_to_block_ids
                     or self.req_to_block_ids[request_id].size == 0
@@ -191,11 +191,11 @@ class SingleTypeKVCacheManager(ABC):
 
         Returns:
             ``list[KVCacheBlock]`` for the base path,
-            ``np.ndarray[int32]`` of block ids for the head-grouped path.
+            ``np.ndarray[int32]`` of block ids for the ragged path.
         """
         num_required_blocks = cdiv(num_tokens, self.block_size)
         num_groups = self.num_head_groups_total
-        if self.head_grouped:
+        if self.ragged:
             existing = self.req_to_block_ids.get(request_id)
             existing_len = 0 if existing is None else int(existing.size)
             num_new_blocks = num_required_blocks * num_groups - existing_len
@@ -251,12 +251,12 @@ class SingleTypeKVCacheManager(ABC):
         """Return the request's current ``KVCacheBlock`` list.
 
         Base path returns the eagerly-maintained list (mutations persist).
-        Head-grouped mode materialises a fresh list from
+        Ragged mode materialises a fresh list from
         ``req_to_block_ids`` via ``block_pool.blocks[bid]``; mutations to
         the returned list are not visible to subsequent calls. Prefer
         ``get_req_block_ids_array`` when only ids are needed.
         """
-        if self.head_grouped:
+        if self.ragged:
             ids = self.req_to_block_ids.get(request_id)
             if ids is None or ids.size == 0:
                 return []
@@ -265,12 +265,12 @@ class SingleTypeKVCacheManager(ABC):
         return self.req_to_blocks.get(request_id, [])
 
     def get_req_block_ids_array(self, request_id: str) -> np.ndarray:
-        """Return the request's int32 block-id ndarray. Head-grouped only.
+        """Return the request's int32 block-id ndarray. Ragged only.
 
         Returns an empty ndarray (not None) when the request has no blocks.
         """
-        assert self.head_grouped, (
-            "get_req_block_ids_array is head-grouped only."
+        assert self.ragged, (
+            "get_req_block_ids_array is ragged only."
         )
         ids = self.req_to_block_ids.get(request_id)
         if ids is None:
@@ -284,7 +284,7 @@ class SingleTypeKVCacheManager(ABC):
         Args:
             request_id: The request ID.
         """
-        if self.head_grouped:
+        if self.ragged:
             # int32 array is the source of truth; push it back to the ring
             # buffer directly. Caching is disabled here, so eviction
             # ordering does not matter.
@@ -322,12 +322,12 @@ class SingleTypeKVCacheManager(ABC):
         """Drop named block ids from the per-request lookup after
         compression so allocations don't double-count them.
 
-        Head-grouped mode filters the int32 ``req_to_block_ids`` array
+        Ragged mode filters the int32 ``req_to_block_ids`` array
         with a numpy bitmap; ``req_to_blocks`` is rebuilt on demand by
         ``get_req_blocks`` and is not touched here. The base path uses a
         set-membership list comprehension.
 
-        ``block_ids`` accepts an int32/int64 ndarray (head-grouped) or a
+        ``block_ids`` accepts an int32/int64 ndarray (ragged) or a
         ``set[int]`` (base). ``candidate_req_ids`` narrows the sweep; None
         scans every running request.
         """
@@ -337,7 +337,7 @@ class SingleTypeKVCacheManager(ABC):
                 return
         elif not block_ids:
             return
-        if self.head_grouped:
+        if self.ragged:
             num_pool_blocks = len(self.block_pool.blocks)
             if is_ndarray:
                 freed_arr = block_ids.astype(np.int64, copy=False)
@@ -387,7 +387,7 @@ class SingleTypeKVCacheManager(ABC):
         block_ids: np.ndarray,
         candidate_req_ids: set[str] | None = None,
     ) -> None:
-        """Null named block ids IN PLACE in the per-request lookup (head-grouped).
+        """Null named block ids IN PLACE in the per-request lookup (ragged).
 
         Length-preserving counterpart of ``free_blocks_by_ids``: instead of
         dropping the freed ids (which lets the next allocation re-grow those
@@ -399,8 +399,8 @@ class SingleTypeKVCacheManager(ABC):
         ``get_num_blocks_to_allocate`` therefore counts the nulled slots as
         present and never re-allocates them.
         """
-        if not self.head_grouped:
-            raise AssertionError("null_blocks_by_ids is head-grouped only.")
+        if not self.ragged:
+            raise AssertionError("null_blocks_by_ids is ragged only.")
         if block_ids.size == 0:
             return
         num_pool_blocks = len(self.block_pool.blocks)
@@ -579,8 +579,8 @@ class FullAttentionManager(SingleTypeKVCacheManager):
         return computed_blocks
 
     def get_num_common_prefix_blocks(self, running_request_id: str) -> int:
-        if self.head_grouped:
-            # Head-grouped disables prefix caching, so every block has
+        if self.ragged:
+            # Ragged disables prefix caching, so every block has
             # ref_cnt == 1 and the cascade-attention condition
             # (ref_cnt == num_running) is false from the first block.
             return 0
@@ -983,10 +983,10 @@ spec_manager_map: dict[type[KVCacheSpec], type[SingleTypeKVCacheManager]] = {
     ChunkedLocalAttentionSpec: ChunkedLocalAttentionManager,
     MambaSpec: MambaManager,
     CrossAttentionSpec: CrossAttentionManager,
-    # Head-group paging reuses FullAttentionManager — prefix-caching
+    # Ragged paging reuses FullAttentionManager — prefix-caching
     # paths are unreachable (disabled at the config layer) and the
     # remaining alloc/free paths are spec-agnostic.
-    HeadGroupedAttentionSpec: FullAttentionManager,
+    RaggedAttentionSpec: FullAttentionManager,
 }
 
 

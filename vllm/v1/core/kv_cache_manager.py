@@ -44,7 +44,7 @@ class KVCacheBlocks:
 
     block_ids_array: tuple[np.ndarray, ...] | None = field(default=None)
     """
-    Head-grouped fast path: int32 block-id ndarrays (one per kv_cache_group)
+    Ragged fast path: int32 block-id ndarrays (one per kv_cache_group)
     in allocation order. When present, this is the source of truth for
     ``get_block_ids`` / ``__add__`` / ``new_empty``, and ``blocks`` is
     kept empty. Bypasses ``list[KVCacheBlock]`` materialisation.
@@ -53,7 +53,7 @@ class KVCacheBlocks:
     def __add__(self, other: "KVCacheBlocks") -> "KVCacheBlocks":
         """Concatenate two ``KVCacheBlocks`` per group.
 
-        If either operand uses the head-grouped fast path, both sides are
+        If either operand uses the ragged fast path, both sides are
         promoted to ndarray; otherwise concatenates the object lists.
         """
         if self.block_ids_array is None and other.block_ids_array is None:
@@ -119,10 +119,10 @@ class KVCacheBlocks:
     def get_unhashed_block_ids(self) -> list[int]:
         """Get block_ids of unhashed blocks from KVCacheBlocks instance.
 
-        Not supported in head-grouped mode where prefix caching is disabled.
+        Not supported in ragged mode where prefix caching is disabled.
         """
         assert self.block_ids_array is None, (
-            "get_unhashed_block_ids is not supported on head-grouped fast "
+            "get_unhashed_block_ids is not supported on ragged fast "
             "path (prefix caching is disabled).")
         assert len(self.blocks) == 1, "Only one group is supported"
         return [block.block_id for block in self.blocks[0]
@@ -198,19 +198,19 @@ class KVCacheManager:
         # triggering a preemption on the next decode step. 0 => no-op.
         assert watermark >= 0.0, "watermark must be non-negative"
         self.watermark_blocks = int(watermark * kv_cache_config.num_blocks)
-        # Head-grouped: any single-type manager in this mode flips the flag,
+        # Ragged: any single-type manager in this mode flips the flag,
         # so allocate / get_blocks return int32 ndarrays via
         # ``KVCacheBlocks.block_ids_array``.
-        self.head_grouped = any(
-            getattr(m, "head_grouped", False)
+        self.ragged = any(
+            getattr(m, "ragged", False)
             for m in self.coordinator.single_type_managers
         )
 
         # Pre-constructed empty KVCacheBlocks reused across callers to avoid
-        # GC overhead. In head-grouped mode mirror the ndarray fast path so
+        # GC overhead. In ragged mode mirror the ndarray fast path so
         # ``empty + non_empty`` (used by KV connector) doesn't fall back to
         # the object list.
-        if self.head_grouped:
+        if self.ragged:
             self.empty_kv_cache_blocks = KVCacheBlocks(
                 blocks=tuple(() for _ in range(self.num_kv_cache_groups)),
                 block_ids_array=tuple(
@@ -450,7 +450,7 @@ class KVCacheManager:
         if self.enable_caching:
             self.block_pool.touch(new_computed_block_list)
         else:
-            # In head-grouped mode every group is an empty tuple (prefix
+            # In ragged mode every group is an empty tuple (prefix
             # caching is disabled); use len() so we never call bool() on
             # a possible ndarray.
             assert not any(len(g) for g in new_computed_block_list), (
@@ -500,7 +500,7 @@ class KVCacheManager:
         candidate_req_ids: set[str] | None = None,
     ) -> None:
         """Compression callback: return the worker-reported dropped block
-        ids to the free queue. Accepts an int32 ndarray (head-grouped) or
+        ids to the free queue. Accepts an int32 ndarray (ragged) or
         a set[int]. ``candidate_req_ids`` narrows the per-request sweep to
         this step's compressed requests.
         """
@@ -513,7 +513,7 @@ class KVCacheManager:
     ) -> None:
         """Sliding-window callback: return the worker-reported out-of-window
         block ids to the free pool while nulling them in place in per-request
-        bookkeeping (length-preserving, head-grouped only). Counterpart of
+        bookkeeping (length-preserving, ragged only). Counterpart of
         ``free_blocks_by_ids`` for the sliding-window eviction path.
         """
         self.coordinator.null_blocks_by_ids(block_ids, candidate_req_ids)
@@ -595,11 +595,11 @@ class KVCacheManager:
     ) -> KVCacheBlocks:
         """Wrap a coordinator result in ``KVCacheBlocks``.
 
-        Head-grouped: per-group payload is an int32 ndarray, routed through
+        Ragged: per-group payload is an int32 ndarray, routed through
         ``block_ids_array``. Base path: ``list[KVCacheBlock]``. Payload
         kinds are not mixed within a call.
         """
-        if self.head_grouped:
+        if self.ragged:
             # ``.size`` instead of bool() to avoid ndarray truthiness errors.
             if not any(arr.size for arr in blocks):
                 return self.empty_kv_cache_blocks

@@ -350,7 +350,7 @@ class VllmConfig:
         if self.model_config is not None:
             self.model_config.verify_with_parallel_config(self.parallel_config)
             self.model_config.verify_dual_chunk_attention_config(self.load_config)
-            # Reject models that don't support head-grouped paging / compression.
+            # Reject models that don't support ragged paging / compression.
             self.cache_config.verify_model_support(self.model_config.architecture)
 
         self.cache_config.verify_with_parallel_config(self.parallel_config)
@@ -498,7 +498,7 @@ class VllmConfig:
                         "Overriding cudagraph_mode to PIECEWISE."
                     )
                     self.compilation_config.cudagraph_mode = CUDAGraphMode.PIECEWISE
-                # Head-grouped paging (Tangram) cannot capture attention in a
+                # Ragged paging (Tangram) cannot capture attention in a
                 # FULL cudagraph: its metadata builder allocates fresh
                 # per-step tensors (virtual block tables, per-layer
                 # overlays), so full-graph replay would read freed
@@ -513,7 +513,7 @@ class VllmConfig:
                     and self.cache_config.page_group_size is not None
                 ):
                     logger.warning_once(
-                        "Head-grouped KV paging (page_group_size=%d) is "
+                        "Ragged KV paging (page_group_size=%d) is "
                         "incompatible with full CUDA graphs. "
                         "Overriding cudagraph_mode to PIECEWISE.",
                         self.cache_config.page_group_size,

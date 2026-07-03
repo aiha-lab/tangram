@@ -91,7 +91,7 @@ from vllm.utils.torch_utils import (
     supports_dynamo,
 )
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadataBuilder
-from vllm.v1.attention.backends.head_grouped_layout import (
+from vllm.v1.attention.backends.ragged_layout import (
     column_major_cache_shape,
 )
 from vllm.v1.attention.compression import (
@@ -117,7 +117,7 @@ from vllm.v1.kv_cache_interface import (
     CrossAttentionSpec,
     EncoderOnlyAttentionSpec,
     FullAttentionSpec,
-    HeadGroupedAttentionSpec,
+    RaggedAttentionSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
     KVCacheSpec,
@@ -947,7 +947,7 @@ class GPUModelRunner(
                 # The request was either preempted and resumed later, or was not
                 # scheduled in the previous step and needs to be added again.
 
-                # Head-grouped re-add: a request that merely skipped a step
+                # Ragged re-add: a request that merely skipped a step
                 # carries a ``block_table_snapshot`` of its exact per-group
                 # layout; ``new_block_ids`` is this step's increment to append
                 # after restoring it. A preempt-resume instead re-prefills from
@@ -1642,8 +1642,8 @@ class GPUModelRunner(
             else:
                 blk_table = self.input_batch.block_table[kv_cache_gid]
                 blk_table_tensor = blk_table.get_device_tensor(num_reqs)
-                # Head-grouped: slot_mapping is 2D, slice token axis.
-                if blk_table.head_grouped:
+                # Ragged: slot_mapping is 2D, slice token axis.
+                if blk_table.ragged:
                     slot_mapping = blk_table.slot_mapping.gpu[
                         :, :total_num_scheduled_tokens
                     ]
@@ -2813,7 +2813,7 @@ class GPUModelRunner(
 
         # Physical indices of the compressible (full-attention) layers, in
         # ascending order — the order the gate checkpoint's per-layer modules
-        # are stored in. Shared with the head-grouped FlashAttention builder via
+        # are stored in. Shared with the ragged FlashAttention builder via
         # full_attention_layer_indices so the two cannot disagree on which
         # layers are compressed (and thus how a cluster map maps to physical
         # rows).
@@ -2832,7 +2832,7 @@ class GPUModelRunner(
         # Sliding-window layers + window, for sliding-window KV eviction.
         # Out-of-window front blocks of these layers are returned to the pool at
         # each compression boundary so concurrent long-context requests stop
-        # thrashing on KV (head-grouped paging otherwise keeps full KV for every
+        # thrashing on KV (ragged paging otherwise keeps full KV for every
         # layer, including sliding-window ones). Resolved via the same source of
         # truth as the compressible (full-attention) split. Empty for a dense
         # model (no sliding-window layers) → eviction is a no-op.
@@ -2849,7 +2849,7 @@ class GPUModelRunner(
         # FlashAttention builder expands the same static map to the physical
         # layer layout it needs (static cross-layer clusters at their executor
         # block-table rows + identity for sliding layers) — see
-        # head_grouped_layout.physical_member_maps_from_static_cluster_map.
+        # ragged_layout.physical_member_maps_from_static_cluster_map.
         # Dense models keep ``num_compressed_layers == num_layers`` and the map
         # is already physical, so both paths see the same array.
 
@@ -3060,7 +3060,7 @@ class GPUModelRunner(
     ) -> None:
         """Free the sliding-window layers' out-of-window front KV blocks.
 
-        Under head-grouped paging the sliding-window layers keep full KV (they
+        Under ragged paging the sliding-window layers keep full KV (they
         are not compressed), but FlashAttention only attends to the last
         ``sliding_window`` tokens, so the leading blocks outside the window are
         dead weight. This returns them to the pool null-in-place — the in-window
@@ -5665,14 +5665,14 @@ class GPUModelRunner(
                     kernel_num_blocks = num_blocks * num_blocks_per_kv_block
 
                     dtype = kv_cache_spec.dtype
-                    if isinstance(kv_cache_spec, HeadGroupedAttentionSpec):
-                        # Column-major head-grouped page: the
+                    if isinstance(kv_cache_spec, RaggedAttentionSpec):
+                        # Column-major ragged page: the
                         # page_group_size (column) dimension sits outside
                         # block_size so each (physical block, column) pair is
                         # a contiguous virtual block. Allocated contiguous —
                         # the NHD/HND stride-order permutation does not apply
                         # to this layout. See
-                        # vllm/v1/attention/backends/head_grouped_layout.py.
+                        # vllm/v1/attention/backends/ragged_layout.py.
                         kv_cache_shape = column_major_cache_shape(
                             kernel_num_blocks,
                             kernel_block_size,

@@ -7,12 +7,12 @@
 #
 # Each configuration runs once per execution mode (GRAPH_MODES):
 #   eager — enforce_eager, the historical measurement mode
-#   graph — VLLM_COMPILE + piecewise CUDA graphs (TANGRAM_GRAPH=1; head-grouped
+#   graph — VLLM_COMPILE + piecewise CUDA graphs (TANGRAM_GRAPH=1; ragged
 #           runs are pinned to PIECEWISE at config time)
 # The summary reports, per scorer x mode, the compression speedup vs r=1.0 and,
 # per scorer x ratio, the graph-vs-eager gain.
 #
-# NOTE on the r=1.0 reference: it runs WITH head-grouped paging (PAGE_GROUP_SIZE,
+# NOTE on the r=1.0 reference: it runs WITH ragged paging (PAGE_GROUP_SIZE,
 # default 4), so the reported speedup is compression vs uncompressed-Tangram —
 # NOT vs vanilla vLLM. Vanilla runs page_group_size=None and is substantially
 # faster at long context (measured 3.08x vs pg=4 uncompressed at ~125k ctx);

@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Column-major head-grouped KV cache layout and virtual-block addressing.
+"""Column-major ragged KV cache layout and virtual-block addressing.
 
-Single source of truth for the column-major page layout used by head-grouped
+Single source of truth for the column-major page layout used by ragged
 paging. Allocation, the FlashAttention metadata builder, and the attention
 forward path all address the cache through the helpers here, so the column-major
 / virtual-block arithmetic lives in exactly one place. Swapping the identity
@@ -11,7 +11,7 @@ member->(cluster, column) mapping, not these helpers.
 
 Layout
 ------
-A head-grouped KV cache page is stored **column-major**: the per-page column
+A ragged KV cache page is stored **column-major**: the per-page column
 dimension (``page_group_size``) sits OUTSIDE ``block_size``::
 
     [2, num_physical_blocks, page_group_size, block_size, head_size]
@@ -50,7 +50,7 @@ def column_major_cache_shape(
     page_group_size: int,
     head_size: int,
 ) -> tuple[int, int, int, int, int]:
-    """Physical shape of a column-major head-grouped KV cache tensor.
+    """Physical shape of a column-major ragged KV cache tensor.
 
     The leading ``2`` is the key/value split. The page_group_size (column)
     dimension precedes block_size so that flattening ``(num_blocks,
@@ -69,7 +69,7 @@ def as_virtual_block_view(kv_cache: torch.Tensor) -> torch.Tensor:
     """
     two, num_blocks, page_group_size, block_size, head_size = kv_cache.shape
     assert two == 2, (
-        f"column-major head-grouped cache must lead with the key/value axis "
+        f"column-major ragged cache must lead with the key/value axis "
         f"of size 2; got shape {tuple(kv_cache.shape)}.")
     return kv_cache.reshape(
         2, num_blocks * page_group_size, block_size, 1, head_size)
@@ -81,7 +81,7 @@ def as_virtual_block_view(kv_cache: torch.Tensor) -> torch.Tensor:
 # map (adjacent-head grouping: KV head ``m`` -> cluster ``m // page_group_size``
 # at column ``m % page_group_size``). They are intentionally kept as a stable,
 # self-contained public API for external head-group cluster-map tooling and for
-# the layout test suite (``tests/v1/attention/test_head_grouped_layout.py``),
+# the layout test suite (``tests/v1/attention/test_ragged_layout.py``),
 # which exercises the identity case directly as the reference for the general
 # mapping below.
 #
@@ -411,7 +411,7 @@ def physical_member_maps_from_static_cluster_map(
     Sliding-window hybrid models compress only their full-attention layers, so
     the cluster map is authored over those layers alone — shape
     ``[num_static, num_kv_heads]``. Physically every layer stores KV, so the
-    FlashAttention head-grouped builder needs a ``[num_layers, num_kv_heads]``
+    FlashAttention ragged builder needs a ``[num_layers, num_kv_heads]``
     assignment. This expansion produces it:
 
     * **static layers** — each full-attention head's KV is placed at physical

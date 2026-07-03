@@ -34,10 +34,10 @@ MambaDType = Literal["auto", "float32"]
 PrefixCachingHashAlgo = Literal["sha256", "sha256_cbor"]
 KVOffloadingBackend = Literal["native", "lmcache"]
 
-# Resolved vLLM model classes validated for head-grouped paged attention /
+# Resolved vLLM model classes validated for ragged paged attention /
 # compression. google/gemma-3-12b-it resolves to the multimodal
 # Gemma3ForConditionalGeneration (not Gemma3ForCausalLM), so both are listed.
-HEAD_GROUPED_SUPPORTED_ARCHITECTURES = frozenset(
+RAGGED_SUPPORTED_ARCHITECTURES = frozenset(
     {
         "LlamaForCausalLM",
         "Qwen2ForCausalLM",
@@ -162,9 +162,9 @@ class CacheConfig:
     'native' (vLLM native CPU offloading), 'lmcache' This option must be used
     together with kv_offloading_size."""
 
-    # Head-group paging.
+    # Ragged paging.
     page_group_size: int | None = 4
-    """Head-group size; ``None`` disables head-group paging.
+    """Head-group size; ``None`` disables ragged paging.
     Must divide ``num_kv_heads``."""
     head_group_cluster_map: str | None = None
     """Head-group cluster map ``.npz`` (``cluster_of`` / ``column_of`` arrays
@@ -428,7 +428,7 @@ class CacheConfig:
         )
 
     def _validate_extended_fields(self) -> None:
-        # Head-group paging.
+        # Ragged paging.
         if self.page_group_size is not None:
             if self.page_group_size <= 0:
                 raise ValueError(
@@ -447,12 +447,12 @@ class CacheConfig:
                         f"num_kv_heads={self.num_kv_heads}, "
                         f"page_group_size={self.page_group_size}."
                     )
-            # Head-grouped paging is only implemented in the FLASH_ATTN
+            # Ragged paging is only implemented in the FLASH_ATTN
             if not os.environ.get("VLLM_ATTENTION_BACKEND"):
                 os.environ["VLLM_ATTENTION_BACKEND"] = "FLASH_ATTN"
                 logger.info(
                     "Defaulting VLLM_ATTENTION_BACKEND=FLASH_ATTN (required by "
-                    "head-grouped paging / compression)."
+                    "ragged paging / compression)."
                 )
 
         # Compression. The ratio is the on/off gate, so validate its range
@@ -467,7 +467,7 @@ class CacheConfig:
                 raise ValueError(
                     "compression (compression_ratio < 1.0) requires "
                     "page_group_size to be set; compression operates on top of "
-                    "head-group paging."
+                    "ragged paging."
                 )
             if self.compression_window_size <= 0:
                 raise ValueError(
@@ -549,7 +549,7 @@ class CacheConfig:
                         f"{self.compression_ea_epsilon}."
                     )
 
-        # Multi-turn rides on top of head-group paging but does not
+        # Multi-turn rides on top of ragged paging but does not
         # require compression.
         if self.multi_turn:
             if self.page_group_size is None:
@@ -563,7 +563,7 @@ class CacheConfig:
                     "replaces prefix caching)."
                 )
 
-        # Prefix caching cannot represent head-group paging's non-uniform
+        # Prefix caching cannot represent ragged paging's non-uniform
         # per-(layer, group) block layout or compression's in-place block
         # mutation, so it is disabled. Warn (not info): it is on by default and
         # this affects throughput.
@@ -572,7 +572,7 @@ class CacheConfig:
         ):
             feature = (
                 "compression" if self.compression_enabled
-                else "head-group paging")
+                else "ragged paging")
             logger.warning(
                 "Disabling prefix caching: it is incompatible with %s, which "
                 "is enabled. Prefix caching will not be used for this run.",
@@ -581,7 +581,7 @@ class CacheConfig:
             self.enable_prefix_caching = False
 
     def verify_model_support(self, architecture: str) -> None:
-        """Reject head-grouped paging / compression on unvalidated models.
+        """Reject ragged paging / compression on unvalidated models.
 
         Unsupported architectures fall back to the dense attention path and
         would silently produce wrong outputs, so fail at startup instead.
@@ -589,14 +589,14 @@ class CacheConfig:
         """
         if self.page_group_size is None and not self.compression_enabled:
             return
-        if architecture in HEAD_GROUPED_SUPPORTED_ARCHITECTURES:
+        if architecture in RAGGED_SUPPORTED_ARCHITECTURES:
             return
         feature = (
-            "compression" if self.compression_enabled else "head-group paging")
-        supported = ", ".join(sorted(HEAD_GROUPED_SUPPORTED_ARCHITECTURES))
+            "compression" if self.compression_enabled else "ragged paging")
+        supported = ", ".join(sorted(RAGGED_SUPPORTED_ARCHITECTURES))
         raise ValueError(
             f"Model architecture '{architecture}' does not support Tangram "
-            f"{feature} (head-grouped paged attention). Supported "
+            f"{feature} (ragged paged attention). Supported "
             f"architectures: {supported}. To run this model, disable the "
             f"feature with --page-group-size=None (and --compression-ratio=1.0 "
             f"for no compression)."

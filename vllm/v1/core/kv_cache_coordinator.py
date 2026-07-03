@@ -14,7 +14,7 @@ from vllm.v1.core.single_type_kv_cache_manager import (
 )
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
-    HeadGroupedAttentionSpec,
+    RaggedAttentionSpec,
     KVCacheConfig,
     KVCacheSpec,
 )
@@ -22,23 +22,23 @@ from vllm.v1.request import Request
 
 
 def _head_group_info(kv_cache_config: KVCacheConfig) -> tuple[bool, int | None]:
-    """Return ``(head_grouped, num_head_groups_total)`` for BlockPool init.
+    """Return ``(ragged, num_head_groups_total)`` for BlockPool init.
 
-    Head-group mode merges every attention layer into one KVCacheGroupSpec
-    backed by ``HeadGroupedAttentionSpec``.
+    Ragged paging merges every attention layer into one KVCacheGroupSpec
+    backed by ``RaggedAttentionSpec``.
     """
     if not kv_cache_config.kv_cache_groups:
         return False, None
-    head_grouped = False
+    ragged = False
     num_head_groups_total = 0
     for group in kv_cache_config.kv_cache_groups:
         spec = group.kv_cache_spec
-        if isinstance(spec, HeadGroupedAttentionSpec):
-            head_grouped = True
+        if isinstance(spec, RaggedAttentionSpec):
+            ragged = True
             num_head_groups_total += (
                 spec.num_head_groups_per_layer * len(group.layer_names)
             )
-    if not head_grouped:
+    if not ragged:
         return False, None
     return True, num_head_groups_total
 
@@ -62,12 +62,12 @@ class KVCacheCoordinator(ABC):
         self.max_model_len = max_model_len
         self.enable_caching = enable_caching
 
-        head_grouped, num_head_groups = _head_group_info(kv_cache_config)
+        ragged, num_head_groups = _head_group_info(kv_cache_config)
         self.block_pool = BlockPool(
             kv_cache_config.num_blocks,
             enable_caching,
             enable_kv_cache_events,
-            head_grouped=head_grouped,
+            ragged=ragged,
             num_head_groups=num_head_groups,
         )
 
@@ -151,7 +151,7 @@ class KVCacheCoordinator(ABC):
         Returns:
             ``list[KVCacheBlock]`` per group on the base path, or
             ``np.ndarray[int32]`` of block ids per group on the
-            head-grouped fast path. The tuple is uniform per call —
+            ragged fast path. The tuple is uniform per call —
             every manager in the coordinator runs in the same mode.
         """
         return tuple(
@@ -194,7 +194,7 @@ class KVCacheCoordinator(ABC):
     ) -> None:
         """Compression-driven free path: strip the named block ids from
         per-request bookkeeping and force-free them in the BlockPool.
-        Accepts an int32 ndarray (head-grouped) or a ``set[int]``;
+        Accepts an int32 ndarray (ragged) or a ``set[int]``;
         ``candidate_req_ids`` narrows the per-request sweep.
         """
         if isinstance(block_ids, np.ndarray):
@@ -258,14 +258,14 @@ class KVCacheCoordinator(ABC):
     ) -> tuple["list[KVCacheBlock] | np.ndarray", ...]:
         """Get the blocks for the request.
 
-        Head-grouped managers return their ``req_to_block_ids`` ndarray
+        Ragged managers return their ``req_to_block_ids`` ndarray
         directly (bypassing ``KVCacheBlock`` materialisation); base
         managers go through ``get_req_blocks``.
         """
         return tuple(
             (
                 manager.get_req_block_ids_array(request_id)
-                if getattr(manager, "head_grouped", False)
+                if getattr(manager, "ragged", False)
                 else manager.get_req_blocks(request_id)
             )
             for manager in self.single_type_managers

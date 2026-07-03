@@ -109,7 +109,7 @@ def run_one(args: argparse.Namespace, reserve_full_isl: bool) -> dict:
         disable_log_stats=False,  # required so get_metrics() is populated
         scheduler_reserve_full_isl=reserve_full_isl,
         watermark=args.watermark,
-        # Head-grouped paging layout — always on in tangram-asp (pg=4 default).
+        # Ragged paging layout — always on in tangram-asp (pg=4 default).
         page_group_size=args.page_group_size,
         head_group_cluster_map=args.head_group_cluster_map,
     )

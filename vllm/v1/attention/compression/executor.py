@@ -104,8 +104,8 @@ class CompressionExecutor:
         Requires ``prepare_keep_decision`` to have populated
         ``req.cross_layer_decision`` and the per-(layer, group) caches.
         """
-        assert block_table.head_grouped, (
-            "CompressionExecutor.run_request requires a head-grouped "
+        assert block_table.ragged, (
+            "CompressionExecutor.run_request requires a ragged "
             "BlockTable."
         )
         assert len(layer_kv_caches) == self.num_layers
@@ -288,7 +288,7 @@ class CompressionExecutor:
         shared sink/locked/k_aligned/win counts make every column the same
         length, so the pad + write-back are column-uniform.
 
-        See vllm/v1/attention/backends/head_grouped_layout.py for the layout.
+        See vllm/v1/attention/backends/ragged_layout.py for the layout.
         """
         page_group_size = self.page_group_size
         block_size = self.block_size

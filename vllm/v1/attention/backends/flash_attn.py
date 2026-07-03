@@ -42,7 +42,7 @@ from vllm.model_executor.layers.batch_invariant import (
 )
 from vllm.platforms.interface import DeviceCapability
 from vllm.utils.math_utils import cdiv
-from vllm.v1.attention.backends.head_grouped_layout import (
+from vllm.v1.attention.backends.ragged_layout import (
     as_virtual_block_view,
     identity_member_maps,
     load_cluster_map,
@@ -61,7 +61,7 @@ from vllm.v1.attention.backends.utils import (
     get_dcp_local_seq_lens,
     get_kv_cache_layout,
 )
-from vllm.v1.kv_cache_interface import AttentionSpec, HeadGroupedAttentionSpec
+from vllm.v1.kv_cache_interface import AttentionSpec, RaggedAttentionSpec
 
 logger = init_logger(__name__)
 
@@ -175,7 +175,7 @@ class FlashAttentionBackend(AttentionBackend):
         # varlen entry point, so sinks are supported wherever it is available —
         # not just on FA3. This lets sink models (e.g. gpt-oss) use the
         # FlashAttention backend on pre-Hopper hardware, which the
-        # FlashAttention-only head-group paging path requires.
+        # FlashAttention-only ragged paging path requires.
         return is_flash_attn_varlen_func_available()
 
     @classmethod
@@ -202,7 +202,7 @@ class FlashAttentionBackend(AttentionBackend):
         # supported on every compute capability FlashAttention itself supports,
         # and no longer gate this backend out (which previously forced
         # sink models such as gpt-oss onto the Triton backend on pre-Hopper
-        # hardware, and made head-group paging — FlashAttention-only — unusable
+        # hardware, and made ragged paging — FlashAttention-only — unusable
         # for them).
         return None
 
@@ -243,7 +243,7 @@ class FlashAttentionMetadata:
 
     causal: bool = True
 
-    # Head-grouped paging fields. Inactive when
+    # Ragged paging fields. Inactive when
     # ``num_head_groups_per_layer == 0``. A sequence is one (req, KV-head)
     # member (member row ``m = L * num_kv_heads + h``), not (req, group).
     #
@@ -257,7 +257,7 @@ class FlashAttentionMetadata:
     #     layer block table = phys_block[req, cluster] * page_group_size + column
     #
     # ``seq_lens_grouped`` / ``slot_mapping_grouped`` have no block axis, so they
-    # keep the all-member form; layout selected by ``head_grouped_decode_layout``:
+    # keep the all-member form; layout selected by ``ragged_decode_layout``:
     #   False (prefill / mixed) — member-major:
     #     seq_lens_grouped     [num_members_total, num_reqs]
     #     slot_mapping_grouped [num_members_total, num_actual_tokens]
@@ -275,7 +275,7 @@ class FlashAttentionMetadata:
     # cu_seqlens for the (num_kv_heads × num_reqs) member sequences per
     # layer; shape ``[num_kv_heads × num_reqs + 1]``.
     query_start_loc_grouped: torch.Tensor | None = None
-    head_grouped_decode_layout: bool = False
+    ragged_decode_layout: bool = False
     # Per-layer ``FlashAttentionMetadata`` overlays for the decode fast
     # path; pre-built so attention avoids ``dataclass_replace`` in the
     # hot loop.
@@ -325,13 +325,13 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
         vllm_config: VllmConfig,
         kv_cache_spec: AttentionSpec,
     ) -> AttentionCGSupport:
-        # Head-grouped paging cannot put attention inside a FULL cudagraph:
+        # Ragged paging cannot put attention inside a FULL cudagraph:
         # build() allocates fresh metadata tensors every step (virtual block
         # tables, member seq-lens, per-layer overlays), so a captured graph
         # would replay against freed capture-time addresses. Piecewise
-        # cudagraphs remain fully supported — the head-grouped attention op
+        # cudagraphs remain fully supported — the ragged attention op
         # is a splitting op and runs eagerly between captured pieces.
-        if isinstance(kv_cache_spec, HeadGroupedAttentionSpec):
+        if isinstance(kv_cache_spec, RaggedAttentionSpec):
             return AttentionCGSupport.NEVER
         return cls._cudagraph_support
 
@@ -358,10 +358,10 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
 
         self.max_num_splits = 0  # No upper bound on the number of splits.
         self.aot_schedule = get_flash_attn_version() == 3
-        # Head-grouped paging disables AOT scheduling because each layer
+        # Ragged paging disables AOT scheduling because each layer
         # sees ``num_kv_heads × num_reqs`` virtual sequences (one per
         # KV-head member), which AOT did not precompute against.
-        if isinstance(kv_cache_spec, HeadGroupedAttentionSpec):
+        if isinstance(kv_cache_spec, RaggedAttentionSpec):
             self.aot_schedule = False
 
         try:
@@ -383,17 +383,17 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
         )
         self.max_cudagraph_size = self.compilation_config.max_cudagraph_capture_size
 
-        # Head-grouped paging adds group-major views to the base metadata;
+        # Ragged paging adds group-major views to the base metadata;
         # the per-layer slice happens in ``Attention.forward``.
-        self._head_grouped = isinstance(kv_cache_spec, HeadGroupedAttentionSpec)
-        if self._head_grouped:
-            assert isinstance(kv_cache_spec, HeadGroupedAttentionSpec)
+        self._ragged = isinstance(kv_cache_spec, RaggedAttentionSpec)
+        if self._ragged:
+            assert isinstance(kv_cache_spec, RaggedAttentionSpec)
             self._num_head_groups_per_layer = (
                 kv_cache_spec.num_head_groups_per_layer
             )
             # Column-major virtual-block addressing needs the page (column)
             # width and the per-layer KV-head count. See
-            # vllm/v1/attention/backends/head_grouped_layout.py.
+            # vllm/v1/attention/backends/ragged_layout.py.
             self._page_group_size = kv_cache_spec.page_group_size
             self._num_kv_heads_per_layer = (
                 self._num_head_groups_per_layer * self._page_group_size
@@ -435,14 +435,14 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
     def _member_maps(
         self, num_layers_local: int, device: torch.device,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Cached ``(member_to_cluster, member_to_col)`` for head-grouped paging.
+        """Cached ``(member_to_cluster, member_to_col)`` for ragged paging.
 
         member row ``m = layer * num_kv_heads_per_layer + head`` -> the cluster
         that head reads/writes and its column within the cluster's page. The
         identity map (``_cluster_map is None``) reproduces adjacent-head
         grouping; a loaded cluster map assigns arbitrary, possibly
         cross-layer, clusters. Built once: both the layer count and the map are
-        fixed for the model. See head_grouped_layout.py.
+        fixed for the model. See ragged_layout.py.
         """
         if self._member_to_cluster is None:
             if self._cluster_map is None:
@@ -458,7 +458,7 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
                     # placed at the same block-table rows the compression
                     # executor reorders, plus identity grouping for the sliding
                     # layers (physical_member_maps_from_static_cluster_map).
-                    static_layer_ids = self._head_grouped_static_layer_ids(
+                    static_layer_ids = self._ragged_static_layer_ids(
                         num_layers_local)
                     self._assert_static_layer_ids_match_map(
                         static_layer_ids, cluster_of.shape[0])
@@ -472,7 +472,7 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
             self._member_to_col = member_to_col
         return self._member_to_cluster, self._member_to_col
 
-    def _head_grouped_static_layer_ids(self, num_layers_local: int) -> list[int]:
+    def _ragged_static_layer_ids(self, num_layers_local: int) -> list[int]:
         """Physical indices of the full-attention (compressible) layers in this
         KV cache group.
 
@@ -488,7 +488,7 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
             phys = extract_layer_index(name)
             if phys != pos:
                 raise RuntimeError(
-                    f"head-grouped KV group layer order mismatch: position "
+                    f"ragged KV group layer order mismatch: position "
                     f"{pos} is physical layer {phys}. The cluster map's layer "
                     f"axis assumes position == physical layer index.")
         return [i for i in full_attention_layer_indices(self.vllm_config)
@@ -677,11 +677,11 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
             scheduler_metadata = self.scheduler_metadata[:n]
 
         # Precompute per-step views consumed by
-        # ``layer.py::_head_grouped_attention_impl`` (the body of the
-        # ``vllm::unified_attention_head_grouped`` custom op); layout selected
-        # by ``head_grouped_decode_layout``.
-        head_grouped_decode_layout = False
-        if self._head_grouped:
+        # ``layer.py::_ragged_attention_impl`` (the body of the
+        # ``vllm::unified_attention_ragged`` custom op); layout selected
+        # by ``ragged_decode_layout``.
+        ragged_decode_layout = False
+        if self._ragged:
             # Terminology in this block: a *head-group* and a *cluster* are the
             # same thing — one shared-retention-budget unit owning a set of
             # physical blocks. ("head-group" is the kv-cache-manager term;
@@ -689,7 +689,7 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
             # per-page columns are *members*, one KV head each, so expanding the
             # cluster axis by ``page_group_size`` yields the member axis.
             assert block_table_tensor.ndim == 3, (
-                "head-grouped path expects 3D block_table_tensor "
+                "ragged path expects 3D block_table_tensor "
                 "[num_reqs, num_head_groups_total, max_blocks_per_req], "
                 f"got shape {tuple(block_table_tensor.shape)}.")
             num_head_groups_total = block_table_tensor.shape[1]
@@ -701,12 +701,12 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
             num_layers_local = (
                 num_head_groups_total // num_head_groups_per_layer)
             assert slot_mapping.ndim == 2, (
-                "head-grouped path expects 2D slot_mapping "
+                "ragged path expects 2D slot_mapping "
                 "[num_head_groups_total, num_actual_tokens], "
                 f"got shape {tuple(slot_mapping.shape)}.")
             effective_seq_lens_cpu = (
                 common_attn_metadata.effective_seq_lens_cpu)
-            head_grouped_decode_layout = max_query_len == 1
+            ragged_decode_layout = max_query_len == 1
 
             num_kv_heads_per_layer = self._num_kv_heads_per_layer
 
@@ -744,7 +744,7 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
             # its column. The identity map reproduces adjacent-head grouping.
             # Gathering on the FLAT cluster axis before the per-layer
             # reshape is what lets a cluster span layers. See
-            # vllm/v1/attention/backends/head_grouped_layout.py.
+            # vllm/v1/attention/backends/ragged_layout.py.
             member_to_cluster, member_to_col = self._member_maps(
                 num_layers_local, seq_lens.device)
             # Cluster block table trimmed to the blocks the batch occupies, plus
@@ -767,11 +767,11 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
             seq_lens_member = member_seq_lens(
                 seq_lens_cluster, member_to_cluster, cluster_axis=0)
 
-            if head_grouped_decode_layout:
+            if ragged_decode_layout:
                 # Uniform decode: every (req, member) varlen sequence has
                 # length 1 so num_actual_tokens == num_reqs.
                 assert num_actual_tokens == num_reqs, (
-                    "uniform-decode head-grouped path expects "
+                    "uniform-decode ragged path expects "
                     f"num_actual_tokens ({num_actual_tokens}) == num_reqs "
                     f"({num_reqs})."
                 )
@@ -801,14 +801,14 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
                 )
             else:
                 # Member-major path (prefill / mixed): the data copy in
-                # ``_head_grouped_attention_impl`` is required because
+                # ``_ragged_attention_impl`` is required because
                 # (req, member) sequences are not contiguous in any
                 # token-major view when sequence lengths vary.
                 slot_mapping_grouped = slot_mapping_member
                 seq_lens_grouped = seq_lens_member
                 # cu_seqlens for the (num_kv_heads_per_layer × num_reqs)
                 # member sequences per layer; the layer slice happens in
-                # ``layer.py::_head_grouped_attention_impl``.
+                # ``layer.py::_ragged_attention_impl``.
                 query_start_head = query_start_loc[:num_reqs]
                 offsets = torch.arange(
                     num_kv_heads_per_layer,
@@ -860,9 +860,9 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
             seq_lens_grouped=seq_lens_grouped,
             slot_mapping_grouped=slot_mapping_grouped,
             query_start_loc_grouped=query_start_loc_grouped,
-            head_grouped_decode_layout=head_grouped_decode_layout,
+            ragged_decode_layout=ragged_decode_layout,
         )
-        if head_grouped_decode_layout:
+        if ragged_decode_layout:
             # Pre-build per-layer overlays so the attention layer picks
             # the right metadata with a single list lookup. One sequence per
             # (request, KV-head member) now that members are per-head.
@@ -951,7 +951,7 @@ class FlashAttentionImpl(AttentionImpl):
         # Hopper+. When unavailable we fall back to an exact post-hoc rescale of
         # the output by the softmax log-sum-exp (``_apply_sink_lse_correction``,
         # mirroring the FastKVzip baseline), which works on FA2 / pre-Hopper and
-        # on the head-group paging path. ``False`` for sink-less models keeps
+        # on the ragged paging path. ``False`` for sink-less models keeps
         # the original hot path untouched (zero overhead).
         self.sink_via_lse_correction = False
         if self.sinks is not None:
@@ -1030,12 +1030,12 @@ class FlashAttentionImpl(AttentionImpl):
 
         # For decoder and cross-attention, use KV cache as before
         if attn_metadata.num_head_groups_per_layer > 0:
-            # Head-grouped column-major page: present the cache as the
+            # Ragged column-major page: present the cache as the
             # standard single-KV-head paged layout over virtual blocks
             # (virtual_block = physical_block * page_group_size + column).
             # slot_mapping and block_table are already in virtual coordinates,
             # so reshape_and_cache_flash / flash_attn_varlen_func run
-            # unchanged. See vllm/v1/attention/backends/head_grouped_layout.py.
+            # unchanged. See vllm/v1/attention/backends/ragged_layout.py.
             kv_cache = as_virtual_block_view(kv_cache)
         key_cache, value_cache = kv_cache.unbind(0)
 
@@ -1198,7 +1198,7 @@ class FlashAttentionImpl(AttentionImpl):
         baseline (``prefill/attention/attn.py``) and is numerically exact, so it
         replaces the FA3-only native ``s_aux`` path on pre-Hopper GPUs.
 
-        Two output layouts are handled, distinguished by the head-group paging
+        Two output layouts are handled, distinguished by the ragged paging
         metadata. ``lse`` always arrives as ``[query_heads, tokens]`` (the
         FlashAttention varlen convention), so it is transposed to align with the
         token-major ``output`` rows.
@@ -1220,7 +1220,7 @@ class FlashAttentionImpl(AttentionImpl):
             # the query head within that group; the global query head is
             # ``kv_head * query_heads_per_kv + column``. The row→kv_head map
             # depends on how
-            # vllm/attention/layer.py::_head_grouped_attention_impl
+            # vllm/attention/layer.py::_ragged_attention_impl
             # flattened the tensors:
             #   - uniform decode fast path: row = token * num_kv_heads + kv_head
             #     (kv_head varies fastest)        -> tile the [kv, head] grid
@@ -1230,7 +1230,7 @@ class FlashAttentionImpl(AttentionImpl):
             num_kv_heads = self.num_kv_heads
             tokens_per_member = num_actual_tokens // num_kv_heads
             sink_grid = sinks.view(num_kv_heads, query_heads)
-            if attn_metadata.head_grouped_decode_layout:
+            if attn_metadata.ragged_decode_layout:
                 sink_rows = sink_grid.repeat(tokens_per_member, 1)
             else:
                 sink_rows = sink_grid.repeat_interleave(tokens_per_member, dim=0)

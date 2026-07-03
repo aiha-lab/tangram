@@ -56,7 +56,7 @@ def full_attention_layer_indices(vllm_config: VllmConfig) -> list[int]:
     ``sliding_window is None`` — the single signal used to decide which layers
     are compressible by FastKVZip (and therefore carry a head-group cluster
     map). This is the shared source of truth for that decision: the compression
-    engine (``GPUModelRunner._init_compression``) and the head-grouped
+    engine (``GPUModelRunner._init_compression``) and the ragged
     FlashAttention metadata builder both call it, so their static-layer sets
     cannot drift. For a dense model every layer is full-attention, so the result
     is ``range(num_decoder_layers)``.
@@ -166,7 +166,7 @@ class CommonAttentionMetadata:
     dcp_local_seq_lens_cpu: torch.Tensor | None = None
     """Sequence lengths of the local rank in decode context parallelism world"""
 
-    # Head-grouped + compression: per-(req, head-group) cache occupancy
+    # Ragged + compression: per-(req, head-group) cache occupancy
     # post-compression. Feeds ``seq_lens_grouped`` so the paged-attention
     # kernels see the actual cache window (smaller than
     # ``num_computed_tokens + num_scheduled`` after eviction).
