@@ -198,7 +198,7 @@ class CacheConfig:
     from ``hmkim97/tangram-gate``; a local path is also accepted."""
 
     # --- Compression: two orthogonal axes (selection level + scorer) ---
-    compression_level: str = "crosslayer_cluster"
+    compression_level: str = "perlayer_cluster"
     """Axis 1 — selection level (the rule turning eval scores into a per-(layer,
     group) kept count). Named ``{scope}_{granularity}`` over two orthogonal axes:
     threshold scope (``crosslayer`` global vs ``perlayer``) and calibration
@@ -217,29 +217,28 @@ class CacheConfig:
       fraction while heads within a layer still diverge. Immune to cross-layer
       scale disparity; the validated pairing for ``compression_scorer ==
       "expected_attention"`` (its kvpress reference uses AdaKV per-layer budgets).
-    * ``"crosslayer_cluster"`` (default) — cross-layer global threshold,
+    * ``"crosslayer_cluster"`` — cross-layer global threshold,
       cluster-calibrated (the exact-budget counterpart of ``"crosslayer_head"``:
       cross-layer block sharing without max-pool inflation). Needs a cross-layer
       (global) cluster map; shares ``"crosslayer_head"``'s scale-disparity
       sensitivity; TP=1 only.
-    * ``"perlayer_cluster"`` — per-layer threshold, cluster-calibrated: the budget
-      is decided at the cluster (shared-block) granularity so the physical KV is
-      exactly ``compression_ratio`` (no max-pool inflation). Needs a within-layer
-      cluster map; TP=1 only.
+    * ``"perlayer_cluster"`` (default) — per-layer threshold,
+      cluster-calibrated: the budget is decided at the cluster (shared-block)
+      granularity so the physical KV is exactly ``compression_ratio`` (no
+      max-pool inflation). Needs a within-layer cluster map; TP=1 only.
     * ``"uniform"`` — a uniform count ``floor(compression_ratio * eval_len)`` per
       (layer, group) (reference ``pair-head``). Positions still differ per head;
       only the kept *count* is uniform.
 
     The accepted set is owned by ``selection_level.SELECTION_LEVELS``."""
-    compression_scorer: str = "fastkvzip"
-    """Axis 2 — score producer. ``"fastkvzip"`` uses the trained gate over
-    hidden_states (needs a checkpoint). ``"snapkv"``, ``"keydiff"``,
-    ``"streamingllm"``, and ``"tova"`` are gate-free and need no checkpoint:
-    SnapKV scores from observation-window attention over the chunk's post-RoPE
-    query/key, KeyDiff from key similarity to the chunk's mean key direction,
-    StreamingLLM from token recency (global position) alone — a recency
-    baseline, and TOVA from the last query's attention averaged across heads
-    (head-uniform)."""
+    compression_scorer: str = "snapkv"
+    """Axis 2 — score producer, defaulting to ``"snapkv"``. The gate-free
+    scorers need no checkpoint: SnapKV scores from observation-window attention
+    over the chunk's post-RoPE query/key, KeyDiff from key similarity to the
+    chunk's mean key direction, StreamingLLM from token recency (global
+    position) alone — a recency baseline, and TOVA from the last query's
+    attention averaged across heads (head-uniform). ``"fastkvzip"`` instead uses
+    the trained gate over hidden_states (needs a checkpoint)."""
     compression_snap_window: int = 32
     """SnapKV observation window: number of trailing queries used to score a
     chunk. Distinct from ``compression_window_size`` (the always-kept recent

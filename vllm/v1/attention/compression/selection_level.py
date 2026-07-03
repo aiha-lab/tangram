@@ -476,11 +476,11 @@ def make_selection_level(level: str) -> SelectionLevel:
     * ``"crosslayer_head"`` — cross-layer global threshold, head-calibrated
       (inflating). Tangram's historical default.
     * ``"perlayer_head"`` — per-layer threshold (AdaKV-style), head-calibrated.
-    * ``"crosslayer_cluster"`` (default) — cross-layer global threshold,
+    * ``"crosslayer_cluster"`` — cross-layer global threshold,
       cluster-calibrated (exact budget with cross-layer block sharing; global
       map; TP=1).
-    * ``"perlayer_cluster"`` — per-layer threshold, cluster-calibrated (exact
-      per-layer budget; needs a per-layer cluster map; TP=1).
+    * ``"perlayer_cluster"`` (default) — per-layer threshold, cluster-calibrated
+      (exact per-layer budget; needs a per-layer cluster map; TP=1).
     * ``"uniform"`` — fixed per-(layer, group) count (no threshold)."""
     try:
         return _LEVELS[level]()
