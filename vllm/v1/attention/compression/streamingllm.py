@@ -31,9 +31,10 @@ from __future__ import annotations
 
 import torch
 from torch import nn
+from vllm.v1.attention.compression.qk_scorer_base import QKScorer
 
 
-class StreamingLLMScorer(nn.Module):
+class StreamingLLMScorer(QKScorer):
     """One (stateless) instance shared across all compressible layers.
 
     Input:  ``query`` / ``key`` / ``value`` (all unused — accepted only to

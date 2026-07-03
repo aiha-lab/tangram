@@ -24,9 +24,10 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 from torch import nn
+from vllm.v1.attention.compression.qk_scorer_base import QKScorer
 
 
-class KeyDiffScorer(nn.Module):
+class KeyDiffScorer(QKScorer):
     """One (stateless) instance shared across all compressible layers.
 
     Input:  ``query [T, num_kv_heads * num_q_per_kv * head_size]`` (unused —

@@ -20,8 +20,10 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from vllm.v1.attention.compression.qk_scorer_base import QKScorer
 
-class SnapKVScorer(nn.Module):
+
+class SnapKVScorer(QKScorer):
     """One (stateless) instance shared across all compressible layers.
 
     Input:  ``query [T, num_kv_heads * num_q_per_kv * head_size]`` and

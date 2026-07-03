@@ -52,6 +52,7 @@ import math
 import torch
 from torch import nn
 
+from vllm.v1.attention.compression.qk_scorer_base import QKScorer
 from vllm.logger import init_logger
 from vllm.model_executor.layers.rotary_embedding.common import (
     apply_rotary_emb_torch,
@@ -60,7 +61,7 @@ from vllm.model_executor.layers.rotary_embedding.common import (
 logger = init_logger(__name__)
 
 
-class ExpectedAttentionScorer(nn.Module):
+class ExpectedAttentionScorer(QKScorer):
     """One (stateless) instance shared across all compressible layers.
 
     Input:  ``query [T, num_kv_heads * num_q_per_kv * head_size]``,

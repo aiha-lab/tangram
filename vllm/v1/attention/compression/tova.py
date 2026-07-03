@@ -31,9 +31,10 @@ import math
 
 import torch
 from torch import nn
+from vllm.v1.attention.compression.qk_scorer_base import QKScorer
 
 
-class TOVAScorer(nn.Module):
+class TOVAScorer(QKScorer):
     """One (stateless) instance shared across all compressible layers.
 
     Input:  ``query [T, num_kv_heads * num_q_per_kv * head_size]`` and

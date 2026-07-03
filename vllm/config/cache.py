@@ -507,13 +507,15 @@ class CacheConfig:
                     f"compression_level must be one of {SELECTION_LEVELS}, "
                     f"got {self.compression_level!r}."
                 )
-            if self.compression_scorer not in (
-                    "fastkvzip", "snapkv", "keydiff", "streamingllm", "tova",
-                    "expected_attention"):
+            # Axis 2 — score producer. Gate-free scorers are owned by the
+            # ``scorer`` registry (single source of truth); ``"fastkvzip"`` is
+            # the checkpoint-backed hidden_states gate, valid in addition.
+            from vllm.v1.attention.compression.scorer import QK_SCORERS
+            valid_scorers = ("fastkvzip", *QK_SCORERS)
+            if self.compression_scorer not in valid_scorers:
                 raise ValueError(
-                    "compression_scorer must be 'fastkvzip', 'snapkv', "
-                    "'keydiff', 'streamingllm', 'tova', or "
-                    f"'expected_attention', got {self.compression_scorer!r}."
+                    f"compression_scorer must be one of {valid_scorers}, "
+                    f"got {self.compression_scorer!r}."
                 )
             # The gate checkpoint is only consumed by the fastkvzip scorer;
             # every other (gate-free) scorer ignores the path.
