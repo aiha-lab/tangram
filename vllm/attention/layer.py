@@ -1135,38 +1135,88 @@ def _ragged_attention_impl(
     output_2d = output.view(-1, hidden)
 
     if attn_metadata.ragged_decode_layout:
-        # Uniform-decode fast path: token-major Q/K/V flattens directly
-        # into member-major (one sequence per KV head) because every
-        # (req, member) sequence is one row. Per-layer metadata is
-        # precomputed by the builder, so we avoid the per-layer view/slice
-        # CPU dispatch cost called out in ``FlashAttentionImpl.forward``.
-        #
-        # ``reshape`` (not ``view``) because Q/K/V may be non-contiguous:
-        # models that fuse the QKV projection hand each tensor out as a
-        # ``split`` view, and a tensor with no post-projection op (e.g.
-        # Gemma-3's value, which unlike query/key is not re-materialized by
-        # q/k-norm + RoPE) keeps the fused row stride. Merging the token and
-        # ``num_kv_heads`` dims then spans that stride, which ``view``
-        # rejects. ``reshape`` is a free view when already contiguous and
-        # copies only the non-contiguous case.
-        q_grouped = query[:num_actual].reshape(
-            num_actual * num_kv_heads, num_query_heads_per_kv, head_size)
-        k_grouped = key[:num_actual].reshape(
-            num_actual * num_kv_heads, 1, head_size)
-        v_grouped = value[:num_actual].reshape(
-            num_actual * num_kv_heads, 1, head_size)
-        output_grouped = output_2d[:num_actual].view(
-            num_actual * num_kv_heads, num_query_heads_per_kv, head_size)
-        layer_md = attn_metadata.per_layer_md[layer.layer_idx]
-        layer.impl.forward(
-            layer, q_grouped, k_grouped, v_grouped,
-            kv_cache, layer_md, output=output_grouped,
+        _ragged_decode_forward(
+            layer, query, key, value, output_2d, kv_cache, attn_metadata,
+            num_actual=num_actual, num_kv_heads=num_kv_heads,
+            num_query_heads_per_kv=num_query_heads_per_kv, head_size=head_size,
         )
         return
 
-    # Member-major path (prefill / mixed batches): a data copy is
-    # required because (req, member) sequences are not contiguous in
-    # any single view of token-major Q/K/V when sequence lengths vary.
+    _ragged_member_major_forward(
+        layer, query, key, value, output_2d, kv_cache, attn_metadata,
+        num_actual=num_actual, num_heads=num_heads, num_kv_heads=num_kv_heads,
+        num_query_heads_per_kv=num_query_heads_per_kv, head_size=head_size,
+    )
+
+
+def _ragged_decode_forward(
+    layer: Attention,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    output_2d: torch.Tensor,
+    kv_cache: torch.Tensor,
+    attn_metadata,
+    *,
+    num_actual: int,
+    num_kv_heads: int,
+    num_query_heads_per_kv: int,
+    head_size: int,
+) -> None:
+    """Uniform-decode ragged path: one query token per (request, KV-head).
+
+    Token-major Q/K/V flattens directly into member-major (one sequence per KV
+    head) because every (req, member) sequence is a single row. Per-layer
+    metadata is precomputed by the builder, so this avoids the per-layer
+    view/slice CPU dispatch cost called out in ``FlashAttentionImpl.forward``.
+    Writes into ``output_2d`` in place.
+
+    ``reshape`` (not ``view``) because Q/K/V may be non-contiguous: models that
+    fuse the QKV projection hand each tensor out as a ``split`` view, and a
+    tensor with no post-projection op (e.g. Gemma-3's value, which unlike
+    query/key is not re-materialized by q/k-norm + RoPE) keeps the fused row
+    stride. Merging the token and ``num_kv_heads`` dims then spans that stride,
+    which ``view`` rejects. ``reshape`` is a free view when already contiguous
+    and copies only the non-contiguous case.
+    """
+    q_grouped = query[:num_actual].reshape(
+        num_actual * num_kv_heads, num_query_heads_per_kv, head_size)
+    k_grouped = key[:num_actual].reshape(
+        num_actual * num_kv_heads, 1, head_size)
+    v_grouped = value[:num_actual].reshape(
+        num_actual * num_kv_heads, 1, head_size)
+    output_grouped = output_2d[:num_actual].view(
+        num_actual * num_kv_heads, num_query_heads_per_kv, head_size)
+    layer_md = attn_metadata.per_layer_md[layer.layer_idx]
+    layer.impl.forward(
+        layer, q_grouped, k_grouped, v_grouped,
+        kv_cache, layer_md, output=output_grouped,
+    )
+
+
+def _ragged_member_major_forward(
+    layer: Attention,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    output_2d: torch.Tensor,
+    kv_cache: torch.Tensor,
+    attn_metadata,
+    *,
+    num_actual: int,
+    num_heads: int,
+    num_kv_heads: int,
+    num_query_heads_per_kv: int,
+    head_size: int,
+) -> None:
+    """Member-major ragged path (prefill / mixed batches).
+
+    A data copy to member-major is required because (req, member) sequences are
+    not contiguous in any single view of token-major Q/K/V when sequence
+    lengths vary. Builds this layer's virtual block table on demand, runs the
+    attention, then writes the inverse (member-major -> token-major) reshape
+    straight into ``output_2d`` in place.
+    """
     q_token_major = query[:num_actual].view(-1, num_heads, head_size)
     k_token_major = key[:num_actual].view(-1, num_kv_heads, head_size)
     v_token_major = value[:num_actual].view(-1, num_kv_heads, head_size)
