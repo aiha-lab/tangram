@@ -136,12 +136,12 @@ class BlockPool:
         num_gpu_blocks: The number of blocks in the pool.
         enable_caching: Whether to enable prefix caching.
         enable_kv_cache_events: Whether to enable kv cache events.
-        head_grouped: Whether the pool is feeding head-grouped paging.
+        ragged: Whether the pool is feeding ragged paging.
             Informational only — every block is byte-equal and head-group
             agnostic; this flag switches storage to a numpy ring buffer.
         num_head_groups: Total head-groups across all layers
             (= ``num_head_groups_per_layer * num_layers``); required when
-            ``head_grouped`` is True.
+            ``ragged`` is True.
     """
 
     def __init__(
@@ -149,32 +149,32 @@ class BlockPool:
         num_gpu_blocks: int,
         enable_caching: bool,
         enable_kv_cache_events: bool = False,
-        head_grouped: bool = False,
+        ragged: bool = False,
         num_head_groups: int | None = None,
     ):
         assert isinstance(num_gpu_blocks, int) and num_gpu_blocks > 0
-        if head_grouped:
+        if ragged:
             assert num_head_groups is not None and num_head_groups > 0, (
-                "head_grouped=True requires a positive num_head_groups."
+                "ragged=True requires a positive num_head_groups."
             )
         else:
             assert num_head_groups is None, (
-                "num_head_groups must be None when head_grouped=False."
+                "num_head_groups must be None when ragged=False."
             )
         self.num_gpu_blocks = num_gpu_blocks
         self.enable_caching = enable_caching
-        self.head_grouped = head_grouped
+        self.ragged = ragged
         self.num_head_groups = num_head_groups
         # All kv-cache blocks.
         self.blocks: list[KVCacheBlock] = [
             KVCacheBlock(idx) for idx in range(num_gpu_blocks)
         ]
         # Doubly linked list of free blocks (eviction candidates when
-        # caching is on). Head-grouped paging swaps this for an int32 ring
+        # caching is on). Ragged paging swaps this for an int32 ring
         # buffer (see ``free_block_ids``) so alloc/free can run as bulk
         # numpy ops; prefix caching is disabled there, removing the only
         # consumer of mid-list removal.
-        if head_grouped:
+        if ragged:
             # Block 0 is reserved as the null block; ring holds ids 1..N-1.
             self.free_block_queue: FreeKVCacheBlockQueue | None = None
             self.free_block_ids: np.ndarray = np.arange(
@@ -306,7 +306,7 @@ class BlockPool:
             )
 
     def _ring_pop_ids(self, num_blocks: int) -> np.ndarray:
-        """Pop ``num_blocks`` ids from the head-grouped ring buffer.
+        """Pop ``num_blocks`` ids from the ragged ring buffer.
 
         Caller must ensure ``num_free_blocks >= num_blocks``.
         """
@@ -327,7 +327,7 @@ class BlockPool:
 
     def _ring_append_ids(self, ids: np.ndarray) -> None:
         """Push ``ids`` into the ring buffer (FIFO; order is irrelevant
-        since head-grouped mode has no LRU invariant)."""
+        since ragged mode has no LRU invariant)."""
         num = ids.size
         if num == 0:
             return
@@ -345,12 +345,12 @@ class BlockPool:
         self.num_free_blocks += num
 
     def get_new_block_ids(self, num_blocks: int) -> np.ndarray:
-        """Head-grouped fast path: int32 ndarray of newly-allocated ids.
+        """Ragged fast path: int32 ndarray of newly-allocated ids.
 
         Bulk-updates ``ref_cnts`` in one numpy op and skips
         ``KVCacheBlock`` materialisation entirely.
         """
-        assert self.head_grouped
+        assert self.ragged
         if num_blocks > self.num_free_blocks:
             raise ValueError(
                 f"Cannot get {num_blocks} free blocks from the pool"
@@ -372,9 +372,9 @@ class BlockPool:
         Returns:
             A list of new block.
         """
-        if self.head_grouped:
+        if self.ragged:
             # Materialise from the ring buffer for callers still expecting
-            # ``list[KVCacheBlock]``; the head-grouped manager uses
+            # ``list[KVCacheBlock]``; the ragged manager uses
             # ``get_new_block_ids`` directly and skips this list build.
             ids = self.get_new_block_ids(num_blocks)
             if ids.size == 0:
@@ -443,10 +443,10 @@ class BlockPool:
         Args:
             blocks: A list of blocks to touch.
         """
-        # Head-grouped paging force-disables prefix caching; surface any
+        # Ragged paging force-disables prefix caching; surface any
         # accidental call rather than silently corrupting ref_cnts.
-        assert not self.head_grouped, (
-            "BlockPool.touch is not supported under head-grouped paging."
+        assert not self.ragged, (
+            "BlockPool.touch is not supported under ragged paging."
         )
         for blocks_per_group in blocks:
             for block in blocks_per_group:
@@ -457,12 +457,12 @@ class BlockPool:
                 block.ref_cnt += 1
 
     def free_block_ids_array(self, ids: np.ndarray) -> None:
-        """Head-grouped fast path: bulk-push int32 ids back into the ring
+        """Ragged fast path: bulk-push int32 ids back into the ring
         buffer. Caller must guarantee ids are unique and exclude the null
         block (id 0); pushing the same id twice would corrupt
         ``num_free_blocks``.
         """
-        assert self.head_grouped
+        assert self.ragged
         if ids.size == 0:
             return
         self.ref_cnts[ids] = 0
@@ -476,7 +476,7 @@ class BlockPool:
             ordered_blocks: A list of blocks to free ordered by their eviction
                 priority.
         """
-        if self.head_grouped:
+        if self.ragged:
             # Manager bookkeeping is the authority here; only called on
             # request termination. Build an id ndarray, skip null, push.
             ids_list = [
@@ -500,7 +500,7 @@ class BlockPool:
         request still references them. Resets ``ref_cnt`` to 0 directly
         (not via ``free_blocks``) and returns them to the free pool.
         """
-        if self.head_grouped:
+        if self.ragged:
             if isinstance(block_ids, np.ndarray):
                 arr = block_ids.astype(np.int32, copy=False)
             else:
@@ -573,7 +573,7 @@ class BlockPool:
         Returns:
             The number of free blocks.
         """
-        if self.head_grouped:
+        if self.ragged:
             return self.num_free_blocks
         return self.free_block_queue.num_free_blocks
 

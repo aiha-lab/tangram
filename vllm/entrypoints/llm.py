@@ -221,7 +221,7 @@ class LLM:
         kv_cache_memory_bytes: int | None = None,
         compilation_config: int | dict[str, Any] | CompilationConfig | None = None,
         logits_processors: list[str | type[LogitsProcessor]] | None = None,
-        # Head-group paging, compression, multi-turn.
+        # Ragged paging, compression, multi-turn.
         # Default 4 matches the CLI/EngineArgs default so both entry points
         # behave identically; None selects the legacy dense layout.
         page_group_size: int | None = 4,
@@ -232,6 +232,15 @@ class LLM:
         compression_floor_min: int = 512,
         compression_chunk_size: int = 2048,
         compression_gate_path: str = "fastkvzip",
+        compression_level: str = "perlayer_cluster",
+        compression_scorer: str = "snapkv",
+        compression_snap_window: int = 32,
+        compression_snap_kernel: int = 7,
+        compression_ea_use_covariance: bool = True,
+        compression_ea_use_vnorm: bool = True,
+        compression_ea_n_future_positions: int = 512,
+        compression_ea_epsilon: float = 1e-2,
+        compression_retention_dump: str | None = None,
         multi_turn: bool = False,
         **kwargs: Any,
     ) -> None:
@@ -354,6 +363,15 @@ class LLM:
             compression_floor_min=compression_floor_min,
             compression_chunk_size=compression_chunk_size,
             compression_gate_path=compression_gate_path,
+            compression_level=compression_level,
+            compression_scorer=compression_scorer,
+            compression_snap_window=compression_snap_window,
+            compression_snap_kernel=compression_snap_kernel,
+            compression_ea_use_covariance=compression_ea_use_covariance,
+            compression_ea_use_vnorm=compression_ea_use_vnorm,
+            compression_ea_n_future_positions=compression_ea_n_future_positions,
+            compression_ea_epsilon=compression_ea_epsilon,
+            compression_retention_dump=compression_retention_dump,
             multi_turn=multi_turn,
             **kwargs,
         )

@@ -350,7 +350,7 @@ class VllmConfig:
         if self.model_config is not None:
             self.model_config.verify_with_parallel_config(self.parallel_config)
             self.model_config.verify_dual_chunk_attention_config(self.load_config)
-            # Reject models that don't support head-grouped paging / compression.
+            # Reject models that don't support ragged paging / compression.
             self.cache_config.verify_model_support(self.model_config.architecture)
 
         self.cache_config.verify_with_parallel_config(self.parallel_config)
@@ -496,6 +496,27 @@ class VllmConfig:
                         "Prefill context parallel (PCP) is enabled, which is "
                         "incompatible with full CUDA graphs. "
                         "Overriding cudagraph_mode to PIECEWISE."
+                    )
+                    self.compilation_config.cudagraph_mode = CUDAGraphMode.PIECEWISE
+                # Ragged paging (Tangram) cannot capture attention in a
+                # FULL cudagraph: its metadata builder allocates fresh
+                # per-step tensors (virtual block tables, per-layer
+                # overlays), so full-graph replay would read freed
+                # capture-time addresses. The attention op is a piecewise
+                # splitting op, so PIECEWISE keeps the rest of the model in
+                # CUDA graphs while attention runs eagerly between pieces.
+                # This must be resolved here at config time: the model
+                # runner's later support check raises for FULL modes rather
+                # than downgrading them.
+                elif (
+                    self.cache_config is not None
+                    and self.cache_config.page_group_size is not None
+                ):
+                    logger.warning_once(
+                        "Ragged KV paging (page_group_size=%d) is "
+                        "incompatible with full CUDA graphs. "
+                        "Overriding cudagraph_mode to PIECEWISE.",
+                        self.cache_config.page_group_size,
                     )
                     self.compilation_config.cudagraph_mode = CUDAGraphMode.PIECEWISE
                 elif self.model_config is not None:

@@ -53,8 +53,8 @@ class CompressionGate(nn.Module):
     Output: scores ``[num_kv_heads, T]``.
     """
 
-    # Axis-2 dispatch: the gate hooks the outer attention block, which
-    # exposes hidden_states.
+    # Axis-2 dispatch: the gate consumes the outer attention block's
+    # hidden_states.
     consumes = "hidden_states"
     name = "fastkvzip"
 

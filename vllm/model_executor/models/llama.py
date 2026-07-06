@@ -238,7 +238,7 @@ class LlamaAttention(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
-        # Head-grouped paging needs contiguous Q/K/V for the decode fast
+        # Ragged paging needs contiguous Q/K/V for the decode fast
         # path's single ``.view()``; the fused ``split(dim=-1)`` would
         # produce non-contiguous slices, so use three matmuls instead.
         if self.attn.num_groups_per_layer > 0:

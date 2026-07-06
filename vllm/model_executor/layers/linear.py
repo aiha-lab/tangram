@@ -950,7 +950,7 @@ class QKVParallelLinear(ColumnParallelLinear):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Return Q, K, V as contiguous tensors via three separate matmuls.
 
-        Head-grouped paging's decode fast path merges dim 0 and dim 1
+        Ragged paging's decode fast path merges dim 0 and dim 1
         with a single ``.view()``, which needs contiguous inputs. The
         fused ``forward() + .split()`` would yield wider-stride slices,
         so split the matmul instead. ``self.weight`` is row-major, so
@@ -965,7 +965,7 @@ class QKVParallelLinear(ColumnParallelLinear):
         )
         assert not self.gather_output or self.tp_size == 1, (
             "QKVParallelLinear.forward_split does not implement output "
-            "all-gather; head-grouped paging operates per-rank."
+            "all-gather; ragged paging operates per-rank."
         )
 
         weight = self.weight

@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Index-math equivalence tests for the column-major head-grouped layout.
+"""Index-math equivalence tests for the column-major ragged layout.
 
 These run on CPU with no model or CUDA: they prove that the column-major
 virtual-block addressing writes and reads exactly the same logical cells as the
@@ -13,7 +13,7 @@ import os
 
 import numpy as np
 
-from vllm.v1.attention.backends.head_grouped_layout import (
+from vllm.v1.attention.backends.ragged_layout import (
     as_virtual_block_view,
     column_major_cache_shape,
     expand_member_seq_lens,

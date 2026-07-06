@@ -1,45 +1,36 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-"""Benchmark: KV-cache admission control vs. preemption thrashing.
+"""Benchmark: Tangram KV-cache compression speedup vs. the uncompressed baseline.
 
-By default, under chunked prefill the scheduler admits a request as soon as its
-*first chunk* fits in the KV cache — not its full length. When the cache is
-tight this over-admits: admitted requests keep growing, run out of cache, and
-get **preempted** (their KV is discarded and recomputed from scratch). Under
-load this preemption thrashing can collapse throughput.
+Under a KV-pressured workload, compression shrinks each request's KV footprint
+so more requests fit at once; fewer requests queue/preempt and end-to-end time
+drops. This harness quantifies that speedup by running the same workload twice —
+an uncompressed baseline (ratio 1.0, full KV cache) and a compressed run
+(``--ratio`` < 1.0, prefill-with-eviction) — and printing a side-by-side
+comparison of preemptions, end-to-end time, throughput, and the speedup.
 
-The ``scheduler_reserve_full_isl`` engine option makes the scheduler admit a
-request only if its *entire* input length fits, which prevents the
-over-admission. This script runs the same KV-pressured workload with that option
-OFF then ON and prints a side-by-side comparison of preemptions and throughput.
+``scheduler_reserve_full_isl`` is pinned ON for every run, so admission control
+is held constant and the only varied axis is the compression ratio.
 
-Tangram KV-cache compression (FastKVZip prefill-with-eviction and the gate-free
-scorers) can be layered on top via ``--ratio`` (< 1.0 enables compression) plus
-the ``--compression-*`` knobs, which mirror ``bench_common.add_compression_args``
-one-for-one so the engine is built with the same semantics as the accuracy
-drivers. The admission OFF-vs-ON comparison then runs *under* compression — note
-that today's full-ISL reserve still sizes the reservation off the *uncompressed*
-``num_tokens`` (compression-aware admission is track item 02, not yet built), so
-``ON`` will be over-conservative under compression; that gap is exactly what this
-harness exists to quantify.
+Compression defaults to the SnapKV scorer at the ``perlayer_cluster`` selection
+level (matching the shipping library defaults); both are configurable via
+``--compression-scorer`` / ``--compression-level``.
 
 Examples
 --------
-    # Run the OFF-vs-ON comparison (default). Pin a free GPU as usual:
-    CUDA_VISIBLE_DEVICES=0 python benchmark.py
+    # Baseline (ratio 1.0) vs SnapKV at a 30% KV budget.
+    CUDA_VISIBLE_DEVICES=0 python speedup_benchmark.py --ratio 0.3
 
-    # Squeeze the KV cache harder (fewer requests fit -> more thrashing):
-    CUDA_VISIBLE_DEVICES=0 python benchmark.py --gpu-memory-utilization 0.12 --num 32
+    # Tighten the KV cache for more contention (larger speedup).
+    CUDA_VISIBLE_DEVICES=0 python speedup_benchmark.py \\
+        --ratio 0.3 --gpu-memory-utilization 0.12 --num 32
 
-    # Run a single configuration only:
-    CUDA_VISIBLE_DEVICES=0 python benchmark.py --reserve off
+    # Override the scorer or selection level.
+    CUDA_VISIBLE_DEVICES=0 python speedup_benchmark.py \\
+        --ratio 0.3 --compression-scorer fastkvzip --compression-level perlayer_head
 
-    # Same comparison, but with FastKVZip compression at a 30% KV budget:
-    CUDA_VISIBLE_DEVICES=0 python benchmark.py --ratio 0.3
-
-    # A gate-free scorer (no checkpoint) with a per-layer selection level:
-    CUDA_VISIBLE_DEVICES=0 python benchmark.py \\
-        --ratio 0.3 --compression-scorer snapkv --compression-level perlayer_head
+    # Run a single configuration only.
+    CUDA_VISIBLE_DEVICES=0 python speedup_benchmark.py --run-ratio 1.0
 """
 from __future__ import annotations
 
@@ -60,10 +51,46 @@ for _p in (_TANGRAM_DIR, _REPO_ROOT):
         sys.path.insert(0, _p)
 
 
+# Head-group cluster maps ship under
+# tools/head_group_clustering/cluster_maps/<method>/<model-id>/pg<pg>_r<base>[_perlayer].npz
+# A cluster-granularity selection level (crosslayer_cluster / perlayer_cluster)
+# needs one; the head levels run fine on identity adjacency. We auto-resolve the
+# map from (scorer, model, pg, level) and fall back to identity (None) when no
+# map is on disk.
+_CMAP_DIR = os.path.join(_REPO_ROOT, "tools", "head_group_clustering",
+                         "cluster_maps")
+_CMAP_BASE_RATIO = 0.3  # one base-ratio ranking map is valid across all ratios.
+# Scorer -> method folder. Identity-mapped except expected_attention -> 'ea'.
+_SCORER_CMAP_METHOD = {
+    "fastkvzip": "fastkvzip", "snapkv": "snapkv", "keydiff": "keydiff",
+    "expected_attention": "ea",
+}
+# Only the per-layer-scope levels use the _perlayer map flavour.
+_LEVEL_CMAP_SUFFIX = {"perlayer_cluster": "_perlayer", "perlayer_head": "_perlayer"}
+
+
+def resolve_cluster_map(args: argparse.Namespace) -> str | None:
+    """Resolve the head-group cluster map path for this run.
+
+    An explicit ``--head-group-cluster-map`` always wins. Otherwise auto-resolve
+    from (scorer, model basename, page-group size, level); return None (identity
+    adjacency) when the scorer has no map folder or the file is not on disk."""
+    if args.head_group_cluster_map:
+        return args.head_group_cluster_map
+    method = _SCORER_CMAP_METHOD.get(args.compression_scorer)
+    if method is None:
+        return None
+    model_id = os.path.basename(args.model.rstrip("/")).lower()
+    suffix = _LEVEL_CMAP_SUFFIX.get(args.compression_level, "")
+    path = os.path.join(_CMAP_DIR, method, model_id,
+                        f"pg{args.page_group_size}_r{_CMAP_BASE_RATIO}{suffix}.npz")
+    return path if os.path.exists(path) else None
+
+
 # ---------------------------------------------------------------------------
-# Worker: run ONE configuration in this process and report its metrics.
+# Worker: run ONE configuration (at a given ratio) and report its metrics.
 # ---------------------------------------------------------------------------
-def run_one(args: argparse.Namespace, reserve_full_isl: bool) -> dict:
+def run_one(args: argparse.Namespace, run_ratio: float) -> dict:
     # Heavy imports kept inside the worker so the orchestrator stays light.
     from transformers import AutoTokenizer
 
@@ -103,22 +130,33 @@ def run_one(args: argparse.Namespace, reserve_full_isl: bool) -> dict:
         max_model_len=args.max_model_len,
         gpu_memory_utilization=args.gpu_memory_utilization,
         enforce_eager=True,
-        # Compression forces prefix caching off (cache.py); keep it off in the
-        # baseline too so OFF/ON differ only in admission control.
+        # Compression forces prefix caching off; keep it off in the baseline too
+        # so baseline/compressed differ only in the KV budget.
         enable_prefix_caching=False,
         disable_log_stats=False,  # required so get_metrics() is populated
-        scheduler_reserve_full_isl=reserve_full_isl,
+        # Pinned ON so admission control is held constant across both runs.
+        scheduler_reserve_full_isl=True,
         watermark=args.watermark,
-        # Ragged paging layout — always on in tangram-asp (pg=4 default).
+        # Head-grouped paging layout (pg=4 default).
         page_group_size=args.page_group_size,
-        head_group_cluster_map=args.head_group_cluster_map,
+        # Cluster-granularity levels need a cluster map; auto-resolved from
+        # (scorer, model, pg, level). Only consulted for compressed runs below.
+        head_group_cluster_map=(
+            resolve_cluster_map(args) if run_ratio < 1.0 else None),
     )
-    # ratio == 1.0 is the no-compression baseline; the compression machinery
-    # stays cold. ratio < 1.0 enables FastKVZip prefill-with-eviction. These
-    # knobs mirror bench_common.build_llm exactly.
-    if args.ratio < 1.0:
+    if run_ratio < 1.0:
+        cmap = llm_kwargs["head_group_cluster_map"]
+        print(f"  cluster map: {cmap if cmap else 'identity (none on disk)'}")
+        if cmap is None and args.compression_level.endswith("_cluster"):
+            print(f"  WARNING: level={args.compression_level} needs a cluster "
+                  f"map but none was found; running on identity adjacency.")
+    # run_ratio == 1.0 is the no-compression baseline (machinery stays cold);
+    # run_ratio < 1.0 enables prefill-with-eviction KV compression.
+    if run_ratio < 1.0:
+        # Compression turns ON purely via compression_ratio < 1.0; there is no
+        # separate enable flag on the LLM API / EngineArgs.
         llm_kwargs.update(
-            compression_ratio=args.ratio,
+            compression_ratio=run_ratio,
             compression_chunk_size=args.compression_chunk_size,
             compression_n_sink_tokens=args.compression_n_sink_tokens,
             compression_window_size=args.compression_window_size,
@@ -150,7 +188,7 @@ def run_one(args: argparse.Namespace, reserve_full_isl: bool) -> dict:
             break
     gen_tokens = sum(len(o.outputs[0].token_ids) for o in outputs)
     return {
-        "reserve_full_isl": reserve_full_isl,
+        "ratio": run_ratio,
         "requests": len(prompts),
         "ctx_mean": sum(ctx_lens) // len(prompts),
         "preemptions": preemptions,
@@ -160,7 +198,7 @@ def run_one(args: argparse.Namespace, reserve_full_isl: bool) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Orchestrator: run OFF then ON (each in a fresh process) and print a table.
+# Orchestrator: run baseline then compressed (each fresh) and print a table.
 # ---------------------------------------------------------------------------
 def _child_env() -> dict:
     env = dict(os.environ)
@@ -173,29 +211,30 @@ def _child_env() -> dict:
     return env
 
 
-def run_config_in_subprocess(args: argparse.Namespace, reserve: str) -> dict:
+def run_config_in_subprocess(args: argparse.Namespace, run_ratio: float) -> dict:
     with tempfile.NamedTemporaryFile("r", suffix=".json", delete=False) as f:
         out_path = f.name
     # Forward the *entire* parsed namespace (minus the per-run control fields) to
     # the worker via JSON, so every model/compression knob propagates without
     # enumerating flags here — adding a new arg never needs a change in this fn.
     shared = {k: v for k, v in vars(args).items()
-              if k not in ("reserve", "_result_path", "_args_path")}
+              if k not in ("run_ratio", "_result_path", "_args_path")}
     with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
         json.dump(shared, f)
         args_path = f.name
     cmd = [
         sys.executable, os.path.abspath(__file__),
-        "--reserve", reserve,
+        "--run-ratio", str(run_ratio),
         "--_args-path", args_path,
         "--_result-path", out_path,
     ]
-    label = "OFF (greedy admission)" if reserve == "off" else "ON  (reserve full input length)"
-    print(f"\n>>> admission control {label} ...", flush=True)
+    label = ("baseline (ratio 1.0, no compression)" if run_ratio >= 1.0
+             else f"compressed (ratio {run_ratio})")
+    print(f"\n>>> {label} ...", flush=True)
     proc = subprocess.run(cmd, env=_child_env())
     if proc.returncode != 0:
         os.unlink(args_path)
-        raise SystemExit(f"configuration '{reserve}' failed (exit {proc.returncode})")
+        raise SystemExit(f"ratio '{run_ratio}' run failed (exit {proc.returncode})")
     with open(out_path) as f:
         res = json.load(f)
     os.unlink(out_path)
@@ -203,29 +242,27 @@ def run_config_in_subprocess(args: argparse.Namespace, reserve: str) -> dict:
     return res
 
 
-def print_comparison(args: argparse.Namespace, off: dict, on: dict) -> None:
+def print_comparison(args: argparse.Namespace, base: dict, comp: dict) -> None:
     line = "─" * 70
     print("\n" + "═" * 70)
-    print(" KV-cache admission control — preemption benchmark")
+    print(" Tangram KV-cache compression — speedup benchmark")
     print("═" * 70)
     print(f" model      {os.path.basename(args.model.rstrip('/'))}")
-    print(f" workload   {off['requests']} requests, ~{off['ctx_mean']} prompt tokens each")
-    print(f" KV cache   gpu_memory_utilization={args.gpu_memory_utilization} (intentionally tight)")
+    print(f" workload   {base['requests']} requests, ~{base['ctx_mean']} prompt tokens each")
+    print(f" KV cache   gpu_memory_utilization={args.gpu_memory_utilization}")
+    print(f" admission  scheduler_reserve_full_isl=ON (held constant)")
     print(line)
-    print(f" {'admission control':<26}{'preemptions':>13}{'end-to-end':>13}{'throughput':>15}")
-    print(f" {'OFF (greedy, default)':<26}{off['preemptions']:>13}"
-          f"{str(off['e2e_s']) + ' s':>13}{str(off['throughput_tok_s']) + ' tok/s':>15}")
-    print(f" {'ON  (full-input reserve)':<26}{on['preemptions']:>13}"
-          f"{str(on['e2e_s']) + ' s':>13}{str(on['throughput_tok_s']) + ' tok/s':>15}")
-    if args.ratio < 1.0:
-        print(f" compression ratio={args.ratio} scorer={args.compression_scorer} "
-              f"level={args.compression_level}")
-    else:
-        print(" compression OFF (ratio=1.0, baseline)")
+    print(f" {'configuration':<30}{'preemptions':>11}{'end-to-end':>13}{'throughput':>15}")
+    print(f" {'baseline (ratio 1.0)':<30}{base['preemptions']:>11}"
+          f"{str(base['e2e_s']) + ' s':>13}{str(base['throughput_tok_s']) + ' tok/s':>15}")
+    print(f" {'compressed (ratio ' + str(comp['ratio']) + ')':<30}{comp['preemptions']:>11}"
+          f"{str(comp['e2e_s']) + ' s':>13}{str(comp['throughput_tok_s']) + ' tok/s':>15}")
+    print(f" compression scorer={args.compression_scorer} level={args.compression_level}")
     print(line)
-    speedup = (off["e2e_s"] / on["e2e_s"]) if on["e2e_s"] else float("nan")
-    print(f" → admission control removed {off['preemptions'] - on['preemptions']} "
-          f"preemptions and ran {speedup:.2f}× faster")
+    speedup = (base["e2e_s"] / comp["e2e_s"]) if comp["e2e_s"] else float("nan")
+    print(f" → compression at ratio {comp['ratio']} removed "
+          f"{base['preemptions'] - comp['preemptions']} preemptions and ran "
+          f"{speedup:.2f}× faster than the uncompressed baseline")
     print("═" * 70 + "\n")
 
 
@@ -241,15 +278,17 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--num", type=int, default=24, help="Number of requests.")
     p.add_argument("--max-model-len", type=int, default=32768)
     p.add_argument("--gpu-memory-utilization", type=float, default=0.90,
-                   help="Lower = tighter KV cache = more preemption pressure.")
+                   help="Lower = tighter KV cache = more compression speedup.")
     p.add_argument("--max-tokens", type=int, default=128,
                    help="Output tokens per request (kept small to isolate the "
-                        "prefill-admission effect).")
+                        "prefill/KV-budget effect).")
     p.add_argument("--tensor-parallel-size", type=int, default=1)
     p.add_argument("--watermark", type=float, default=0.0,
                    help="Fraction of KV blocks kept free as decode headroom.")
-    p.add_argument("--reserve", choices=["on", "off"], default=None,
-                   help="Run a SINGLE config instead of the comparison.")
+    p.add_argument(
+        "--run-ratio", type=float, default=None,
+        help="Run a SINGLE config at this ratio instead of the comparison. "
+             "1.0 = uncompressed baseline; < 1.0 = compressed.")
     _add_compression_args(p)
     # Internal: worker writes its result JSON here / reads shared args from here.
     p.add_argument("--_result-path", default=None, help=argparse.SUPPRESS)
@@ -258,16 +297,14 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _add_compression_args(p: argparse.ArgumentParser) -> None:
-    """Tangram compression knobs, mirroring bench_common.add_compression_args
-    one-for-one so the engine is built with identical semantics. Defined inline
-    (not imported) to keep the light orchestrator free of the heavy vLLM import
-    that bench_common performs at module load."""
-    g = p.add_argument_group("compression (FastKVZip prefill-with-eviction)")
+    """Tangram compression knobs. Defined inline (not imported) so the light
+    orchestrator stays free of the heavy vLLM import."""
+    g = p.add_argument_group("compression (prefill-with-eviction KV compression)")
     g.add_argument(
-        "--ratio", type=float, default=1.0,
-        help="KV cache budget as a ratio of the full cache, in (0, 1]. "
-             "ratio == 1.0 (default) disables compression and runs the "
-             "uncompressed baseline; < 1.0 enables compression.")
+        "--ratio", type=float, default=0.3,
+        help="KV cache budget as a ratio of the full cache, in (0, 1). This is "
+             "the compressed configuration compared against the ratio-1.0 "
+             "baseline. (The baseline ratio is always 1.0 and not configurable.)")
     g.add_argument("--page-group-size", type=int, default=4)
     g.add_argument(
         "--head-group-cluster-map", type=str, default=None,
@@ -285,7 +322,7 @@ def _add_compression_args(p: argparse.ArgumentParser) -> None:
                  "expected_attention"],
         help="Score producer (axis 2). All but 'fastkvzip' are gate-free.")
     g.add_argument(
-        "--compression-level", default="crosslayer_head",
+        "--compression-level", default="perlayer_cluster",
         choices=("crosslayer_head", "perlayer_head", "crosslayer_cluster",
                  "perlayer_cluster", "uniform"),
         help="Selection level (axis 1), named {scope}_{granularity}.")
@@ -316,22 +353,28 @@ def main() -> None:
             for k, v in json.load(f).items():
                 setattr(args, k, v)
 
-    if not (0.0 < args.ratio <= 1.0):
-        raise SystemExit(f"--ratio must satisfy 0 < ratio <= 1, got {args.ratio}.")
+    if not (0.0 < args.ratio < 1.0):
+        raise SystemExit(
+            f"--ratio must satisfy 0 < ratio < 1 (the compressed config), "
+            f"got {args.ratio}. The baseline is always ratio 1.0.")
 
     # Single-config (worker) mode.
-    if args.reserve is not None:
-        res = run_one(args, reserve_full_isl=(args.reserve == "on"))
+    if args.run_ratio is not None:
+        if not (0.0 < args.run_ratio <= 1.0):
+            raise SystemExit(
+                f"--run-ratio must satisfy 0 < ratio <= 1, got {args.run_ratio}.")
+        res = run_one(args, run_ratio=args.run_ratio)
         print(f"  result: {json.dumps(res)}")
         if args._result_path:
             with open(args._result_path, "w") as f:
                 json.dump(res, f)
         return
 
-    # Comparison mode: run OFF then ON in fresh processes, then tabulate.
-    off = run_config_in_subprocess(args, "off")
-    on = run_config_in_subprocess(args, "on")
-    print_comparison(args, off, on)
+    # Comparison mode: run baseline (1.0) then compressed (args.ratio) in fresh
+    # processes, then tabulate the speedup.
+    base = run_config_in_subprocess(args, 1.0)
+    comp = run_config_in_subprocess(args, args.ratio)
+    print_comparison(args, base, comp)
 
 
 if __name__ == "__main__":

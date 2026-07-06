@@ -18,7 +18,7 @@ from vllm.utils.mem_constants import GiB_bytes
 from vllm.v1.kv_cache_interface import (
     ChunkedLocalAttentionSpec,
     FullAttentionSpec,
-    HeadGroupedAttentionSpec,
+    RaggedAttentionSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
     KVCacheSpec,
@@ -788,10 +788,10 @@ def get_max_concurrency_for_kv_cache_config(
         * num_layer_per_group
     )
     num_block_per_request = cdiv(max_memory_usage_per_request, memory_per_block)
-    # Head-grouped paging shares a global pool, so the per-request footprint
+    # Ragged paging shares a global pool, so the per-request footprint
     # scales with the number of layers in the group.
     spec0 = kv_cache_config.kv_cache_groups[0].kv_cache_spec
-    if isinstance(spec0, HeadGroupedAttentionSpec):
+    if isinstance(spec0, RaggedAttentionSpec):
         num_block_per_request *= num_layer_per_group
     max_concurrency = kv_cache_config.num_blocks / num_block_per_request
     return max_concurrency
@@ -825,7 +825,7 @@ def get_num_blocks(
         available_memory: Memory available for KV cache in bytes.
         page_size: The page size of the KV cache.
     """
-    # Head-grouped paging uses a single global block pool spanning every
+    # Ragged paging uses a single global block pool spanning every
     # layer; the pool is sized against total memory rather than per-layer.
     if vllm_config.cache_config.page_group_size is not None:
         num_blocks = int(available_memory // page_size)
@@ -1065,16 +1065,16 @@ def get_kv_cache_config_from_groups(
         # full.0, sw.0, sw.1: share a Tensor with size=available_memory//2
         # full.1, sw.2: share another Tensor with size=available_memory//2
 
-        # Head-grouped paging: all attention layers share a single raw KV
+        # Ragged paging: all attention layers share a single raw KV
         # tensor; layers are separated by disjoint block_ids in the
         # BlockTable rather than by owning their own raw tensor.
-        head_grouped = any(
-            isinstance(group.kv_cache_spec, HeadGroupedAttentionSpec)
+        ragged = any(
+            isinstance(group.kv_cache_spec, RaggedAttentionSpec)
             for group in kv_cache_groups
         )
-        if head_grouped:
+        if ragged:
             assert len(kv_cache_groups) == 1, (
-                "Head-grouped paging requires a single KVCacheGroupSpec; "
+                "Ragged paging requires a single KVCacheGroupSpec; "
                 f"got {len(kv_cache_groups)}.")
             group_size = 1
         else:
@@ -1086,7 +1086,7 @@ def get_kv_cache_config_from_groups(
             vllm_config, group_size, available_memory, page_size
         )
         kv_cache_tensors = []
-        if head_grouped:
+        if ragged:
             # Single contiguous tensor; each attention layer resolves its
             # slice through the block_table's flat group index
             # (layer_idx × num_head_groups + group_in_layer).
@@ -1247,9 +1247,9 @@ def _report_kv_cache_config(
         [group.kv_cache_spec.block_size for group in kv_cache_config.kv_cache_groups]
     )
 
-    # Head-grouped paging: 1 token consumes (num_layers × num_head_groups) slots.
+    # Ragged paging: 1 token consumes (num_layers × num_head_groups) slots.
     spec0 = kv_cache_config.kv_cache_groups[0].kv_cache_spec
-    if isinstance(spec0, HeadGroupedAttentionSpec):
+    if isinstance(spec0, RaggedAttentionSpec):
         num_layers_total = sum(
             len(g.layer_names) for g in kv_cache_config.kv_cache_groups
         )

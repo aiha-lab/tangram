@@ -16,9 +16,10 @@ have no SDPA kernel, so transformers never dispatches its attention through the
 registry the capture hooks rely on). The engine, by contrast, scores every model
 identically through its own attention path.
 
-Wiring is config-driven (no engine entanglement beyond one optional hook): set
-``CacheConfig.compression_retention_dump`` to a directory and the worker attaches
-the observer to its compressor at construction (see ``gpu_model_runner``). From
+Wiring is config-driven (no engine entanglement beyond one optional observer):
+set ``CacheConfig.compression_retention_dump`` to a directory and the worker
+attaches the observer to its compressor at construction (see
+``gpu_model_runner``). From
 the ``LLM`` entrypoint that is just a keyword argument:
 
     from vllm import LLM

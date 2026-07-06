@@ -550,7 +550,7 @@ class EngineArgs:
     mamba_ssm_cache_dtype: MambaDType = CacheConfig.mamba_ssm_cache_dtype
     mamba_block_size: int | None = get_field(CacheConfig, "mamba_block_size")
 
-    # Head-group paging, compression, multi-turn.
+    # Ragged paging, compression, multi-turn.
     page_group_size: int | None = CacheConfig.page_group_size
     head_group_cluster_map: str | None = CacheConfig.head_group_cluster_map
     compression_ratio: float = CacheConfig.compression_ratio
@@ -972,7 +972,7 @@ class EngineArgs:
         cache_group.add_argument(
             "--kv-offloading-backend", **cache_kwargs["kv_offloading_backend"]
         )
-        # Head-group paging, compression, multi-turn.
+        # Ragged paging, compression, multi-turn.
         cache_group.add_argument(
             "--page-group-size", **cache_kwargs["page_group_size"]
         )
@@ -1462,17 +1462,11 @@ class EngineArgs:
         """
         current_platform.pre_register_and_update()
 
-        # Compression's per-layer pre-hook runs eager Python every forward and
-        # cannot be CUDA-graph captured, so force eager mode. Warn (not info):
-        # it overrides the CUDA-graph default.
-        if self.compression_ratio < 1.0 and not self.enforce_eager:
-            logger.warning(
-                "compression (compression_ratio=%s < 1.0) forces "
-                "enforce_eager=True: compression's per-layer pre-hook cannot "
-                "run under CUDA graph capture, so CUDA graphs are disabled for "
-                "this run.", self.compression_ratio
-            )
-            self.enforce_eager = True
+        # Compression no longer forces enforce_eager: scoring is delivered
+        # through piecewise splitting ops (unified_attention_ragged /
+        # tangram_gate_capture) that run eagerly between CUDA-graph pieces,
+        # and VllmConfig.__post_init__ downgrades full-cudagraph modes to
+        # PIECEWISE whenever page_group_size is set.
 
         device_config = DeviceConfig(device=cast(Device, current_platform.device_type))
 

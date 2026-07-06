@@ -20,7 +20,7 @@ Two properties define TOVA and separate it from SnapKV:
   level this reproduces TOVA's single global KV policy.
 
 Like tangram's SnapKV scorer, the attention is computed from the chunk's
-post-RoPE query/key supplied by the qk hook (the reference recomputes the
+post-RoPE query/key the scorer receives (the reference recomputes the
 query from hidden_states; tangram already has the post-RoPE query, so it skips
 that recomputation — same attention). "Last query" is the last query of the
 current chunk, the chunk-local analogue of the reference's last prompt token.
@@ -31,9 +31,10 @@ import math
 
 import torch
 from torch import nn
+from vllm.v1.attention.compression.qk_scorer_base import QKScorer
 
 
-class TOVAScorer(nn.Module):
+class TOVAScorer(QKScorer):
     """One (stateless) instance shared across all compressible layers.
 
     Input:  ``query [T, num_kv_heads * num_q_per_kv * head_size]`` and
@@ -43,8 +44,8 @@ class TOVAScorer(nn.Module):
             identical across heads (TOVA is head-uniform).
     """
 
-    # Axis-2 dispatch: this scorer hooks the inner ``Attention`` (sees q/k),
-    # not the outer block (which sees hidden_states).
+    # Axis-2 dispatch: this scorer reads the inner ``Attention``'s q/k,
+    # not the outer block's hidden_states.
     consumes = "qk"
     name = "tova"
 

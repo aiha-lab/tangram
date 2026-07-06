@@ -31,9 +31,10 @@ from __future__ import annotations
 
 import torch
 from torch import nn
+from vllm.v1.attention.compression.qk_scorer_base import QKScorer
 
 
-class StreamingLLMScorer(nn.Module):
+class StreamingLLMScorer(QKScorer):
     """One (stateless) instance shared across all compressible layers.
 
     Input:  ``query`` / ``key`` / ``value`` (all unused — accepted only to
@@ -43,8 +44,8 @@ class StreamingLLMScorer(nn.Module):
             recent (kept), lower = older (evicted first).
     """
 
-    # Axis-2 dispatch: this scorer hooks the inner ``Attention`` (the qk hook),
-    # so it shares the call signature even though it reads neither q nor k.
+    # Axis-2 dispatch: this scorer uses the query/key delivery path, so it
+    # shares the call signature even though it reads neither q nor k.
     consumes = "qk"
     name = "streamingllm"
 

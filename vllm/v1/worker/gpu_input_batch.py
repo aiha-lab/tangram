@@ -49,18 +49,18 @@ class CachedRequestState:
     # Used when both async_scheduling and spec_decode are enabled.
     prev_num_draft_len: int = 0
 
-    # Head-grouped paging: per-(layer, head-group) sequence-length snapshot
+    # Ragged paging: per-(layer, head-group) sequence-length snapshot
     # held only while the request is out of the InputBatch (the batch row
-    # is otherwise the source of truth). None when head-group paging is off.
+    # is otherwise the source of truth). None when ragged paging is off.
     eff_seq_lens_snapshot: np.ndarray | None = None
-    # Head-grouped paging: exact per-group block_table row (block ids +
+    # Ragged paging: exact per-group block_table row (block ids +
     # fill counts) captured when the request leaves the InputBatch, so a
     # re-add restores the precise (possibly compression-compacted, non-
     # uniform) layout instead of reconstructing it from the flat ``block_ids``
     # via ``add_row`` (which fills groups uniformly and would scramble a
-    # compacted request's KV). None when head-group paging is off.
+    # compacted request's KV). None when ragged paging is off.
     block_table_snapshot: tuple[np.ndarray, np.ndarray] | None = None
-    # Head-grouped paging: this step's newly allocated block ids for a
+    # Ragged paging: this step's newly allocated block ids for a
     # request being re-added, appended after ``restore_row``.
     block_table_readd_increment: tuple[list[int], ...] | None = None
 
@@ -86,7 +86,7 @@ class CachedRequestState:
         return -1
 
     def drop_readd_snapshot(self) -> None:
-        """Clear the head-grouped verbatim re-add snapshot as one unit.
+        """Clear the ragged verbatim re-add snapshot as one unit.
 
         The three fields are captured together when a request leaves the
         InputBatch and are all stale once it is resumed from preemption (which
@@ -160,14 +160,14 @@ class InputBatch:
         )
         self.num_computed_tokens_cpu = self.num_computed_tokens_cpu_tensor.numpy()
 
-        # Head-grouped paging: per-(req, head-group) effective sequence
+        # Ragged paging: per-(req, head-group) effective sequence
         # lengths feeding allocate_slots and slot_mapping. ``num_head_groups``
         # is the total (per_layer × layers); the layer dimension is folded
         # into the flat group index.
         self.num_head_groups = num_head_groups
         self.num_head_groups_per_layer = num_head_groups_per_layer
-        self.head_grouped = num_head_groups is not None
-        if self.head_grouped:
+        self.ragged = num_head_groups is not None
+        if self.ragged:
             assert num_head_groups is not None and num_head_groups > 0
             if num_head_groups_per_layer is not None:
                 assert num_head_groups_per_layer > 0
@@ -408,7 +408,7 @@ class InputBatch:
 
         # Hand any out-of-batch snapshot back to the batch row, then clear
         # the request-side mirror; first-time entries start at zero.
-        if self.head_grouped:
+        if self.ragged:
             assert self.effective_seq_lens_cpu is not None
             if request.eff_seq_lens_snapshot is not None:
                 assert request.eff_seq_lens_snapshot.shape == (
@@ -529,7 +529,7 @@ class InputBatch:
 
         Args:
           req_id: request to remove
-          cached_state: Head-grouped paging only — the runner-side
+          cached_state: Ragged paging only — the runner-side
               ``CachedRequestState`` to receive an ``eff_seq_lens`` snapshot
               before the row is cleared. ``None`` for finished requests
               whose cached state has already been popped.
@@ -545,7 +545,7 @@ class InputBatch:
         # Snapshot eff_seq_lens for resume; only requested for
         # unscheduled / preempted requests (finished requests' cached
         # state is already popped).
-        if self.head_grouped and cached_state is not None:
+        if self.ragged and cached_state is not None:
             assert self.effective_seq_lens_cpu is not None
             cached_state.eff_seq_lens_snapshot = self.effective_seq_lens_cpu[
                 req_index, :
@@ -655,7 +655,7 @@ class InputBatch:
         self.block_table.swap_row(i1, i2)
 
         # Keep eff_seq_lens rows aligned with batch indices.
-        if self.head_grouped:
+        if self.ragged:
             assert self.effective_seq_lens_cpu is not None
             tmp = self.effective_seq_lens_cpu[i1, :].copy()
             self.effective_seq_lens_cpu[i1, :] = self.effective_seq_lens_cpu[i2, :]
@@ -790,7 +790,7 @@ class InputBatch:
             self.block_table.move_row(last_req_index, empty_index)
 
             # Move the eff_seq_lens row alongside.
-            if self.head_grouped:
+            if self.ragged:
                 assert self.effective_seq_lens_cpu is not None
                 self.effective_seq_lens_cpu[empty_index, :] = (
                     self.effective_seq_lens_cpu[last_req_index, :]

@@ -159,8 +159,8 @@ class FullAttentionSpec(AttentionSpec):
 
 
 @dataclass(frozen=True)
-class HeadGroupedAttentionSpec(AttentionSpec):
-    """Head-group paging spec.
+class RaggedAttentionSpec(AttentionSpec):
+    """Ragged paging spec.
 
     A block holds ``page_group_size`` (not ``num_kv_heads``) KV heads of
     ``block_size`` tokens to enable per-head-group eviction. Per-layer
@@ -175,7 +175,7 @@ class HeadGroupedAttentionSpec(AttentionSpec):
     def __post_init__(self) -> None:
         if self.page_group_size <= 0:
             raise ValueError(
-                f"HeadGroupedAttentionSpec.page_group_size must be a positive "
+                f"RaggedAttentionSpec.page_group_size must be a positive "
                 f"int, got {self.page_group_size}."
             )
         if self.num_kv_heads % self.page_group_size != 0:
@@ -213,9 +213,9 @@ class HeadGroupedAttentionSpec(AttentionSpec):
 
     @classmethod
     def merge(cls, specs: list[Self]) -> Self:
-        assert all(isinstance(spec, HeadGroupedAttentionSpec) for spec in specs), (
-            "All attention layers in the same head-grouped KV cache group must "
-            "be HeadGroupedAttentionSpec."
+        assert all(isinstance(spec, RaggedAttentionSpec) for spec in specs), (
+            "All attention layers in the same ragged KV cache group must "
+            "be RaggedAttentionSpec."
         )
         sliding_window = set(
             spec.sliding_window for spec in specs if spec.sliding_window is not None
@@ -240,18 +240,18 @@ class HeadGroupedAttentionSpec(AttentionSpec):
         for spec in specs:
             for f in fields(AttentionSpec):
                 assert getattr(spec, f.name) == getattr(merged, f.name), (
-                    "All attention layers in the same head-grouped KV cache "
+                    "All attention layers in the same ragged KV cache "
                     "group must have the same attention spec."
                 )
             assert spec.page_group_size == merged.page_group_size, (
-                "All attention layers in the same head-grouped KV cache group "
+                "All attention layers in the same ragged KV cache group "
                 "must have the same page_group_size."
             )
         assert (merged.sliding_window is not None) + (
             merged.attention_chunk_size is not None
         ) <= 1, (
             "Model with both sliding window layers and chunked local attention "
-            "layers is not supported under head-grouped paging."
+            "layers is not supported under ragged paging."
         )
         return merged
 
@@ -414,9 +414,9 @@ class UniformTypeKVCacheSpecs(KVCacheSpec):
             # Different block sizes, not uniform.
             return False
         one_spec = next(iter(kv_cache_specs.values()))
-        if isinstance(one_spec, HeadGroupedAttentionSpec):
+        if isinstance(one_spec, RaggedAttentionSpec):
             return all(
-                isinstance(spec, HeadGroupedAttentionSpec)
+                isinstance(spec, RaggedAttentionSpec)
                 and spec.page_group_size == one_spec.page_group_size
                 for spec in kv_cache_specs.values()
             )

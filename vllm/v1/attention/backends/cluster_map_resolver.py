@@ -6,7 +6,7 @@ Finds the ``.npz`` map shipped under
 ``tools/head_group_clustering/cluster_maps/<scorer-dir>/<model-slug>/`` that
 matches the running model, scorer, ``page_group_size``, and selection level, so
 the default config needs no explicit ``--head-group-cluster-map``. This only
-*locates and identity-checks* a file; ``head_grouped_layout.load_cluster_map``
+*locates and identity-checks* a file; ``ragged_layout.load_cluster_map``
 stays the authoritative loader/validator of the array contents. Run once at
 config finalization (``CacheConfig.resolve_head_group_cluster_map``) and frozen
 onto the config, so every consumer reads the same path.
@@ -90,7 +90,7 @@ def _validate_cluster_map_meta(
     scope, source model, ``page_group_size``, and ``num_kv_heads``; any mismatch
     (or missing meta) returns ``False`` to fall back to identity. The array
     contents are still validated authoritatively by ``load_cluster_map``."""
-    from vllm.v1.attention.backends.head_grouped_layout import (
+    from vllm.v1.attention.backends.ragged_layout import (
         read_cluster_map_meta,
     )
 

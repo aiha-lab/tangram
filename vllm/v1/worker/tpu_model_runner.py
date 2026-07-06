@@ -172,10 +172,10 @@ class TPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
         self.enforce_eager = model_config.enforce_eager
 
-        # Head-grouped paging is GPU-only.
+        # Ragged paging is GPU-only.
         if cache_config.page_group_size is not None:
             raise NotImplementedError(
-                "Head-grouped paging (cache_config.page_group_size) is "
+                "Ragged paging (cache_config.page_group_size) is "
                 "not supported on TPU."
             )
 

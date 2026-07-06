@@ -491,6 +491,19 @@ class CompilationConfig:
     _attention_ops: ClassVar[list[str]] = [
         "vllm::unified_attention",
         "vllm::unified_attention_with_output",
+        # Ragged paging (Tangram). MUST stay a splitting op: the op
+        # body performs per-layer metadata selection (and compression
+        # scoring) in Python, which only executes when the op runs eagerly
+        # between CUDA-graph pieces. See
+        # vllm/attention/layer.py::unified_attention_ragged.
+        "vllm::unified_attention_ragged",
+        # Compression gate scoring (Tangram, FastKVZip). Same invariant: the
+        # op exists purely for its eager Python side effect (hidden-states
+        # scoring); captured inside a graph it would run at capture time
+        # only. Listing an op that never appears in a given graph (non-gate
+        # scorers) is harmless — splitting matches nodes present in the
+        # graph. See compression/gate_capture.py::tangram_gate_capture.
+        "vllm::tangram_gate_capture",
         "vllm::unified_mla_attention",
         "vllm::unified_mla_attention_with_output",
         "vllm::mamba_mixer2",

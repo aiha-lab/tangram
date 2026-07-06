@@ -11,32 +11,22 @@ Tangram: Unlocking Non-Uniform KV Cache Compression for Efficient Multi-turn LLM
 | <a href="https://aiha-lab.github.io/tangram-page/"><b>Project Page</b></a> | <a href="https://aiha-lab.github.io/tangram-page/#"><b>Paper</b></a> |
 </p>
 
+<p align="center">
+  <img src="docs/assets/speedup/speedup.png" alt="Tangram end-to-end speedup vs vLLM 0.11.1" width="100%"/>
+</p>
+
 **Tangram** is a serving system that makes non-uniform KV cache compression
-practical for multi-turn LLM serving. It is built on top of
+practical for multi-turn LLM serving, built on top of
 [vLLM](https://github.com/vllm-project/vllm).
 
 **Highlights**
 
-- **KV Cache Compression on vLLM** — brings both non-uniform (per-head) and uniform (per-layer) KV cache compression to vLLM serving
-- **Seamless vLLM integration** — fully compatible with paged attention, continuous batching, and chunked prefill
-- **Efficient LLM serving** — compressed KV cache is actually reclaimed, turning memory savings into higher serving throughput
+- **KV Cache Compression on vLLM with Ragged Paging** — non-uniform and uniform KV cache compression, natively integrated into vLLM
+- **Seamless vLLM integration** — fully compatible with paged attention, continuous batching, chunked prefill, and CUDA graph mode
+- **Real memory reclamation** — compressed KV cache is actually freed, turning memory savings into higher serving throughput
+- **Zero runtime scheduling overhead** — budget reservation and ahead-of-time (AOT) load balancing keep compression off the critical path
 
-**Core techniques**
-
-1. **Budget Reservation** — static per-head memory footprint, no runtime scheduling overhead
-2. **Ragged Paging** — clusters heads by retention demand with independent, vectorized page tables
-3. **Ahead-of-Time (AOT) Load Balancing** — offline workload partitioning for uniform SM utilization
-
----
-
-## Getting Started
-
-Tangram is built on top of [vLLM](https://github.com/vllm-project/vllm), a fast
-and easy-to-use library for LLM inference and serving. See the
-[vLLM documentation](https://docs.vllm.ai/en/latest/) for the underlying engine
-and supported models.
-
-### Installation
+## Installation
 
 ```bash
 git clone https://github.com/aiha-lab/tangram.git
@@ -46,7 +36,7 @@ source .venv/bin/activate
 VLLM_USE_PRECOMPILED=1 uv pip install --editable . --torch-backend=auto
 ```
 
-### Quickstart
+## Quickstart
 
 ```python
 from vllm import LLM, SamplingParams
@@ -55,42 +45,32 @@ llm = LLM(
     model="Qwen/Qwen3-4B-Instruct-2507",
     compression_ratio=0.5,                  # keep 50% of the KV cache (1.0 = no compression)
     compression_scorer="snapkv",            # snapkv | keydiff | expected_attention | fastkvzip
-    compression_level="crosslayer_cluster", # "crosslayer_cluster", "perlayer_cluster"(non-uniform) and "uniform"
+    compression_level="crosslayer_cluster", # crosslayer_cluster | perlayer_cluster | uniform
 )
 
 out = llm.generate(["What is KV cache compression?"], SamplingParams(max_tokens=128))
 print(out[0].outputs[0].text)
 ```
 
-## Supported Compression
-
-- SnapKV ([paper](https://arxiv.org/abs/2404.14469))
-- KeyDiff ([paper](https://arxiv.org/abs/2504.15364))
-- ExpectedAttention ([paper](https://arxiv.org/abs/2510.00636))
-- FastKVzip ([paper](https://arxiv.org/abs/2601.17668))
-
-**🚧 WIP**
-
-- TOVA
-- PyramidKV
-
-### Ragged Paging and Configurations
-
-Key knobs for Tangram Framework:
+## Configuration
 
 | Config | Description |
 | ------ | ----------- |
 | `compression_ratio` | KV retention fraction; `1.0` = FullKV (no compression). |
 | `compression_scorer` | Importance scorer: `snapkv` \| `keydiff` \| `expected_attention` \| `fastkvzip`. |
-| `compression_level` | KV-budget scope — see the options below. |
+| `compression_level` | KV-budget scope — see below. |
 | `page_group_size` | Heads per page (H<sub>p</sub>): attention heads managed together in one KV-cache page; they share one paged budget. |
 
-**`compression_level` options** — the two cluster levels give an exact (= ratio)
-footprint and need a cluster map; otherwise heads are grouped by adjacency.
+**`compression_level` options**
 
-- `crosslayer_cluster` — one budget shared across all layers (they compete for it).
-- `perlayer_cluster` — each layer budgeted independently; immune to cross-layer score-scale skew.
-- `uniform` — every attention head keeps the same budget `floor(ratio × len)`; only positions differ per head.
+- `crosslayer_cluster` — non-uniform; a single global KV budget is distributed across all layers and heads, so important heads in any layer can keep more tokens.
+- `perlayer_cluster` — non-uniform; each layer gets an equal KV budget, distributed non-uniformly across the heads within that layer.
+- `uniform` — every attention head keeps the same number of tokens (`ratio × seq_len`); only *which* tokens are kept differs per head.
+
+**Supported scorers** — SnapKV ([paper](https://arxiv.org/abs/2404.14469)),
+KeyDiff ([paper](https://arxiv.org/abs/2504.15364)),
+ExpectedAttention ([paper](https://arxiv.org/abs/2510.00636)),
+FastKVzip ([paper](https://arxiv.org/abs/2601.17668))
 
 ## Accuracy
 
@@ -98,8 +78,6 @@ footprint and need a cluster map; otherwise heads are grouped by adjacency.
 
 <details>
 <summary><b>Non-uniform (<code>perlayer_cluster</code>), H<sub>p</sub> = 4</b></summary>
-
-Selection level: `PerLayerClusterLevel` (per-layer threshold, cluster-calibrated; exact budget).
 
 <table>
 <thead>
@@ -157,9 +135,11 @@ Selection level: `PerLayerClusterLevel` (per-layer threshold, cluster-calibrated
 
 </details>
 
-## Evaluate on RULER
+## Benchmarks
 
-Run one compression method at one ratio on RULER 8K.
+### RULER
+
+Run one compression method at one ratio on RULER 8K:
 
 ```bash
 cd benchmarks/tangram
@@ -171,19 +151,17 @@ bash benchmark_ruler.sh
 
 - `SCORER` — `snapkv` | `keydiff` | `expected_attention`
 - `RATIOS` — KV retention fraction (`1.0` = FullKV reference)
-- `LEVEL` — selection level; see [Ragged Paging and Configurations](#ragged-paging-and-configurations) above
+- `LEVEL` — selection level; see [Configuration](#configuration)
 
-### Measure Speedup
+### Speedup
 
-A quick, lightweight example measuring end-to-end generation speedup of Tangram — wall-clock at `r=1.0` (uncompressed) vs compressed ratios on an
-SCBench task.
+Measure end-to-end generation speedup — wall-clock at `r=1.0` (uncompressed)
+vs compressed ratios on an SCBench task:
 
 ```bash
 cd benchmarks/tangram/speedup
 ./run_speedup.sh
 ```
-
----
 
 ## Citation
 
@@ -191,7 +169,7 @@ If you use Tangram for your research, please cite our [paper](https://arxiv.org/
 
 ```
 @misc{kim2026tangramunlockingnonuniformkv,
-      title={Tangram: Unlocking Non-Uniform KV Cache for Efficient Multi-turn LLM Serving}, 
+      title={Tangram: Unlocking Non-Uniform KV Cache Compression for Efficient Multi-turn LLM Serving}, 
       author={Hyungmin Kim and Minsoo Kim and Hongseok Kim and Jungwook Choi},
       year={2026},
       eprint={2606.06302},

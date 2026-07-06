@@ -34,10 +34,10 @@ MambaDType = Literal["auto", "float32"]
 PrefixCachingHashAlgo = Literal["sha256", "sha256_cbor"]
 KVOffloadingBackend = Literal["native", "lmcache"]
 
-# Resolved vLLM model classes validated for head-grouped paged attention /
+# Resolved vLLM model classes validated for ragged paged attention /
 # compression. google/gemma-3-12b-it resolves to the multimodal
 # Gemma3ForConditionalGeneration (not Gemma3ForCausalLM), so both are listed.
-HEAD_GROUPED_SUPPORTED_ARCHITECTURES = frozenset(
+RAGGED_SUPPORTED_ARCHITECTURES = frozenset(
     {
         "LlamaForCausalLM",
         "Qwen2ForCausalLM",
@@ -162,9 +162,9 @@ class CacheConfig:
     'native' (vLLM native CPU offloading), 'lmcache' This option must be used
     together with kv_offloading_size."""
 
-    # Head-group paging.
+    # Ragged paging.
     page_group_size: int | None = 4
-    """Head-group size; ``None`` disables head-group paging.
+    """Head-group size; ``None`` disables ragged paging.
     Must divide ``num_kv_heads``."""
     head_group_cluster_map: str | None = None
     """Head-group cluster map ``.npz`` (``cluster_of`` / ``column_of`` arrays
@@ -198,7 +198,7 @@ class CacheConfig:
     from ``hmkim97/tangram-gate``; a local path is also accepted."""
 
     # --- Compression: two orthogonal axes (selection level + scorer) ---
-    compression_level: str = "crosslayer_cluster"
+    compression_level: str = "perlayer_cluster"
     """Axis 1 — selection level (the rule turning eval scores into a per-(layer,
     group) kept count). Named ``{scope}_{granularity}`` over two orthogonal axes:
     threshold scope (``crosslayer`` global vs ``perlayer``) and calibration
@@ -217,29 +217,28 @@ class CacheConfig:
       fraction while heads within a layer still diverge. Immune to cross-layer
       scale disparity; the validated pairing for ``compression_scorer ==
       "expected_attention"`` (its kvpress reference uses AdaKV per-layer budgets).
-    * ``"crosslayer_cluster"`` (default) — cross-layer global threshold,
+    * ``"crosslayer_cluster"`` — cross-layer global threshold,
       cluster-calibrated (the exact-budget counterpart of ``"crosslayer_head"``:
       cross-layer block sharing without max-pool inflation). Needs a cross-layer
       (global) cluster map; shares ``"crosslayer_head"``'s scale-disparity
       sensitivity; TP=1 only.
-    * ``"perlayer_cluster"`` — per-layer threshold, cluster-calibrated: the budget
-      is decided at the cluster (shared-block) granularity so the physical KV is
-      exactly ``compression_ratio`` (no max-pool inflation). Needs a within-layer
-      cluster map; TP=1 only.
+    * ``"perlayer_cluster"`` (default) — per-layer threshold,
+      cluster-calibrated: the budget is decided at the cluster (shared-block)
+      granularity so the physical KV is exactly ``compression_ratio`` (no
+      max-pool inflation). Needs a within-layer cluster map; TP=1 only.
     * ``"uniform"`` — a uniform count ``floor(compression_ratio * eval_len)`` per
       (layer, group) (reference ``pair-head``). Positions still differ per head;
       only the kept *count* is uniform.
 
     The accepted set is owned by ``selection_level.SELECTION_LEVELS``."""
-    compression_scorer: str = "fastkvzip"
-    """Axis 2 — score producer. ``"fastkvzip"`` uses the trained gate over
-    hidden_states (needs a checkpoint). ``"snapkv"``, ``"keydiff"``,
-    ``"streamingllm"``, and ``"tova"`` are gate-free and need no checkpoint:
-    SnapKV scores from observation-window attention over the chunk's post-RoPE
-    query/key, KeyDiff from key similarity to the chunk's mean key direction,
-    StreamingLLM from token recency (global position) alone — a recency
-    baseline, and TOVA from the last query's attention averaged across heads
-    (head-uniform)."""
+    compression_scorer: str = "snapkv"
+    """Axis 2 — score producer, defaulting to ``"snapkv"``. The gate-free
+    scorers need no checkpoint: SnapKV scores from observation-window attention
+    over the chunk's post-RoPE query/key, KeyDiff from key similarity to the
+    chunk's mean key direction, StreamingLLM from token recency (global
+    position) alone — a recency baseline, and TOVA from the last query's
+    attention averaged across heads (head-uniform). ``"fastkvzip"`` instead uses
+    the trained gate over hidden_states (needs a checkpoint)."""
     compression_snap_window: int = 32
     """SnapKV observation window: number of trailing queries used to score a
     chunk. Distinct from ``compression_window_size`` (the always-kept recent
@@ -362,9 +361,19 @@ class CacheConfig:
         from vllm.config.utils import get_hash_factors, hash_factors
 
         factors = get_hash_factors(self, ignored_factors)
-        # Hash the on/off gate (it forces eager / changes the forward path), not
-        # the continuous ratio, now that ``enable_compression`` is gone.
+        # Hash the on/off gate (it changes the forward path), not the
+        # continuous ratio, now that ``enable_compression`` is gone.
         factors["compression_enabled"] = self.compression_enabled
+        # ``compression_scorer`` itself is excluded above, but its
+        # hidden-states-vs-qk axis DOES change the traced graph: the
+        # FastKVZip gate wraps every attention block's forward with a
+        # ``vllm::tangram_gate_capture`` op node, which qk scorers (SnapKV,
+        # ...) do not emit. Without this bit a compile cache written under
+        # one scorer kind would be silently reused for the other, dropping
+        # (or spuriously adding) the gate-capture nodes.
+        factors["gate_capture_installed"] = (
+            self.compression_enabled and self.compression_scorer == "fastkvzip"
+        )
         return hash_factors(factors)
 
     def metrics_info(self):
@@ -418,7 +427,7 @@ class CacheConfig:
         )
 
     def _validate_extended_fields(self) -> None:
-        # Head-group paging.
+        # Ragged paging.
         if self.page_group_size is not None:
             if self.page_group_size <= 0:
                 raise ValueError(
@@ -437,12 +446,12 @@ class CacheConfig:
                         f"num_kv_heads={self.num_kv_heads}, "
                         f"page_group_size={self.page_group_size}."
                     )
-            # Head-grouped paging is only implemented in the FLASH_ATTN
+            # Ragged paging is only implemented in the FLASH_ATTN
             if not os.environ.get("VLLM_ATTENTION_BACKEND"):
                 os.environ["VLLM_ATTENTION_BACKEND"] = "FLASH_ATTN"
                 logger.info(
                     "Defaulting VLLM_ATTENTION_BACKEND=FLASH_ATTN (required by "
-                    "head-grouped paging / compression)."
+                    "ragged paging / compression)."
                 )
 
         # Compression. The ratio is the on/off gate, so validate its range
@@ -457,7 +466,7 @@ class CacheConfig:
                 raise ValueError(
                     "compression (compression_ratio < 1.0) requires "
                     "page_group_size to be set; compression operates on top of "
-                    "head-group paging."
+                    "ragged paging."
                 )
             if self.compression_window_size <= 0:
                 raise ValueError(
@@ -497,13 +506,15 @@ class CacheConfig:
                     f"compression_level must be one of {SELECTION_LEVELS}, "
                     f"got {self.compression_level!r}."
                 )
-            if self.compression_scorer not in (
-                    "fastkvzip", "snapkv", "keydiff", "streamingllm", "tova",
-                    "expected_attention"):
+            # Axis 2 — score producer. Gate-free scorers are owned by the
+            # ``scorer`` registry (single source of truth); ``"fastkvzip"`` is
+            # the checkpoint-backed hidden_states gate, valid in addition.
+            from vllm.v1.attention.compression.scorer import QK_SCORERS
+            valid_scorers = ("fastkvzip", *QK_SCORERS)
+            if self.compression_scorer not in valid_scorers:
                 raise ValueError(
-                    "compression_scorer must be 'fastkvzip', 'snapkv', "
-                    "'keydiff', 'streamingllm', 'tova', or "
-                    f"'expected_attention', got {self.compression_scorer!r}."
+                    f"compression_scorer must be one of {valid_scorers}, "
+                    f"got {self.compression_scorer!r}."
                 )
             # The gate checkpoint is only consumed by the fastkvzip scorer;
             # every other (gate-free) scorer ignores the path.
@@ -539,7 +550,7 @@ class CacheConfig:
                         f"{self.compression_ea_epsilon}."
                     )
 
-        # Multi-turn rides on top of head-group paging but does not
+        # Multi-turn rides on top of ragged paging but does not
         # require compression.
         if self.multi_turn:
             if self.page_group_size is None:
@@ -553,7 +564,7 @@ class CacheConfig:
                     "replaces prefix caching)."
                 )
 
-        # Prefix caching cannot represent head-group paging's non-uniform
+        # Prefix caching cannot represent ragged paging's non-uniform
         # per-(layer, group) block layout or compression's in-place block
         # mutation, so it is disabled. Warn (not info): it is on by default and
         # this affects throughput.
@@ -562,7 +573,7 @@ class CacheConfig:
         ):
             feature = (
                 "compression" if self.compression_enabled
-                else "head-group paging")
+                else "ragged paging")
             logger.warning(
                 "Disabling prefix caching: it is incompatible with %s, which "
                 "is enabled. Prefix caching will not be used for this run.",
@@ -571,7 +582,7 @@ class CacheConfig:
             self.enable_prefix_caching = False
 
     def verify_model_support(self, architecture: str) -> None:
-        """Reject head-grouped paging / compression on unvalidated models.
+        """Reject ragged paging / compression on unvalidated models.
 
         Unsupported architectures fall back to the dense attention path and
         would silently produce wrong outputs, so fail at startup instead.
@@ -579,14 +590,14 @@ class CacheConfig:
         """
         if self.page_group_size is None and not self.compression_enabled:
             return
-        if architecture in HEAD_GROUPED_SUPPORTED_ARCHITECTURES:
+        if architecture in RAGGED_SUPPORTED_ARCHITECTURES:
             return
         feature = (
-            "compression" if self.compression_enabled else "head-group paging")
-        supported = ", ".join(sorted(HEAD_GROUPED_SUPPORTED_ARCHITECTURES))
+            "compression" if self.compression_enabled else "ragged paging")
+        supported = ", ".join(sorted(RAGGED_SUPPORTED_ARCHITECTURES))
         raise ValueError(
             f"Model architecture '{architecture}' does not support Tangram "
-            f"{feature} (head-grouped paged attention). Supported "
+            f"{feature} (ragged paged attention). Supported "
             f"architectures: {supported}. To run this model, disable the "
             f"feature with --page-group-size=None (and --compression-ratio=1.0 "
             f"for no compression)."

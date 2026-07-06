@@ -20,8 +20,10 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from vllm.v1.attention.compression.qk_scorer_base import QKScorer
 
-class SnapKVScorer(nn.Module):
+
+class SnapKVScorer(QKScorer):
     """One (stateless) instance shared across all compressible layers.
 
     Input:  ``query [T, num_kv_heads * num_q_per_kv * head_size]`` and
@@ -30,8 +32,8 @@ class SnapKVScorer(nn.Module):
     Output: scores ``[num_kv_heads, T]`` (float32), higher = more important.
     """
 
-    # Axis-2 dispatch: this scorer hooks the inner ``Attention`` (sees q/k),
-    # not the outer block (which sees hidden_states).
+    # Axis-2 dispatch: this scorer reads the inner ``Attention``'s q/k,
+    # not the outer block's hidden_states.
     consumes = "qk"
     name = "snapkv"
 

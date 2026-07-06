@@ -39,7 +39,7 @@ class BlockTable:
                 by the attention kernel.
             num_head_groups: Total head-groups
                 (``num_head_groups_per_layer × num_layers``). When set,
-                switches to head-grouped 3D mode; otherwise this is the
+                switches to ragged 3D mode; otherwise this is the
                 base 2D layout.
             num_head_groups_per_layer: Per-layer head-group count
                 (metadata for layer-aware consumers).
@@ -49,17 +49,17 @@ class BlockTable:
         self.pin_memory = pin_memory
         self.device = device
 
-        # Head-group paging lives on a separate code path so the base
+        # Ragged paging lives on a separate code path so the base
         # 2D path stays a zero-overhead copy of the upstream layout.
         self.num_head_groups = num_head_groups
-        self.head_grouped = num_head_groups is not None
+        self.ragged = num_head_groups is not None
         self.num_head_groups_per_layer = num_head_groups_per_layer
-        if self.head_grouped:
+        if self.ragged:
             assert num_head_groups is not None and num_head_groups > 0, (
                 "num_head_groups must be a positive int."
             )
             assert kernel_block_size == block_size, (
-                "Head-grouped paging requires kernel_block_size == "
+                "Ragged paging requires kernel_block_size == "
                 "block_size (hybrid kernel block sizes not supported)."
             )
             # Default to ``num_head_groups`` so single-layer unit tests
@@ -95,7 +95,7 @@ class BlockTable:
 
         self.max_num_blocks_per_req = max_num_blocks_per_req * self.blocks_per_kv_block
 
-        if self.head_grouped:
+        if self.ragged:
             assert num_head_groups is not None  # for type-checkers
             self.block_table = self._make_buffer(
                 self.max_num_reqs,
@@ -144,9 +144,9 @@ class BlockTable:
             self.dcp_rank = 0
         self.cp_kv_cache_interleave_size = cp_kv_cache_interleave_size
 
-        if self.head_grouped:
+        if self.ragged:
             assert self.dcp_world_size == 1 and self.pcp_world_size == 1, (
-                "Head-grouped paging is not implemented for "
+                "Ragged paging is not implemented for "
                 "DCP/PCP world sizes > 1."
             )
 
@@ -158,7 +158,7 @@ class BlockTable:
         if not block_ids:
             return
 
-        if self.head_grouped:
+        if self.ragged:
             self._append_row_grouped(block_ids, row_idx)
             return
 
@@ -173,7 +173,7 @@ class BlockTable:
         self.block_table.np[row_idx, start : start + num_blocks] = block_ids
 
     def _append_row_grouped(self, block_ids: list[int], row_idx: int) -> None:
-        """Head-grouped append.
+        """Ragged append.
 
         ``block_ids`` is a flat sequence sized by
         ``num_required_blocks × num_head_groups − len(req_blocks)``. With
@@ -194,14 +194,14 @@ class BlockTable:
         # ``num_required`` must be an integer; otherwise allocator and
         # append are out of sync (e.g. stale ``num_required_blocks``).
         if (sum_starts + total) % num_groups != 0:
-            raise AssertionError(
-                f"head-grouped append_row: total {total} + existing "
+            raise RuntimeError(
+                f"ragged append_row: total {total} + existing "
                 f"{sum_starts} not divisible by num_head_groups "
                 f"({num_groups}); uniform per-group target unrecoverable.")
         num_required = (sum_starts + total) // num_groups
         if num_required < int(starts.max()):
-            raise AssertionError(
-                f"head-grouped append_row: num_required {num_required} < "
+            raise RuntimeError(
+                f"ragged append_row: num_required {num_required} < "
                 f"max(starts) {int(starts.max())}; cannot shrink groups "
                 "via append.")
 
@@ -216,11 +216,15 @@ class BlockTable:
                 row_idx, group_idx, start : start + num_new
             ] = block_ids_np[pos : pos + num_new]
             pos += num_new
-        assert pos == total, (pos, total)
+        if pos != total:
+            raise RuntimeError(
+                f"ragged append_row: consumed {pos} block ids but received "
+                f"{total}; per-group block counts are inconsistent and the "
+                "KV block table would be corrupted.")
         self.num_blocks_per_row[row_idx, :] = num_required
 
     def add_row(self, block_ids: list[int], row_idx: int) -> None:
-        if self.head_grouped:
+        if self.ragged:
             self.num_blocks_per_row[row_idx, :] = 0
         else:
             self.num_blocks_per_row[row_idx] = 0
@@ -229,7 +233,7 @@ class BlockTable:
     def snapshot_row(self, row_idx: int) -> tuple[np.ndarray, np.ndarray]:
         """Capture a row's exact block ids + per-group fill counts.
 
-        Head-grouped paging only. A compressed request's per-group block
+        Ragged paging only. A compressed request's per-group block
         counts are non-uniform (each cluster evicts independently), and the
         flat ``CachedRequestState.block_ids`` list cannot reconstruct that
         layout via ``add_row`` (which fills groups uniformly, group-major).
@@ -237,7 +241,7 @@ class BlockTable:
         a step) we snapshot its live row here and ``restore_row`` it on
         re-add, preserving the exact (cluster, slot) -> block id mapping the
         KV already lives at."""
-        assert self.head_grouped, "snapshot_row is head-grouped only."
+        assert self.ragged, "snapshot_row is ragged only."
         return (
             self.block_table.np[row_idx, :, :].copy(),
             self.num_blocks_per_row[row_idx, :].copy(),
@@ -247,13 +251,13 @@ class BlockTable:
         self, row_idx: int, snapshot: tuple[np.ndarray, np.ndarray]
     ) -> None:
         """Write back a row captured by :meth:`snapshot_row`."""
-        assert self.head_grouped, "restore_row is head-grouped only."
+        assert self.ragged, "restore_row is ragged only."
         block_ids_np, counts = snapshot
         self.block_table.np[row_idx, :, :] = block_ids_np
         self.num_blocks_per_row[row_idx, :] = counts
 
     def move_row(self, src: int, tgt: int) -> None:
-        if self.head_grouped:
+        if self.ragged:
             block_table_np = self.block_table.np
             block_table_np[tgt, :, :] = block_table_np[src, :, :]
             self.num_blocks_per_row[tgt, :] = self.num_blocks_per_row[src, :]
@@ -264,7 +268,7 @@ class BlockTable:
         self.num_blocks_per_row[tgt] = num_blocks
 
     def swap_row(self, src: int, tgt: int) -> None:
-        if self.head_grouped:
+        if self.ragged:
             block_table_np = self.block_table.np
             tmp = block_table_np[src, :, :].copy()
             block_table_np[src, :, :] = block_table_np[tgt, :, :]
@@ -280,7 +284,7 @@ class BlockTable:
     def compute_slot_mapping(
         self, req_indices: np.ndarray, positions: np.ndarray
     ) -> None:
-        if self.head_grouped:
+        if self.ragged:
             self._compute_slot_mapping_grouped(req_indices, positions)
             return
 
@@ -344,7 +348,7 @@ class BlockTable:
     def _compute_slot_mapping_grouped(
         self, req_indices: np.ndarray, positions: np.ndarray
     ) -> None:
-        """Per-(group, token) slot mapping for the head-grouped 3D path.
+        """Per-(group, token) slot mapping for the ragged 3D path.
 
         ``positions`` is either 1D ``[num_tokens]`` (every group shares the
         same position — pre-compression) or 2D
@@ -383,7 +387,7 @@ class BlockTable:
         self.slot_mapping.np[:, :num_tokens] = slot
 
     def commit_block_table(self, num_reqs: int) -> None:
-        if self.head_grouped:
+        if self.ragged:
             self.block_table.gpu[:num_reqs].copy_(
                 self.block_table.cpu[:num_reqs], non_blocking=True
             )
@@ -391,7 +395,7 @@ class BlockTable:
         self.block_table.copy_to_gpu(num_reqs)
 
     def commit_slot_mapping(self, num_tokens: int) -> None:
-        if self.head_grouped:
+        if self.ragged:
             self.slot_mapping.gpu[:, :num_tokens].copy_(
                 self.slot_mapping.cpu[:, :num_tokens], non_blocking=True
             )
@@ -417,8 +421,8 @@ class BlockTable:
         ids returned (caller releases them via ``free_blocks_by_ids``).
         ``new_num_blocks_per_layer`` has shape ``[num_layers, groups]``.
         """
-        assert self.head_grouped, (
-            "compact_after_compress_all_layers is head-grouped only.")
+        assert self.ragged, (
+            "compact_after_compress_all_layers is ragged only.")
         num_groups = num_head_groups_per_layer
         new_counts = np.asarray(new_num_blocks_per_layer, dtype=np.int32)
         if new_counts.ndim != 2 or new_counts.shape[1] != num_groups:
@@ -431,7 +435,7 @@ class BlockTable:
         old_2d = self.num_blocks_per_row[row_idx, :total_groups].reshape(
             num_layers, num_groups)
         if (new_counts > old_2d).any():
-            raise AssertionError(
+            raise RuntimeError(
                 "compact_after_compress_all_layers cannot grow num_blocks; "
                 f"max old={old_2d.max(axis=0).tolist()} "
                 f"max new={new_counts.max(axis=0).tolist()}.")
@@ -476,7 +480,7 @@ class BlockTable:
             row_idx: persistent-batch row of the request.
             sliding_layer_ids: physical indices of the sliding-window layers.
             num_head_groups_per_layer: groups (page columns) per layer; the
-                group axis of the head-grouped block table is
+                group axis of the ragged block table is
                 ``layer * num_head_groups_per_layer + group``.
             num_skipped_blocks: number of leading blocks now outside the window,
                 ``(num_computed_tokens - sliding_window + 1) // block_size``;
@@ -487,8 +491,8 @@ class BlockTable:
             to be returned to the pool and null-in-placed in the manager's
             per-request array. Empty when there is nothing to free.
         """
-        assert self.head_grouped, (
-            "null_front_blocks_sliding is head-grouped only.")
+        assert self.ragged, (
+            "null_front_blocks_sliding is ragged only.")
         if num_skipped_blocks <= 0 or sliding_layer_ids.size == 0:
             return np.empty(0, dtype=np.int32)
         ngpl = num_head_groups_per_layer
@@ -603,16 +607,16 @@ class MultiGroupBlockTable:
 
         total_cp_world_size = dcp_world_size * pcp_world_size
 
-        # Head-grouped mode collapses the underlying list to a single 3D
+        # Ragged mode collapses the underlying list to a single 3D
         # BlockTable. ``num_head_groups`` is the total (per_layer × layers);
         # the layer dimension is already absorbed into the flat group
         # index, so ``append_row`` does no per-layer tiling.
-        self.head_grouped = num_head_groups is not None
+        self.ragged = num_head_groups is not None
         self.num_head_groups = num_head_groups
         self.num_head_groups_per_layer = num_head_groups_per_layer
-        if self.head_grouped:
+        if self.ragged:
             assert len(block_sizes) == 1, (
-                "Head-grouped paging requires a single KVCacheGroupSpec; "
+                "Ragged paging requires a single KVCacheGroupSpec; "
                 f"got {len(block_sizes)} block_sizes.")
             assert num_head_groups is not None
             if num_head_groups_per_layer is not None:
@@ -641,7 +645,7 @@ class MultiGroupBlockTable:
         ]
 
     def append_row(self, block_ids: tuple[list[int], ...], row_idx: int) -> None:
-        if self.head_grouped:
+        if self.ragged:
             # Caller delivers ``num_head_groups × num_new`` ids in
             # group-major order; a single ``BlockPool.get_new_blocks``
             # call already covered every (layer, head-group) pair.
@@ -651,22 +655,22 @@ class MultiGroupBlockTable:
             block_table.append_row(block_ids[i], row_idx)
 
     def add_row(self, block_ids: tuple[list[int], ...], row_idx: int) -> None:
-        if self.head_grouped:
+        if self.ragged:
             self.block_tables[0].add_row(block_ids[0], row_idx)
             return
         for i, block_table in enumerate(self.block_tables):
             block_table.add_row(block_ids[i], row_idx)
 
     def snapshot_row(self, row_idx: int) -> tuple[np.ndarray, np.ndarray]:
-        """Head-grouped paging keeps every layer/group in ``block_tables[0]``."""
-        assert self.head_grouped, "snapshot_row is head-grouped only."
+        """Ragged paging keeps every layer/group in ``block_tables[0]``."""
+        assert self.ragged, "snapshot_row is ragged only."
         return self.block_tables[0].snapshot_row(row_idx)
 
     def restore_row(
         self, row_idx: int, snapshot: tuple[np.ndarray, np.ndarray]
     ) -> None:
-        """Head-grouped paging keeps every layer/group in ``block_tables[0]``."""
-        assert self.head_grouped, "restore_row is head-grouped only."
+        """Ragged paging keeps every layer/group in ``block_tables[0]``."""
+        assert self.ragged, "restore_row is ragged only."
         self.block_tables[0].restore_row(row_idx, snapshot)
 
     def move_row(self, src: int, tgt: int) -> None:

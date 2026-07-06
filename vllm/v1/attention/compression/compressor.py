@@ -18,12 +18,15 @@ import torch
 from torch import nn
 
 from vllm.logger import init_logger
-from vllm.v1.attention.backends.head_grouped_layout import (
+from vllm.v1.attention.backends.ragged_layout import (
     identity_member_maps,
     load_cluster_map,
     member_maps_from_cluster_map,
 )
 from vllm.v1.attention.compression.gate import CompressionGate, load_gates
+from vllm.v1.attention.compression.gate_capture import (
+    _wrap_forward_with_gate_capture,
+)
 from vllm.v1.attention.compression.selection_level import (
     SelectionLevel,
     make_selection_level,
@@ -118,7 +121,8 @@ class KVCompressor:
     """One instance per model; per-request state held in ``req_state``.
 
     ``compress_active`` is flipped by the ModelRunner around the compress
-    forward pass and read by the per-layer pre-hook.
+    forward pass and read by the per-layer scorers (delivered through the
+    attention / gate-capture custom ops; see ``attach_scorers``).
     """
 
     def __init__(
@@ -158,8 +162,10 @@ class KVCompressor:
         # ``load_gate_checkpoint`` (FastKVZip; hidden_states) or
         # ``set_qk_scorers`` (gate-free query/key scorers — SnapKV, KeyDiff);
         # kept separate so unit tests can exercise compress() without one.
-        # ``scorer_consumes`` ("hidden_states" | "qk") decides which module the
-        # pre-hook attaches to (see ``attach_scorers``).
+        # ``scorer_consumes`` ("hidden_states" | "qk") decides how the scorer
+        # is delivered: a query/key scorer stored on the inner ``Attention``,
+        # or a hidden_states gate wrapped around the outer block (see
+        # ``attach_scorers``).
         self.scorers: list[nn.Module] = []
         self.scorer_consumes: str = "hidden_states"
 
@@ -192,10 +198,10 @@ class KVCompressor:
         # the global sequence position of its chunk's first scored token
         # (the request's ``num_computed_tokens`` this step). Query/key scorers
         # that depend on absolute token position (StreamingLLM recency,
-        # ExpectedAttention's future-position RoPE rotation) read it via the
-        # qk hook; position-independent scorers ignore it. Kept parallel to
-        # ``pending_req_offsets`` (set/cleared together) so the batch-range
-        # tuples stay unchanged and the hidden_states hook is untouched.
+        # ExpectedAttention's future-position RoPE rotation) read it in the
+        # query/key scorer; position-independent scorers ignore it. Kept
+        # parallel to ``pending_req_offsets`` (set/cleared together) so the
+        # batch-range tuples stay unchanged and the gate scorer is untouched.
         self.pending_req_pos_offsets: dict[str, int] | None = None
 
     def load_gate_checkpoint(
@@ -244,7 +250,7 @@ class KVCompressor:
         ``ea_*``) are forwarded but consumed only by their scorer. The concrete
         scorer is chosen by ``build_qk_scorer`` — the one place the gate-free
         scorer type branches — and ``scorer_consumes`` is read off the module so
-        the hook dispatch stays scorer-agnostic."""
+        the delivery dispatch in ``attach_scorers`` stays scorer-agnostic."""
         scorer = build_qk_scorer(
             scorer_name,
             num_kv_heads=self.num_kv_heads_per_layer,
@@ -271,7 +277,7 @@ class KVCompressor:
         cluster map instead assigns each head to the (possibly cross-layer)
         cluster it shares physical KV blocks with. Either way the maps mirror
         those the FlashAttention builder uses for paging, so scoring and
-        physical placement agree (see ``head_grouped_layout.py``). Member row
+        physical placement agree (see ``ragged_layout.py``). Member row
         ``m = layer * num_kv_heads_per_layer + head``.
         """
         if head_group_cluster_map is None:
@@ -551,13 +557,16 @@ class KVCompressor:
         chunk_len: int,
         floor_min: int,
     ) -> np.ndarray:
-        """Per-(layer, group) post-evict kept_lengths for this chunk.
+        """Compute this chunk's per-(layer, group) post-evict kept_lengths.
 
-        Mirrors :py:meth:`CompressionExecutor.run_request` arithmetic
-        without touching KV cache. Result is cached on
-        ``req.cached_kept_lengths_cpu`` so the executor can read it back;
-        under TP the caller may cross-rank MAX-reduce the cache before
-        ``run_request`` to keep the block pool consistent."""
+        This is the single source of truth for how many token slots each
+        (layer, group) keeps. It touches no KV cache; the result is cached on
+        ``req.cached_kept_lengths_cpu`` and :py:meth:`CompressionExecutor.run_request`
+        reads it back (deriving its top-k span from it via
+        ``_new_region_from_kept_length``) rather than recomputing — so the two
+        stay consistent by construction. Under TP the caller may cross-rank
+        MAX-reduce the cache before ``run_request`` to keep the block pool
+        consistent."""
         req = self.req_state.get(req_id)
         if req is None or req.cross_layer_decision is None:
             raise RuntimeError(
@@ -741,12 +750,29 @@ class KVCompressor:
         parents: list[nn.Module],
         inners: list[nn.Module],
     ) -> None:
-        """Wire per-layer forward pre-hooks for the active scorer (axis 2).
+        """Wire the per-layer scorer into the model (axis 2), compile-safely.
 
         ``parents[i]`` is layer i's outer attention block (exposes
         hidden_states); ``inners[i]`` is its inner ``Attention`` (exposes
-        post-RoPE query/key). The hook attaches to whichever the scorer
-        consumes, and fires only when ``compress_active`` is True and
+        post-RoPE query/key). Neither uses module forward hooks: torch.compile
+        skips hooks when it inlines module forwards, which would silently drop
+        all scoring under compilation. Instead, both scorer kinds are
+        delivered through custom ops that are piecewise *splitting ops*
+        (listed in ``CompilationConfig._attention_ops``), so their Python
+        bodies execute eagerly between captured CUDA-graph pieces on every
+        step:
+
+        - query/key scorers (SnapKV, KeyDiff, ...) are stored on the inner
+          ``Attention`` as ``compression_qk_scorer`` and invoked at the top of
+          the ``vllm::unified_attention_ragged`` op body, which receives
+          the same token-major query/key/value the old pre-hook saw.
+        - hidden_states scorers (FastKVZip gate) are stored on the inner
+          ``Attention`` as ``compression_gate_capture`` and invoked by a
+          ``vllm::tangram_gate_capture`` op call inserted in front of the
+          outer block's forward (instance-level wrap; dynamo traces the
+          wrapper and keeps the op as an opaque graph node).
+
+        Every delivered fn fires only when ``compress_active`` is True and
         ``pending_req_offsets`` is non-empty (else zero overhead). Caller owns
         the ordering: ``parents[i]`` / ``inners[i]`` must correspond to
         ``scorers[i]``."""
@@ -754,42 +780,42 @@ class KVCompressor:
             raise ValueError(
                 f"attach_scorers: unknown scorer_consumes "
                 f"{self.scorer_consumes!r}.")
-        # hidden_states scorers hook the outer block; qk scorers hook the inner
-        # ``Attention`` but still need the outer block (``parent``) for its
-        # ``rotary_emb`` (ExpectedAttention), threaded into the hook closure.
-        targets = parents if self.scorer_consumes == "hidden_states" else inners
-        if len(targets) != len(self.scorers) or len(parents) != len(targets):
+        if len(inners) != len(self.scorers) or len(parents) != len(inners):
             raise ValueError(
-                f"attach_scorers: got {len(targets)} target layers / "
+                f"attach_scorers: got {len(inners)} inner layers / "
                 f"{len(parents)} parents but {len(self.scorers)} scorers.")
-        for layer_idx, (target, scorer) in enumerate(
-                zip(targets, self.scorers)):
+        for layer_idx, (parent, inner, scorer) in enumerate(
+                zip(parents, inners, self.scorers)):
             if self.scorer_consumes == "qk":
-                hook = self._make_qk_hook(
-                    layer_idx, scorer, parents[layer_idx])
+                # ``parent`` is threaded through because ExpectedAttention
+                # needs the outer block's ``rotary_emb`` (the inner op only
+                # runs the attention kernel and has no RoPE).
+                inner.compression_qk_scorer = self._make_qk_scorer(
+                    layer_idx, scorer, parent)
             else:
-                hook = self._make_hidden_states_hook(layer_idx, scorer)
-            target.register_forward_pre_hook(hook, with_kwargs=True)
+                inner.compression_gate_capture = (
+                    self._make_hidden_states_capture(layer_idx, scorer))
+                _wrap_forward_with_gate_capture(parent, inner.layer_name)
 
-    def _make_hidden_states_hook(self, layer_idx: int, scorer: nn.Module):
-        """Pre-hook for hidden_states scorers (FastKVZip gate). Concatenates
-        all compression-active request slices into a single forward per layer
-        to amortise kernel launch (per-token scores are request-independent)."""
+    def _make_hidden_states_capture(self, layer_idx: int, scorer: nn.Module):
+        """Capture fn for hidden_states scorers (FastKVZip gate), invoked by
+        the ``vllm::tangram_gate_capture`` op with the outer block's input
+        hidden_states. Concatenates all compression-active request slices into
+        a single forward per layer to amortise kernel launch (per-token scores
+        are request-independent)."""
 
-        def pre_hook(module, args, kwargs, _idx=layer_idx, _scorer=scorer):
+        def capture(hidden_states: torch.Tensor,
+                    _idx=layer_idx, _scorer=scorer) -> None:
             if not self.compress_active:
-                return None
+                return
             offsets = self.pending_req_offsets
             if not offsets:
-                return None
-            hidden_states = args[0] if args else kwargs.get("hidden_states")
-            if hidden_states is None:
-                return None
+                return
 
             valid = [(req, start, end)
                      for req, start, end in offsets if end > start]
             if not valid:
-                return None
+                return
 
             with torch.no_grad():
                 if len(valid) == 1:
@@ -810,19 +836,18 @@ class KVCompressor:
                             score_full[:, cursor:cursor + length],
                         )
                         cursor += length
-            return None
 
-        return pre_hook
+        return capture
 
-    def _make_qk_hook(
+    def _make_qk_scorer(
         self, layer_idx: int, scorer: nn.Module, parent: nn.Module,
     ):
-        """Pre-hook for query/key scorers (SnapKV, KeyDiff, StreamingLLM, TOVA,
-        ExpectedAttention). Scores each request's chunk independently — the
-        observation window is chunk-relative, so request slices must NOT be
-        concatenated. The hook is registered on the inner ``Attention``, whose
-        ``forward(query, key, value, ...)`` exposes ``args[0..2]`` = post-RoPE
-        query / key / value (token-major flatten).
+        """Scorer fn for query/key scorers (SnapKV, KeyDiff, StreamingLLM,
+        TOVA, ExpectedAttention), invoked from the ragged attention op
+        body with the op's token-major query / key / value (post-RoPE — the
+        same tensors the inner ``Attention``'s forward receives). Scores each
+        request's chunk independently — the observation window is
+        chunk-relative, so request slices must NOT be concatenated.
 
         Every qk scorer is called with the uniform contract
         ``scorer(query, key, value, *, module, position_offset)``: ``value``
@@ -834,18 +859,14 @@ class KVCompressor:
         position (StreamingLLM recency, ExpectedAttention future positions).
         Scorers that do not need an argument simply ignore it."""
 
-        def pre_hook(module, args, kwargs,
-                     _idx=layer_idx, _scorer=scorer, _parent=parent):
+        def score_qk(query: torch.Tensor, key: torch.Tensor,
+                     value: torch.Tensor | None,
+                     _idx=layer_idx, _scorer=scorer, _parent=parent) -> None:
             if not self.compress_active:
-                return None
+                return
             offsets = self.pending_req_offsets
             if not offsets:
-                return None
-            query = args[0] if len(args) > 0 else kwargs.get("query")
-            key = args[1] if len(args) > 1 else kwargs.get("key")
-            value = args[2] if len(args) > 2 else kwargs.get("value")
-            if query is None or key is None:
-                return None
+                return
             pos_offsets = self.pending_req_pos_offsets or {}
 
             with torch.no_grad():
@@ -861,6 +882,5 @@ class KVCompressor:
                         position_offset=pos_offsets.get(req, 0),
                     )
                     self.receive_score(req, _idx, score)
-            return None
 
-        return pre_hook
+        return score_qk

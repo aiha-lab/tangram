@@ -37,12 +37,12 @@ from vllm.utils.torch_utils import (
     direct_register_custom_op,
     kv_cache_dtype_str_to_dtype,
 )
-from vllm.v1.attention.backends.head_grouped_layout import (
+from vllm.v1.attention.backends.ragged_layout import (
     member_virtual_block_table,
 )
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
-    HeadGroupedAttentionSpec,
+    RaggedAttentionSpec,
     KVCacheSpec,
     MLAAttentionSpec,
     SlidingWindowSpec,
@@ -362,7 +362,18 @@ class Attention(nn.Module, AttentionLayerBase):
         ):
             self.query_quant = QuantFP8(static=True, group_shape=GroupShape.PER_TENSOR)
 
-        # Head-grouped paging derived sizes. ``page_group_size is None``
+        # Compression scorer delivery (Tangram). Populated by
+        # ``KVCompressor.attach_scorers``: ``compression_qk_scorer`` is
+        # invoked at the top of the ``unified_attention_ragged`` op
+        # body with this layer's token-major query/key/value;
+        # ``compression_gate_capture`` is invoked by the
+        # ``tangram_gate_capture`` op with the outer block's hidden_states.
+        # Plain attributes instead of module forward hooks because
+        # torch.compile skips hooks when inlining module forwards.
+        self.compression_qk_scorer: Callable | None = None
+        self.compression_gate_capture: Callable | None = None
+
+        # Ragged paging derived sizes. ``page_group_size is None``
         # turns the branch in ``forward()`` off and keeps this layer
         # byte-identical to base vLLM.
         self.page_group_size: int | None = None
@@ -390,7 +401,7 @@ class Attention(nn.Module, AttentionLayerBase):
             except (AssertionError, ValueError) as exc:
                 raise ValueError(
                     f"Could not extract a numeric layer index from layer "
-                    f"prefix {prefix!r}; head-grouped paging requires it for "
+                    f"prefix {prefix!r}; ragged paging requires it for "
                     f"per-layer metadata slicing."
                 ) from exc
 
@@ -428,10 +439,30 @@ class Attention(nn.Module, AttentionLayerBase):
             if self.impl.supports_quant_query_input():
                 query, _ = self.query_quant(query, self._q_scale)
 
-        # Head-grouped paging: reshape into group-major + slice per-layer
-        # metadata, then delegate to ``impl.forward``.
+        # Ragged paging: the member-major reshape and the per-layer
+        # metadata selection run inside a dedicated custom op
+        # (``vllm::unified_attention_ragged``). The op is a piecewise
+        # splitting point, so under compilation this attention runs eagerly
+        # between captured CUDA-graph pieces while the rest of the model is
+        # compiled — the traced region here is only the output allocation
+        # and the opaque op call.
         if self.num_groups_per_layer > 0:
-            return self._forward_head_grouped(query, key, value, output_shape)
+            output_shape = output_shape if output_shape is not None else query.shape
+            output = torch.empty(output_shape, dtype=output_dtype, device=query.device)
+            if self.use_direct_call:
+                forward_context = get_forward_context()
+                attn_metadata = forward_context.attn_metadata
+                if isinstance(attn_metadata, dict):
+                    attn_metadata = attn_metadata[self.layer_name]
+                self_kv_cache = self.kv_cache[forward_context.virtual_engine]
+                _ragged_attention_impl(
+                    self, query, key, value, output, attn_metadata, self_kv_cache
+                )
+            else:
+                torch.ops.vllm.unified_attention_ragged(
+                    query, key, value, output, self.layer_name
+                )
+            return output
 
         if self.use_output:
             output_shape = output_shape if output_shape is not None else query.shape
@@ -475,179 +506,6 @@ class Attention(nn.Module, AttentionLayerBase):
                     query, key, value, self.layer_name
                 )
 
-    def _forward_head_grouped(
-        self,
-        query: torch.Tensor,
-        key: torch.Tensor,
-        value: torch.Tensor,
-        output_shape: torch.Size | None,
-    ) -> torch.Tensor:
-        """Head-grouped forward: each (request, KV-head member) is one varlen
-        sequence (column-major paging makes every KV head its own sequence,
-        carrying its GQA group of query heads). Decode uses a single ``.view()``
-        per Q/K/V/O against precomputed per-layer metadata; prefill / mixed
-        batches reshape token-major → member-major to handle varying sequence
-        lengths.
-        """
-        assert self.use_output, (
-            "Head-grouped paging requires backends that accept an output "
-            "buffer (FlashAttention does)."
-        )
-
-        num_groups = self.num_groups_per_layer
-        assert self.page_group_size is not None
-        head_size = self.head_size
-        num_heads = self.num_heads
-        num_kv_heads = self.num_kv_heads
-        # Column-major paging makes each KV head its own varlen sequence (one
-        # member), so a member carries the GQA group's query heads. See
-        # vllm/v1/attention/backends/head_grouped_layout.py.
-        num_query_heads_per_kv = num_heads // num_kv_heads
-
-        forward_context: ForwardContext = get_forward_context()
-        attn_metadata = forward_context.attn_metadata
-        if isinstance(attn_metadata, dict):
-            attn_metadata = attn_metadata[self.layer_name]
-        # Profiling run: no metadata; return a zero output.
-        if attn_metadata is None:
-            shape = output_shape if output_shape is not None else query.shape
-            return torch.zeros(shape, dtype=query.dtype, device=query.device)
-
-        assert (getattr(attn_metadata, "num_head_groups_per_layer", 0)
-                == num_groups), (
-            "FlashAttentionMetadata.num_head_groups_per_layer "
-            f"({getattr(attn_metadata, 'num_head_groups_per_layer', 0)}) "
-            f"does not match layer's num_groups_per_layer ({num_groups}).")
-
-        self_kv_cache = self.kv_cache[forward_context.virtual_engine]
-
-        if attn_metadata.head_grouped_decode_layout:
-            # Uniform-decode fast path: token-major Q/K/V flattens directly
-            # into member-major (one sequence per KV head) because every
-            # (req, member) sequence is one row. Per-layer metadata is
-            # precomputed by the builder, so we avoid the per-layer view/slice
-            # CPU dispatch cost called out in ``FlashAttentionImpl.forward``.
-            num_tokens = query.shape[0]
-            hidden = num_heads * head_size
-            # ``reshape`` (not ``view``) because Q/K/V may be non-contiguous:
-            # models that fuse the QKV projection hand each tensor out as a
-            # ``split`` view, and a tensor with no post-projection op (e.g.
-            # Gemma-3's value, which unlike query/key is not re-materialized by
-            # q/k-norm + RoPE) keeps the fused row stride. Merging the
-            # ``num_tokens`` and ``num_kv_heads`` dims then spans that stride,
-            # which ``view`` rejects. ``reshape`` is a free view when already
-            # contiguous and copies only the non-contiguous case.
-            q_grouped = query.reshape(
-                num_tokens * num_kv_heads, num_query_heads_per_kv, head_size)
-            k_grouped = key.reshape(
-                num_tokens * num_kv_heads, 1, head_size)
-            v_grouped = value.reshape(
-                num_tokens * num_kv_heads, 1, head_size)
-            output_token_major = torch.empty(
-                (num_tokens, hidden), dtype=query.dtype, device=query.device
-            )
-            output_grouped = output_token_major.view(
-                num_tokens * num_kv_heads, num_query_heads_per_kv, head_size)
-            layer_md = attn_metadata.per_layer_md[self.layer_idx]
-            self.impl.forward(
-                self, q_grouped, k_grouped, v_grouped,
-                self_kv_cache, layer_md, output=output_grouped,
-            )
-            if (output_shape is not None
-                    and tuple(output_shape) != (num_tokens, hidden)):
-                return output_token_major.view(output_shape)
-            return output_token_major
-
-        # Member-major path (prefill / mixed batches): a data copy is
-        # required because (req, member) sequences are not contiguous in
-        # any single view of token-major Q/K/V when sequence lengths vary.
-        q_token_major = query.view(-1, num_heads, head_size)
-        k_token_major = key.view(-1, num_kv_heads, head_size)
-        v_token_major = value.view(-1, num_kv_heads, head_size)
-        num_tokens = q_token_major.shape[0]
-
-        cluster_block_table = attn_metadata.cluster_block_table
-        clusters_per_layer = attn_metadata.clusters_per_layer
-        cols_per_layer = attn_metadata.cols_per_layer
-        seq_lens_grouped = attn_metadata.seq_lens_grouped
-        slot_mapping_grouped = attn_metadata.slot_mapping_grouped
-        query_start_loc_grouped = attn_metadata.query_start_loc_grouped
-        assert cluster_block_table is not None
-        assert clusters_per_layer is not None
-        assert cols_per_layer is not None
-        assert seq_lens_grouped is not None
-        assert slot_mapping_grouped is not None
-        assert query_start_loc_grouped is not None
-
-        def to_member_major(
-            x: torch.Tensor, sub_heads: int,
-        ) -> torch.Tensor:
-            # x: [num_tokens, num_kv_heads * sub_heads, head_size] ->
-            # [num_kv_heads * num_tokens, sub_heads, head_size], one KV head
-            # (member) per varlen sequence.
-            return (
-                x.view(num_tokens, num_kv_heads, sub_heads, head_size)
-                .permute(1, 0, 2, 3)
-                .contiguous()
-                .view(num_kv_heads * num_tokens, sub_heads, head_size)
-            )
-
-        q_grouped = to_member_major(q_token_major, num_query_heads_per_kv)
-        k_grouped = to_member_major(k_token_major, 1)
-        v_grouped = to_member_major(v_token_major, 1)
-
-        output_grouped = torch.empty(
-            (num_kv_heads * num_tokens, num_query_heads_per_kv, head_size),
-            dtype=query.dtype,
-            device=query.device,
-        )
-
-        # Slice the per-layer span of the member-major precomputes.
-        layer_start = self.layer_idx * num_kv_heads
-        layer_end = layer_start + num_kv_heads
-
-        num_reqs = seq_lens_grouped.shape[1]
-        # This layer's virtual block table, built on demand: member-major
-        # [num_kv_heads, num_reqs, max_blocks] -> [num_kv_heads * num_reqs,
-        # max_blocks].
-        block_table_layer = member_virtual_block_table(
-            cluster_block_table, clusters_per_layer[self.layer_idx],
-            cols_per_layer[self.layer_idx], attn_metadata.page_group_size,
-            cluster_axis=1,
-        ).permute(1, 0, 2).reshape(num_kv_heads * num_reqs, -1)
-        seq_lens_layer = seq_lens_grouped[layer_start:layer_end].reshape(
-            num_kv_heads * num_reqs)
-        slot_mapping_layer = slot_mapping_grouped[
-            layer_start:layer_end].reshape(-1)
-
-        layer_md = dataclass_replace(
-            attn_metadata,
-            num_actual_tokens=num_kv_heads * num_tokens,
-            block_table=block_table_layer,
-            seq_lens=seq_lens_layer,
-            slot_mapping=slot_mapping_layer,
-            query_start_loc=query_start_loc_grouped,
-        )
-
-        self.impl.forward(
-            self, q_grouped, k_grouped, v_grouped,
-            self_kv_cache, layer_md, output=output_grouped,
-        )
-
-        # Inverse reshape: member-major → token-major hidden.
-        output_token_major = (
-            output_grouped.view(
-                num_kv_heads, num_tokens,
-                num_query_heads_per_kv, head_size)
-            .permute(1, 0, 2, 3)
-            .contiguous()
-            .view(num_tokens, num_heads * head_size)
-        )
-        if (output_shape is not None
-                and tuple(output_shape) != tuple(output_token_major.shape)):
-            output_token_major = output_token_major.view(output_shape)
-        return output_token_major
-
     def calc_kv_scales(self, query, key, value):
         self._q_scale.copy_(torch.abs(query).max() / self.q_range)
         self._k_scale.copy_(torch.abs(key).max() / self.k_range)
@@ -679,11 +537,12 @@ class Attention(nn.Module, AttentionLayerBase):
         assert self.attn_type == AttentionType.DECODER
         page_group_size = vllm_config.cache_config.page_group_size
         if page_group_size is not None:
-            assert not vllm_config.model_config.use_mla, (
-                "MLA is not compatible with head-grouped paging "
-                "(page_group_size); these features are mutually exclusive."
-            )
-            return HeadGroupedAttentionSpec(
+            if vllm_config.model_config.use_mla:
+                raise ValueError(
+                    "MLA is not compatible with ragged paging "
+                    "(page_group_size); these features are mutually "
+                    "exclusive.")
+            return RaggedAttentionSpec(
                 block_size=block_size,
                 num_kv_heads=self.num_kv_heads,
                 head_size=self.head_size,
@@ -1203,6 +1062,285 @@ direct_register_custom_op(
     op_func=unified_attention_with_output,
     mutates_args=["output", "output_block_scale"],
     fake_impl=unified_attention_with_output_fake,
+)
+
+
+def _ragged_attention_impl(
+    layer: Attention,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    output: torch.Tensor,
+    attn_metadata,
+    kv_cache: torch.Tensor,
+) -> None:
+    """Ragged attention body, writing into ``output`` in place.
+
+    Each (request, KV-head member) is one varlen sequence: column-major paging
+    makes every KV head its own sequence, carrying its GQA group of query
+    heads (see vllm/v1/attention/backends/ragged_layout.py). Decode uses
+    a single reshape per Q/K/V/O against precomputed per-layer metadata;
+    prefill / mixed batches copy token-major → member-major to handle varying
+    sequence lengths.
+
+    This body always executes eagerly: under piecewise compilation the
+    wrapping custom op (``vllm::unified_attention_ragged``) is a
+    splitting point, so it runs between captured CUDA-graph pieces. Inputs may
+    therefore be padded to a CUDA-graph capture size — every path below slices
+    Q/K/V to ``attn_metadata.num_actual_tokens`` first and writes only the
+    first ``num_actual_tokens`` rows of ``output``. Padded output rows keep
+    whatever ``torch.empty`` produced; the runner discards them, exactly as it
+    does for the standard attention path.
+    """
+    assert layer.use_output, (
+        "Ragged paging requires backends that accept an output "
+        "buffer (FlashAttention does)."
+    )
+
+    # Compression scoring (Tangram): query/key scorers run here — inside the
+    # eager splitting op, on the same unreshaped token-major tensors the
+    # replaced module pre-hook used to see — because torch.compile skips
+    # pre-hooks when inlining module forwards. Request offsets are unpadded,
+    # so scorer slices never touch capture-size padding rows. No-op unless
+    # the runner marked this step compression-active.
+    if layer.compression_qk_scorer is not None:
+        layer.compression_qk_scorer(query, key, value)
+
+    num_groups = layer.num_groups_per_layer
+    assert layer.page_group_size is not None
+    head_size = layer.head_size
+    num_heads = layer.num_heads
+    num_kv_heads = layer.num_kv_heads
+    # Column-major paging makes each KV head its own varlen sequence (one
+    # member), so a member carries the GQA group's query heads.
+    num_query_heads_per_kv = num_heads // num_kv_heads
+    hidden = num_heads * head_size
+
+    # Profiling and compilation dummy runs carry no metadata; zero the output
+    # so downstream layers see finite values.
+    if attn_metadata is None:
+        output.fill_(0)
+        return
+
+    assert (getattr(attn_metadata, "num_head_groups_per_layer", 0)
+            == num_groups), (
+        "FlashAttentionMetadata.num_head_groups_per_layer "
+        f"({getattr(attn_metadata, 'num_head_groups_per_layer', 0)}) "
+        f"does not match layer's num_groups_per_layer ({num_groups}).")
+
+    # Actual (unpadded) token count. Slicing before the member-major
+    # reshapes both keeps the layout math correct under padding and bounds
+    # the cost of the non-contiguous copies to real tokens.
+    num_actual = attn_metadata.num_actual_tokens
+    output_2d = output.view(-1, hidden)
+
+    if attn_metadata.ragged_decode_layout:
+        _ragged_decode_forward(
+            layer, query, key, value, output_2d, kv_cache, attn_metadata,
+            num_actual=num_actual, num_kv_heads=num_kv_heads,
+            num_query_heads_per_kv=num_query_heads_per_kv, head_size=head_size,
+        )
+        return
+
+    _ragged_member_major_forward(
+        layer, query, key, value, output_2d, kv_cache, attn_metadata,
+        num_actual=num_actual, num_heads=num_heads, num_kv_heads=num_kv_heads,
+        num_query_heads_per_kv=num_query_heads_per_kv, head_size=head_size,
+    )
+
+
+def _ragged_decode_forward(
+    layer: Attention,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    output_2d: torch.Tensor,
+    kv_cache: torch.Tensor,
+    attn_metadata,
+    *,
+    num_actual: int,
+    num_kv_heads: int,
+    num_query_heads_per_kv: int,
+    head_size: int,
+) -> None:
+    """Uniform-decode ragged path: one query token per (request, KV-head).
+
+    Token-major Q/K/V flattens directly into member-major (one sequence per KV
+    head) because every (req, member) sequence is a single row. Per-layer
+    metadata is precomputed by the builder, so this avoids the per-layer
+    view/slice CPU dispatch cost called out in ``FlashAttentionImpl.forward``.
+    Writes into ``output_2d`` in place.
+
+    ``reshape`` (not ``view``) because Q/K/V may be non-contiguous: models that
+    fuse the QKV projection hand each tensor out as a ``split`` view, and a
+    tensor with no post-projection op (e.g. Gemma-3's value, which unlike
+    query/key is not re-materialized by q/k-norm + RoPE) keeps the fused row
+    stride. Merging the token and ``num_kv_heads`` dims then spans that stride,
+    which ``view`` rejects. ``reshape`` is a free view when already contiguous
+    and copies only the non-contiguous case.
+    """
+    q_grouped = query[:num_actual].reshape(
+        num_actual * num_kv_heads, num_query_heads_per_kv, head_size)
+    k_grouped = key[:num_actual].reshape(
+        num_actual * num_kv_heads, 1, head_size)
+    v_grouped = value[:num_actual].reshape(
+        num_actual * num_kv_heads, 1, head_size)
+    output_grouped = output_2d[:num_actual].view(
+        num_actual * num_kv_heads, num_query_heads_per_kv, head_size)
+    layer_md = attn_metadata.per_layer_md[layer.layer_idx]
+    layer.impl.forward(
+        layer, q_grouped, k_grouped, v_grouped,
+        kv_cache, layer_md, output=output_grouped,
+    )
+
+
+def _ragged_member_major_forward(
+    layer: Attention,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    output_2d: torch.Tensor,
+    kv_cache: torch.Tensor,
+    attn_metadata,
+    *,
+    num_actual: int,
+    num_heads: int,
+    num_kv_heads: int,
+    num_query_heads_per_kv: int,
+    head_size: int,
+) -> None:
+    """Member-major ragged path (prefill / mixed batches).
+
+    A data copy to member-major is required because (req, member) sequences are
+    not contiguous in any single view of token-major Q/K/V when sequence
+    lengths vary. Builds this layer's virtual block table on demand, runs the
+    attention, then writes the inverse (member-major -> token-major) reshape
+    straight into ``output_2d`` in place.
+    """
+    q_token_major = query[:num_actual].view(-1, num_heads, head_size)
+    k_token_major = key[:num_actual].view(-1, num_kv_heads, head_size)
+    v_token_major = value[:num_actual].view(-1, num_kv_heads, head_size)
+
+    cluster_block_table = attn_metadata.cluster_block_table
+    clusters_per_layer = attn_metadata.clusters_per_layer
+    cols_per_layer = attn_metadata.cols_per_layer
+    seq_lens_grouped = attn_metadata.seq_lens_grouped
+    slot_mapping_grouped = attn_metadata.slot_mapping_grouped
+    query_start_loc_grouped = attn_metadata.query_start_loc_grouped
+    assert cluster_block_table is not None
+    assert clusters_per_layer is not None
+    assert cols_per_layer is not None
+    assert seq_lens_grouped is not None
+    assert slot_mapping_grouped is not None
+    assert query_start_loc_grouped is not None
+
+    def to_member_major(
+        x: torch.Tensor, sub_heads: int,
+    ) -> torch.Tensor:
+        # x: [num_actual, num_kv_heads * sub_heads, head_size] ->
+        # [num_kv_heads * num_actual, sub_heads, head_size], one KV head
+        # (member) per varlen sequence.
+        return (
+            x.view(num_actual, num_kv_heads, sub_heads, head_size)
+            .permute(1, 0, 2, 3)
+            .contiguous()
+            .view(num_kv_heads * num_actual, sub_heads, head_size)
+        )
+
+    q_grouped = to_member_major(q_token_major, num_query_heads_per_kv)
+    k_grouped = to_member_major(k_token_major, 1)
+    v_grouped = to_member_major(v_token_major, 1)
+
+    output_grouped = torch.empty(
+        (num_kv_heads * num_actual, num_query_heads_per_kv, head_size),
+        dtype=query.dtype,
+        device=query.device,
+    )
+
+    # Slice the per-layer span of the member-major precomputes.
+    layer_start = layer.layer_idx * num_kv_heads
+    layer_end = layer_start + num_kv_heads
+
+    num_reqs = seq_lens_grouped.shape[1]
+    # This layer's virtual block table, built on demand: member-major
+    # [num_kv_heads, num_reqs, max_blocks] -> [num_kv_heads * num_reqs,
+    # max_blocks].
+    block_table_layer = member_virtual_block_table(
+        cluster_block_table, clusters_per_layer[layer.layer_idx],
+        cols_per_layer[layer.layer_idx], attn_metadata.page_group_size,
+        cluster_axis=1,
+    ).permute(1, 0, 2).reshape(num_kv_heads * num_reqs, -1)
+    seq_lens_layer = seq_lens_grouped[layer_start:layer_end].reshape(
+        num_kv_heads * num_reqs)
+    slot_mapping_layer = slot_mapping_grouped[
+        layer_start:layer_end].reshape(-1)
+
+    layer_md = dataclass_replace(
+        attn_metadata,
+        num_actual_tokens=num_kv_heads * num_actual,
+        block_table=block_table_layer,
+        seq_lens=seq_lens_layer,
+        slot_mapping=slot_mapping_layer,
+        query_start_loc=query_start_loc_grouped,
+    )
+
+    layer.impl.forward(
+        layer, q_grouped, k_grouped, v_grouped,
+        kv_cache, layer_md, output=output_grouped,
+    )
+
+    # Inverse reshape member-major → token-major, written straight into the
+    # caller's output buffer. The ``copy_`` is the single materializing copy
+    # on this path, replacing the ``.contiguous()`` the pre-custom-op code
+    # used before returning a fresh tensor.
+    output_2d[:num_actual].view(
+        num_actual, num_kv_heads, num_query_heads_per_kv, head_size,
+    ).copy_(
+        output_grouped.view(
+            num_kv_heads, num_actual, num_query_heads_per_kv, head_size,
+        ).permute(1, 0, 2, 3)
+    )
+
+
+@maybe_transfer_kv_layer
+def unified_attention_ragged(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    output: torch.Tensor,
+    layer_name: str,
+) -> None:
+    """Ragged attention as a custom op, writing into ``output``.
+
+    INVARIANT: this op must remain in ``CompilationConfig._attention_ops``
+    (piecewise splitting ops). Its body runs Python that only exists at op
+    execution time — per-layer metadata selection, and the compression scorer
+    once one is installed. A splitting op executes eagerly between CUDA-graph
+    pieces on every step; if the op were ever captured inside a graph instead,
+    that Python would run at capture time only and be silently skipped on
+    every replay.
+    """
+    attn_metadata, self, kv_cache = get_attention_context(layer_name)
+    _ragged_attention_impl(
+        self, query, key, value, output, attn_metadata, kv_cache
+    )
+
+
+def unified_attention_ragged_fake(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    output: torch.Tensor,
+    layer_name: str,
+) -> None:
+    return
+
+
+direct_register_custom_op(
+    op_name="unified_attention_ragged",
+    op_func=unified_attention_ragged,
+    mutates_args=["output"],
+    fake_impl=unified_attention_ragged_fake,
 )
 
 
