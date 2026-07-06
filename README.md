@@ -67,10 +67,19 @@ print(out[0].outputs[0].text)
 - `perlayer_cluster` — non-uniform; each layer gets an equal KV budget, distributed non-uniformly across the heads within that layer.
 - `uniform` — every attention head keeps the same number of tokens (`ratio × seq_len`); only *which* tokens are kept differs per head.
 
-**Supported scorers** — SnapKV ([paper](https://arxiv.org/abs/2404.14469)),
-KeyDiff ([paper](https://arxiv.org/abs/2504.15364)),
-ExpectedAttention ([paper](https://arxiv.org/abs/2510.00636)),
-FastKVzip ([paper](https://arxiv.org/abs/2601.17668))
+## Supported Compression
+
+**✅ Supported**
+
+- SnapKV ([paper](https://arxiv.org/abs/2404.14469))
+- KeyDiff ([paper](https://arxiv.org/abs/2504.15364))
+- ExpectedAttention ([paper](https://arxiv.org/abs/2510.00636))
+- FastKVzip ([paper](https://arxiv.org/abs/2601.17668))
+
+**🚧 WIP**
+
+- TOVA
+- PyramidKV
 
 ## Accuracy
 
