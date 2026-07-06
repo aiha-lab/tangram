@@ -187,33 +187,13 @@ cd benchmarks/tangram/speedup
 ./run_speedup.sh
 ```
 
----
-
-## Known Issues
-
-**Decode-heavy workloads can stall under KV-cache saturation.** KV-cache
-admission control (`scheduler_reserve_full_isl`, on by default) reserves blocks
-for a request's full *input* length at admission time, but not for the tokens it
-will *generate*. When the output length is large and many requests run
-concurrently, the generated KV grows past the cache pool and the engine can
-livelock (generation throughput drops to zero, no forward progress) instead of
-preempting to recover — unlike upstream vLLM, which preempts.
-
-Example that triggers it: `num_prompts=64`, `input_len=4096`, `output_len=4096`
-on a single 48&nbsp;GB GPU (Qwen3-4B), where the KV pool holds only ~29 requests
-at the 8192-token peak. Until this is fixed (reserve output length at admission,
-or fall back to preemption on running-set exhaustion), cap concurrency with
-`max_num_seqs` so the running set fits the pool, or lower `output_len`.
-
----
-
 ## Citation
 
 If you use Tangram for your research, please cite our [paper](https://arxiv.org/abs/2606.06302):
 
 ```
 @misc{kim2026tangramunlockingnonuniformkv,
-      title={Tangram: Unlocking Non-Uniform KV Cache for Efficient Multi-turn LLM Serving}, 
+      title={Tangram: Unlocking Non-Uniform KV Cache Compression for Efficient Multi-turn LLM Serving}, 
       author={Hyungmin Kim and Minsoo Kim and Hongseok Kim and Jungwook Choi},
       year={2026},
       eprint={2606.06302},
