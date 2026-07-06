@@ -278,6 +278,29 @@ class Request:
         self._output_token_ids.clear()
         self.num_prompt_tokens = len(self.prompt_token_ids)
 
+    def reset_for_compression_preempt(self) -> None:
+        """Rewind request state after preemption discards the KV cache under
+        once-only compression.
+
+        The resumed prefill must run as a fresh first compression cycle, so
+        the compression bookkeeping is cleared and the already-sampled output
+        tokens are folded into the prompt for reattention. The output budget
+        (``max_tokens`` / ``min_tokens``) is reduced by the folded token count
+        so that ``num_prompt_tokens + max_tokens`` stays constant across
+        preemptions; without this, repeated preemption would grow that sum
+        past ``max_model_len``, leaving the request permanently unschedulable
+        yet unfinished (engine livelock).
+        """
+        self.compression_done = False
+        self.compress_max_eff_seq_len = None
+        num_absorbed = self.num_output_tokens
+        self.absorb_output_into_prompt()
+        self.max_tokens = max(1, self.max_tokens - num_absorbed)
+        if self.sampling_params is not None:
+            self.sampling_params.min_tokens = max(
+                0, self.sampling_params.min_tokens - num_absorbed
+            )
+
     def advance_to_next_turn(self) -> bool:
         """Multi-turn auto-advance. Called from ``check_stop`` when the
         current turn's stop conditions fire.

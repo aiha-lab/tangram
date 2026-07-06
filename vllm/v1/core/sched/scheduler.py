@@ -381,15 +381,10 @@ class Scheduler(SchedulerInterface):
                     preempted_req.status = RequestStatus.PREEMPTED
                     preempted_req.num_computed_tokens = 0
                     preempted_req.num_preemptions += 1
-                    # Preempt under once-only compression: the cache is
-                    # gone, so the resumed prefill must run as the first
-                    # cycle again. Reset compression bookkeeping and absorb
-                    # already-sampled output tokens into the prompt so the
-                    # resumed cycle reattends them.
                     if self.cache_config.compression_enabled:
-                        preempted_req.compression_done = False
-                        preempted_req.compress_max_eff_seq_len = None
-                        preempted_req.absorb_output_into_prompt()
+                        # Once-only compression: the discarded cache forces the
+                        # resumed prefill to run as a fresh first cycle.
+                        preempted_req.reset_for_compression_preempt()
                     if self.log_stats:
                         preempted_req.record_event(
                             EngineCoreEventType.PREEMPTED, scheduled_timestamp
