@@ -187,3 +187,8 @@ If you use Tangram for your research, please cite our [paper](https://arxiv.org/
       url={https://arxiv.org/abs/2606.06302}, 
 }
 ```
+
+## Acknowledgements
+
+Tangram project is built on top of [vLLM](https://github.com/vllm-project/vllm), and its
+compression scorer implementations are adapted from [NVIDIA/kvpress](https://github.com/NVIDIA/kvpress).
