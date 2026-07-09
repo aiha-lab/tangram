@@ -81,6 +81,20 @@ print(out[0].outputs[0].text)
 - TOVA
 - PyramidKV
 
+## Supported Models
+
+The following models have been verified with Tangram. More models are on the way.
+
+| Model | Checkpoint |
+| ----- | ---------- |
+| Qwen3 4B | [`Qwen/Qwen3-4B-Instruct-2507`](https://huggingface.co/Qwen/Qwen3-4B-Instruct-2507) |
+| Llama 3.1 8B | [`meta-llama/Llama-3.1-8B-Instruct`](https://huggingface.co/meta-llama/Llama-3.1-8B-Instruct) |
+| Gemma 3 12B | [`google/gemma-3-12b-it`](https://huggingface.co/google/gemma-3-12b-it) |
+| GPT-OSS 20B | [`openai/gpt-oss-20b`](https://huggingface.co/openai/gpt-oss-20b) |
+| Qwen3 30B (MoE)&nbsp;* | [`Qwen/Qwen3-30B-A3B-Instruct-2507`](https://huggingface.co/Qwen/Qwen3-30B-A3B-Instruct-2507) |
+
+\* Verified with `tensor_parallel_size=2`.
+
 ## Accuracy
 
 [RULER](https://arxiv.org/abs/2404.06654) 8K
