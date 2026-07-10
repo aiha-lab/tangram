@@ -8,10 +8,6 @@ Tangram: Unlocking Non-Uniform KV Cache Compression for Efficient Multi-turn LLM
 </h3>
 
 <p align="center">
-| <a href="https://aiha-lab.github.io/tangram-page/"><b>Project Page</b></a> | <a href="https://arxiv.org/abs/2606.06302"><b>Paper</b></a> |
-</p>
-
-<p align="center">
   <a href="https://arxiv.org/abs/2606.06302">
     <img src="https://img.shields.io/badge/arXiv-2606.06302-b31b1b.svg?logo=arxiv&logoColor=white" alt="arXiv"/>
   </a>
