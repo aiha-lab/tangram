@@ -8,7 +8,16 @@ Tangram: Unlocking Non-Uniform KV Cache Compression for Efficient Multi-turn LLM
 </h3>
 
 <p align="center">
-| <a href="https://aiha-lab.github.io/tangram-page/"><b>Project Page</b></a> | <a href="https://aiha-lab.github.io/tangram-page/#"><b>Paper</b></a> |
+| <a href="https://aiha-lab.github.io/tangram-page/"><b>Project Page</b></a> | <a href="https://arxiv.org/abs/2606.06302"><b>Paper</b></a> |
+</p>
+
+<p align="center">
+  <a href="https://arxiv.org/abs/2606.06302">
+    <img src="https://img.shields.io/badge/arXiv-2606.06302-b31b1b.svg?logo=arxiv&logoColor=white" alt="arXiv"/>
+  </a>
+  <a href="https://aiha-lab.github.io/tangram-page/">
+    <img src="https://img.shields.io/badge/Project%20Page-tangram-blue.svg?logo=data%3Aimage%2Fpng%3Bbase64%2CiVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAADEUlEQVR42u2WMW8cVRSFv%2FNmdjZxImw2TiiBIJTYDULiZ1AjQMgFpLFkiIJNYUEFiryJQAKRin%2FBT6BBSgEUIMcGCiiQgKy9M1kH27uedyhmbS%2FB9jraoFD4jkYz0tx599xz7r3vwYmd2GM2DXPwMXyGBPB%2FjXGkX4e5yPDEL0%2B%2FIMiZOMQphwO%2Frf866Yv%2B5p50OAvpIcQrIJ%2B75TOLXy7dXvrp8%2FPtMBYByd5fTZVGE4PrS9h2uhnCU%2B%2F%2F3AJeAjo2OghIehiyCDS%2BXVHz8rvna9lY48Pvr3M%2Fe5LgyKCs6gfFJkpIpsxTzl67C28U4nZDsM5DMlDZKmskvQvdjy5ddbe35ebKJ8prE8imSqYKXL1WoGIRyOb%2BNFcKxVbohcb6kRofCYBTzzsa1XobujG9gELQ0p2PKdJxICJ7nwZB7AROza2RvVVAISEPLcNwnGIugVo3pzm1wOLUAuM7OVEBoypzQdxIyGbWqL%2Faxh1VKx%2BjC44FwIhSgXS7TfPyPItT7zHRzYkSUaLcCNRmWtRfbxN%2FS4gdcF%2BdYZYOb1TtTZNSgVovpzm9ABJLyzf5a3uCbOYu6Ws5dAS1SHIfqJnk9KMAsFtkrvjaiSLdatOcmid2xfyLH%2BBXStSuQ4gQq1%2BSexC3IDnXGwHA1rqoX%2FhHzxtRAkm3zc1L1%2FjimYTQugXb4yAQJjoSsoBzW3%2BMGb4%2BtByGMDC5J8GgIkZEQ1BB%2Ft1V2K7BdAVCclW2DoBxZ0cjFGFrf%2BYMDjsE%2FS7Q6RytzJIsz1HLclKbFJHGSOJy1C6Y3M9eD7TV4DyuF8TVWcqVOZwV%2FbLRI%2BqCg%2FYs%2BQFmBFmB78xWQ%2FHyZxAb4HjkGD6eBMI4GttE2%2F0nHryry1nucnnWcfltK2sbEaExCgOTYDKSeiWAtDvyD2RJGMY2iT%2B%2BI%2BoZeu7TjI1nRwDQ3Ymuh9%2B10y0de8b8a0f1buC%2BTMaQrjv%2BcCWErc0WL1%2F3Xg8%2F%2FIHE4s3WWc5o329X0saQstkuxFcXI6vaYPRj2WM8lFbbykgh%2Fr%2FZn9iJAfwNA5Fiz3oR1tsAAAAASUVORK5CYII%3D&logoColor=white" alt="Project Page"/>
+  </a>
 </p>
 
 <p align="center">
