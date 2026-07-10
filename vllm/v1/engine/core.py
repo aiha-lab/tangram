@@ -62,6 +62,7 @@ from vllm.v1.metrics.stats import SchedulerStats
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
 from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
+from vllm.banner import print_banner
 from vllm.v1.structured_output import StructuredOutputManager
 from vllm.version import __version__ as VLLM_VERSION
 
@@ -90,6 +91,7 @@ class EngineCore:
 
         self.vllm_config = vllm_config
         if vllm_config.parallel_config.data_parallel_rank == 0:
+            print_banner()
             logger.info(
                 "Initializing a V1 LLM engine (v%s) with config: %s",
                 VLLM_VERSION,
