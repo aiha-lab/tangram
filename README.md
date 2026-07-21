@@ -49,7 +49,7 @@ from vllm import LLM, SamplingParams
 llm = LLM(
     model="Qwen/Qwen3-4B-Instruct-2507",
     compression_ratio=0.5,                  # keep 50% of the KV cache (1.0 = no compression)
-    compression_scorer="snapkv",            # snapkv | keydiff | expected_attention | fastkvzip
+    compression_scorer="snapkv",            # snapkv | keydiff | tova | expected_attention | fastkvzip
     compression_level="crosslayer_cluster", # crosslayer_cluster | perlayer_cluster | uniform
 )
 
@@ -62,29 +62,23 @@ print(out[0].outputs[0].text)
 | Config | Description |
 | ------ | ----------- |
 | `compression_ratio` | KV retention fraction; `1.0` = FullKV (no compression). |
-| `compression_scorer` | Importance scorer: `snapkv` \| `keydiff` \| `expected_attention` \| `fastkvzip`. |
+| `compression_scorer` | Importance scorer: `snapkv` \| `keydiff` \| `tova` \| `expected_attention` \| `fastkvzip`. |
 | `compression_level` | KV-budget scope — see below. |
 | `page_group_size` | Heads per page (H<sub>p</sub>): attention heads managed together in one KV-cache page; they share one paged budget. |
 
 **`compression_level` options**
 
-- `crosslayer_cluster` — non-uniform; a single global KV budget is distributed across all layers and heads, so important heads in any layer can keep more tokens.
+- `crosslayer_cluster` — non-uniform; a single global KV budget is distributed across all layers and heads, so important heads in any layer can keep more tokens (like [PyramidKV](https://arxiv.org/abs/2406.02069)).
 - `perlayer_cluster` — non-uniform; each layer gets an equal KV budget, distributed non-uniformly across the heads within that layer.
 - `uniform` — every attention head keeps the same number of tokens (`ratio × seq_len`); only *which* tokens are kept differs per head.
 
 ## Supported Compression
 
-**✅ Supported**
-
-- SnapKV ([paper](https://arxiv.org/abs/2404.14469))
-- KeyDiff ([paper](https://arxiv.org/abs/2504.15364))
-- ExpectedAttention ([paper](https://arxiv.org/abs/2510.00636))
-- FastKVzip ([paper](https://arxiv.org/abs/2601.17668))
-
-**🚧 WIP**
-
-- TOVA
-- PyramidKV
+- SnapKV ([source](vllm/v1/attention/compression/snapkv.py), [paper](https://arxiv.org/abs/2404.14469))
+- KeyDiff ([source](vllm/v1/attention/compression/keydiff.py), [paper](https://arxiv.org/abs/2504.15364))
+- TOVA ([source](vllm/v1/attention/compression/tova.py), [paper](https://arxiv.org/abs/2401.06104))
+- ExpectedAttention ([source](vllm/v1/attention/compression/expected_attention.py), [paper](https://arxiv.org/abs/2510.00636))
+- FastKVzip ([source](vllm/v1/attention/compression/gate.py), [paper](https://arxiv.org/abs/2601.17668))
 
 ## Supported Models
 
@@ -144,20 +138,22 @@ The following models have been verified with Tangram. More models are on the way
 <th rowspan="2">FullKV</th>
 <th colspan="4">SnapKV</th>
 <th colspan="4">KeyDiff</th>
+<th colspan="4">TOVA</th>
 <th colspan="4">ExpectedAttention</th>
 </tr>
 <tr>
 <th>75%</th><th>50%</th><th>25%</th><th>10%</th>
 <th>75%</th><th>50%</th><th>25%</th><th>10%</th>
 <th>75%</th><th>50%</th><th>25%</th><th>10%</th>
+<th>75%</th><th>50%</th><th>25%</th><th>10%</th>
 </tr>
 </thead>
 <tbody>
-<tr><td>qwen3-4b</td><td>93.7</td><td>85.0</td><td>77.0</td><td>68.8</td><td>59.0</td><td>89.8</td><td>80.2</td><td>70.9</td><td>55.1</td><td>77.3</td><td>50.5</td><td>28.4</td><td>15.6</td></tr>
-<tr><td>llama3.1-8b</td><td>93.1</td><td>89.0</td><td>84.2</td><td>71.2</td><td>56.0</td><td>87.8</td><td>83.2</td><td>76.1</td><td>67.7</td><td>79.3</td><td>61.4</td><td>40.3</td><td>21.0</td></tr>
-<tr><td>gemma3-12b</td><td>91.7</td><td>76.2</td><td>66.5</td><td>58.7</td><td>51.7</td><td>86.9</td><td>80.3</td><td>71.2</td><td>50.3</td><td>63.7</td><td>46.1</td><td>29.2</td><td>21.4</td></tr>
-<tr><td>gptoss-20b</td><td>83.7</td><td>81.9</td><td>77.0</td><td>66.2</td><td>53.2</td><td>79.1</td><td>71.0</td><td>57.0</td><td>33.8</td><td>74.8</td><td>48.9</td><td>25.9</td><td>13.4</td></tr>
-<tr><td>qwen3-30b</td><td>95.3</td><td>87.5</td><td>80.7</td><td>74.3</td><td>64.7</td><td>88.7</td><td>82.0</td><td>74.4</td><td>66.9</td><td>60.6</td><td>40.5</td><td>29.0</td><td>18.5</td></tr>
+<tr><td>qwen3-4b</td><td>93.7</td><td>85.0</td><td>77.0</td><td>68.8</td><td>59.0</td><td>89.8</td><td>80.2</td><td>70.9</td><td>55.1</td><td>83.5</td><td>77.4</td><td>73.2</td><td>66.2</td><td>77.3</td><td>50.5</td><td>28.4</td><td>15.6</td></tr>
+<tr><td>llama3.1-8b</td><td>93.1</td><td>89.0</td><td>84.2</td><td>71.2</td><td>56.0</td><td>87.8</td><td>83.2</td><td>76.1</td><td>67.7</td><td>90.2</td><td>86.4</td><td>72.8</td><td>64.4</td><td>79.3</td><td>61.4</td><td>40.3</td><td>21.0</td></tr>
+<tr><td>gemma3-12b</td><td>91.7</td><td>76.2</td><td>66.5</td><td>58.7</td><td>51.7</td><td>86.9</td><td>80.3</td><td>71.2</td><td>50.3</td><td>72.0</td><td>63.6</td><td>54.9</td><td>43.5</td><td>63.7</td><td>46.1</td><td>29.2</td><td>21.4</td></tr>
+<tr><td>gptoss-20b</td><td>83.7</td><td>81.9</td><td>77.0</td><td>66.2</td><td>53.2</td><td>79.1</td><td>71.0</td><td>57.0</td><td>33.8</td><td>80.6</td><td>72.5</td><td>62.8</td><td>49.0</td><td>74.8</td><td>48.9</td><td>25.9</td><td>13.4</td></tr>
+<tr><td>qwen3-30b</td><td>95.3</td><td>87.5</td><td>80.7</td><td>74.3</td><td>64.7</td><td>88.7</td><td>82.0</td><td>74.4</td><td>66.9</td><td>–</td><td>–</td><td>–</td><td>–</td><td>60.6</td><td>40.5</td><td>29.0</td><td>18.5</td></tr>
 </tbody>
 </table>
 
@@ -177,7 +173,7 @@ SCORER=snapkv LEVEL=crosslayer_cluster RATIOS=0.5 LENGTHS=8192 \
 bash benchmark_ruler.sh
 ```
 
-- `SCORER` — `snapkv` | `keydiff` | `expected_attention`
+- `SCORER` — `snapkv` | `keydiff` | `tova` | `expected_attention`
 - `RATIOS` — KV retention fraction (`1.0` = FullKV reference)
 - `LEVEL` — selection level; see [Configuration](#configuration)
 
