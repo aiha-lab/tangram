@@ -2,9 +2,15 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Keep-decision logic for KV cache compression.
 
-Owns the per-request score buffers and the keep decision. The per-(layer,
-group) kept COUNT is delegated to a pluggable selection level (axis 1; see
-selection_level.py) — non-uniform global threshold (default) or uniform count.
+Owns the keep decision and delegates every policy choice to one of three
+orthogonal, pluggable axes:
+
+* axis 1 — selection level (``selection_level.py``): eval scores -> per-(layer,
+  group) kept COUNT;
+* axis 2 — scorer (``scorer.py`` / ``gate.py``): what a position's score means;
+* axis 3 — eviction regime (``eviction_regime.py``): which positions may be
+  evicted, how much survives, and how long a score lives.
+
 KV writes and block-table updates live in the FlashAttention backend.
 """
 from __future__ import annotations
@@ -22,6 +28,12 @@ from vllm.v1.attention.backends.ragged_layout import (
     identity_member_maps,
     load_cluster_map,
     member_maps_from_cluster_map,
+)
+from vllm.v1.attention.compression.eviction_regime import (
+    ChunkParams,
+    EvictionRegime,
+    RegimeScoreStore,
+    make_eviction_regime,
 )
 from vllm.v1.attention.compression.gate import CompressionGate, load_gates
 from vllm.v1.attention.compression.gate_capture import (
@@ -69,29 +81,34 @@ class KeepDecisionObserver(Protocol):
 
 @dataclass
 class KeepDecision:
-    """Per-chunk sink / window / ratio geometry the executor consumes.
+    """Per-chunk geometry the executor consumes, in cache-slot coordinates.
 
-    The eval region is the workspace slice ``[eval_start, eval_end)``;
-    sink / locked / window positions outside it are auto-kept. The kept COUNT
-    and POSITION live in the per-(layer, group) caches (``cached_k_new_cpu`` /
+    The eval region of a (layer, group) is the ``eval_len`` slots starting at
+    ``sink_size + locked``; the sink, the locked prefix and the trailing
+    ``tail_size`` slots are kept regardless of score. The kept COUNT and
+    POSITION live in the per-(layer, group) caches (``cached_k_new_cpu`` /
     ``cached_sorted_indices``), not here — the level-specific threshold is an
     internal of ``SelectionLevel`` and never reaches downstream consumers.
     """
     sink_size: int
-    win_size: int
+    #: Trailing always-kept slots: the recent window under the ratio regime,
+    #: the whole fresh chunk under the budget regime (unless the fresh chunk is
+    #: configured to be evictable).
+    tail_size: int
     adjusted_ratio: float
-    eval_start: int = 0
-    eval_end: int = 0
+    eval_len: int = 0
+    #: Per-(layer, group) hard cap on the post-evict kept length, or ``None``
+    #: when the regime sets no absolute cap (the ratio regime).
+    budget_tokens: int | None = None
 
 
 @dataclass
 class _LayerCompressState:
-    # [num_kv_heads, win_size]: window-region scores from the previous chunk.
-    prior_window_scores: torch.Tensor | None = None
     # [G]: tokens already promoted to "kept" by prior compress steps.
+    # Always zero under the budget regime, which has no lock-in.
     locked_count_per_group: torch.Tensor | None = None
     # [G]: kept length after the most recent compress
-    # (= sink + locked + win, clamped to total_seen).
+    # (= sink + locked + tail, clamped to total_seen).
     valid_lengths_per_group: torch.Tensor | None = None
     # [num_kv_heads, accumulated_len]: gate scores accumulated across this
     # chunk's (possibly budget-sliced) sub-chunks; consumed at the boundary
@@ -103,15 +120,19 @@ class _LayerCompressState:
 class _RequestCompressState:
     layer_states: dict[int, _LayerCompressState] = field(default_factory=dict)
     cross_layer_decision: KeepDecision | None = None
-    # [L, num_kv_heads, win + chunk]: grow-only workspace
-    # laid out as [prior_window | pending_score].
-    score_workspace: torch.Tensor | None = None
-    workspace_size: int = 0
+    # Score memory owned by the active eviction regime (axis 3): a chunk-local
+    # workspace under the ratio regime, a slot-aligned persistent statistics
+    # buffer under the budget regime. Created lazily on the first chunk.
+    score_store: RegimeScoreStore | None = None
     # [L, G, page_group_size, eval_len]: each KV head's own descending score
     # ranking, placed at its (cluster, column). Rebuilt each chunk.
     cached_sorted_indices: torch.Tensor | None = None
     cached_k_new_cpu: np.ndarray | None = None           # [L, G]
     locked_count_cpu: np.ndarray | None = None           # [L, G]
+    # [L, G]: genuine eval width per (layer, group). Under the budget regime the
+    # eval region is ragged (kept lengths diverge), so the rectangular score
+    # tensor is padded and the selected count must be clamped to this.
+    real_eval_len_cpu: np.ndarray | None = None
     # [L, G] int32: post-evict kept_lengths. Under TP the runner
     # cross-rank MAX-reduces this for block-pool consistency.
     cached_kept_lengths_cpu: np.ndarray | None = None
@@ -136,6 +157,7 @@ class KVCompressor:
         dtype: torch.dtype,
         device: torch.device | str,
         level: str = "crosslayer_head",
+        regime: str = "ratio",
     ) -> None:
         assert num_kv_heads % page_group_size == 0, (
             f"num_kv_heads ({num_kv_heads}) must be divisible by "
@@ -147,6 +169,12 @@ class KVCompressor:
         # once here; ``prepare_keep_decision`` calls ``self.level.compute_counts``
         # and never branches on the level again.
         self.level: SelectionLevel = make_selection_level(level)
+        # Eviction regime (compression axis 3): which cached positions may be
+        # evicted this chunk, what fraction of them survives, and how long a
+        # position's score lives (see eviction_regime.py). Selected by whether
+        # ``cache_config.compression_budget_tokens`` is set; like the level it is
+        # chosen once here and never branched on again.
+        self.regime: EvictionRegime = make_eviction_regime(regime)
         self.num_layers = num_layers
         self.num_kv_heads_per_layer = num_kv_heads
         self.page_group_size = page_group_size
@@ -177,6 +205,12 @@ class KVCompressor:
         # Populated by ``set_cluster_map``; the keep decision requires both.
         self.member_to_cluster: torch.Tensor | None = None
         self.member_to_col: torch.Tensor | None = None
+        # [num_clusters, page_group_size] inverse of the two maps above:
+        # (cluster, column) -> member row, or -1 for a column no member fills
+        # (a cross-layer map may leave a cluster empty). The eviction regime's
+        # score memory needs it because the writeback addresses cluster columns
+        # while a score buffer is addressed by member.
+        self.cluster_members: torch.Tensor | None = None
 
         # Optional observer notified of every finalized per-request keep
         # decision (see ``compute_kept_lengths_per_rank``). ``None`` in
@@ -302,6 +336,14 @@ class KVCompressor:
         self.member_to_cluster = member_to_cluster
         self.member_to_col = member_to_col
         num_clusters = self.num_layers * self.num_head_groups_per_layer
+        # Invert the two maps once. -1 marks a (cluster, column) no member
+        # occupies, so a score buffer never mistakes an empty slot for member 0.
+        cluster_members = torch.full(
+            (num_clusters, self.page_group_size), -1,
+            dtype=torch.long, device=self.device)
+        cluster_members[member_to_cluster, member_to_col] = torch.arange(
+            member_to_cluster.numel(), dtype=torch.long, device=self.device)
+        self.cluster_members = cluster_members
         logger.info(
             "KVCompressor scoring cluster map: %s (%d clusters over %d "
             "members, page_group_size=%d)",
@@ -363,115 +405,90 @@ class KVCompressor:
         req_id: str,
         prev_seq_lens_per_layer: torch.Tensor,
         chunk_len: int,
-        ratio: float,
-        window_size: int,
-        n_sink_tokens: int,
-        total_prompt_tokens: int,
+        params: ChunkParams,
     ) -> KeepDecision:
-        """Run the keep decision for one chunk: compute sink / window / ratio
-        geometry, then delegate the per-(layer, group) kept COUNT to the active
-        selection level (``self.level``). Caches per-(layer, group) sorted
-        indices for the executor. Enforces the once-only invariant:
-        ``prev_seq_lens_per_layer`` matches the last
-        ``valid_lengths_per_group`` (or is all-zero on the first chunk)."""
+        """Run the keep decision for one chunk.
+
+        Three delegations, no policy of its own: the active eviction regime
+        (axis 3) fixes the geometry — which slots may be evicted, what fraction
+        survives — and supplies the eval-region scores from its own score
+        memory; the active selection level (axis 1) turns those scores into a
+        per-(layer, group) kept COUNT; and this method caches the per-(layer,
+        group) POSITION ranking the executor gathers with.
+
+        Enforces the once-only invariant: ``prev_seq_lens_per_layer`` matches
+        the last ``valid_lengths_per_group`` (or is all-zero on the first
+        chunk).
+        """
         if req_id not in self.req_state:
             raise RuntimeError(
                 f"prepare_keep_decision: '{req_id}' not begin_request'd.")
-        if not (0.0 < ratio <= 1.0):
+        if not (0.0 < params.ratio <= 1.0):
             raise ValueError(
-                f"prepare_keep_decision: ratio must be in (0, 1], got {ratio}.")
+                f"prepare_keep_decision: ratio must be in (0, 1], got "
+                f"{params.ratio}.")
 
         req = self.req_state[req_id]
         num_layers = self.num_layers
         num_groups = self.num_head_groups_per_layer
         num_kv_heads = self.num_kv_heads_per_layer
 
-        # Sink / window sized by the smallest (layer, group) total length.
         prev_lens = prev_seq_lens_per_layer.to(dtype=torch.long).cpu()
         if prev_lens.shape != (num_layers, num_groups):
             raise ValueError(
                 f"prev_seq_lens shape {tuple(prev_lens.shape)} != "
                 f"({num_layers}, {num_groups}).")
-        min_total = int((prev_lens + chunk_len).min().item())
-        sink_size = min(n_sink_tokens, min_total)
-        win_size = min(window_size, max(0, min_total - sink_size))
 
         self._assert_once_only(req, prev_lens, num_layers, num_groups)
 
-        # ``adjusted_ratio`` mirrors baseline FastKVzip
-        # (wrapper.py:188-194); we hold ``win_size`` fixed, so the
-        # window-shrink branch collapses to zero.
-        eff_prompt = max(0, int(total_prompt_tokens) - sink_size)
-        if ratio >= 1.0 or eff_prompt <= win_size:
-            adjusted_ratio = 1.0
-        elif ratio * eff_prompt < win_size:
-            adjusted_ratio = 0.0
-        else:
-            adjusted_ratio = max(0.0, min(1.0,
-                (ratio * eff_prompt - win_size) / (eff_prompt - win_size)))
+        # Both maps are needed below: ``member_to_cluster`` / ``member_to_col``
+        # place each head's ranking at its (cluster, column), and the regime's
+        # score memory inverts them to follow the writeback.
+        if (self.member_to_cluster is None or self.member_to_col is None
+                or self.cluster_members is None):
+            raise RuntimeError(
+                "prepare_keep_decision: cluster maps are unset — "
+                "set_cluster_map must run after construction.")
 
-        # First chunk skips the locked [sink, sink+win) prefix; subsequent
-        # chunks evaluate the whole fresh chunk.
+        # Score dtype/device follow the scorer output (which may stay float32
+        # even when self.dtype is bfloat16) for byte-equivalence.
+        pending, prev_locked = self._collect_layer_tensors(
+            req, num_layers, num_groups, num_kv_heads, chunk_len)
+        dtype, device = pending.dtype, pending.device
+
+        if req.score_store is None:
+            req.score_store = self.regime.create_store(
+                num_layers, num_kv_heads,
+                self.member_to_cluster, self.cluster_members)
+        store = req.score_store
+
+        # A request is on its first chunk until an eviction has left a kept
+        # length behind; the regimes use it to skip regions that cannot exist
+        # yet (there is no earlier window to re-rank).
         is_first_chunk = not any(
             ls.valid_lengths_per_group is not None
             for ls in req.layer_states.values())
-        eval_start = win_size + sink_size if is_first_chunk else 0
-        eval_end = chunk_len
-        eval_len = max(0, eval_end - eval_start)
+        prev_lens_np = prev_lens.numpy()
+        geometry = self.regime.plan(
+            store=store,
+            prev_lens=prev_lens_np,
+            chunk_len=chunk_len,
+            prev_locked=prev_locked,
+            is_first_chunk=is_first_chunk,
+            params=params,
+            device=device,
+        )
+        sink_size = geometry.sink_size
+        eval_len = geometry.eval_len
+        adjusted_ratio = geometry.adjusted_ratio
+        locked = geometry.locked
 
-        # Workspace dtype/device follow the gate output (may stay float32
-        # even when self.dtype == bfloat16) for byte-equivalence.
-        first_score = next(
-            (ls.pending_score for ls in req.layer_states.values()
-             if ls.pending_score is not None), None)
-        if first_score is None:
-            raise RuntimeError(
-                f"prepare_keep_decision({req_id}): no pending_score "
-                "— receive_score must run first.")
-        dtype, device = first_score.dtype, first_score.device
-        neg_inf = torch.finfo(dtype).min
+        eval_scores = store.build_eval_scores(
+            pending, prev_lens.to(device), geometry)
 
-        workspace_need = win_size + chunk_len
-        if (req.score_workspace is None
-                or req.workspace_size < workspace_need
-                or req.score_workspace.dtype != dtype
-                or req.score_workspace.device != device):
-            req.score_workspace = torch.empty(
-                num_layers, num_kv_heads, workspace_need,
-                dtype=dtype, device=device)
-            req.workspace_size = workspace_need
-        workspace = req.score_workspace
-        workspace.fill_(neg_inf)
-
-        pending, prior, prev_locked = self._collect_layer_tensors(
-            req, num_layers, num_groups, num_kv_heads,
-            win_size, chunk_len, dtype, device, neg_inf)
-        if win_size > 0:
-            workspace[:, :, :win_size] = prior
-        workspace[:, :, win_size:win_size + chunk_len] = pending
-
-        max_locked = (
-            prev_lens.to(device) + chunk_len - sink_size - win_size
-        ).clamp_min(0)
-        locked = torch.minimum(prev_locked, max_locked)
         for layer_idx in range(num_layers):
             req.layer_states[layer_idx].locked_count_per_group = (
                 locked[layer_idx])
-
-        # Save next chunk's prior_window from this chunk's tail.
-        if adjusted_ratio < 1.0:
-            if win_size > 0 and chunk_len >= win_size:
-                new_prior = pending[
-                    :, :, chunk_len - win_size:].detach().clone()
-                for layer_idx in range(num_layers):
-                    req.layer_states[layer_idx].prior_window_scores = (
-                        new_prior[layer_idx])
-            elif win_size == 0:
-                empty = torch.empty(
-                    num_kv_heads, 0, dtype=dtype, device=device)
-                for layer_idx in range(num_layers):
-                    req.layer_states[layer_idx].prior_window_scores = empty
-            # win > chunk_len is degenerate; leave prior unchanged.
 
         # Keep decision = COUNT (per-cluster shared length) + POSITION
         # (per-member ranking). Each KV head (member) keeps its OWN top-scored
@@ -480,13 +497,8 @@ class KVCompressor:
         # single). Grouping heads with similar retention budgets via the cluster
         # map makes that shared length approximate each member's ideal — the
         # source of the memory saving. Per-member individual lengths are never
-        # stored; only the cluster's one length is. Both outputs need the
-        # cluster maps bound by ``set_cluster_map``.
-        if self.member_to_cluster is None or self.member_to_col is None:
-            raise RuntimeError(
-                "prepare_keep_decision: cluster maps are unset — "
-                "set_cluster_map must run after construction.")
-
+        # stored; only the cluster's one length is.
+        #
         # POSITION (ratio-independent rank) is cached whenever there is an eval
         # region to keep from, INCLUDING the zero path (adjusted_ratio == 0):
         # the ratio budget keeps no middle there, but floor_min can still force
@@ -496,26 +508,31 @@ class KVCompressor:
         # ratio <= 0, and at ratio 0 the base count is 0 (floor_min supplies the
         # retention against the ranking above).
         if eval_len > 0 and adjusted_ratio < 1.0:
-            eval_scores = workspace[:, :, eval_start:eval_end]
             req.cached_sorted_indices = self._rank_positions(
                 eval_scores, num_layers, num_kv_heads, num_groups)
             if adjusted_ratio > 0.0:
-                req.cached_k_new_cpu = self.level.compute_counts(
-                    eval_scores, adjusted_ratio, self.member_to_cluster,
-                    num_layers, num_kv_heads, num_groups)
+                # Clamp to the genuine eval width: under a ragged eval region
+                # (the budget regime, where kept lengths diverge) the score
+                # tensor is padded, and a count must never reach into padding.
+                req.cached_k_new_cpu = np.minimum(
+                    self.level.compute_counts(
+                        eval_scores, adjusted_ratio, self.member_to_cluster,
+                        num_layers, num_kv_heads, num_groups),
+                    geometry.real_eval_len)
             else:
                 req.cached_k_new_cpu = None
         else:
             req.cached_sorted_indices = None
             req.cached_k_new_cpu = None
         req.locked_count_cpu = locked.cpu().numpy().astype(np.int64)
+        req.real_eval_len_cpu = geometry.real_eval_len
 
         decision = KeepDecision(
             sink_size=int(sink_size),
-            win_size=int(win_size),
+            tail_size=int(geometry.tail_size),
             adjusted_ratio=float(adjusted_ratio),
-            eval_start=int(eval_start),
-            eval_end=int(eval_end),
+            eval_len=int(eval_len),
+            budget_tokens=params.budget_tokens,
         )
         req.cross_layer_decision = decision
         req.cached_kept_lengths_cpu = None
@@ -575,9 +592,10 @@ class KVCompressor:
                 "must run first.")
         keep_dec = req.cross_layer_decision
         sink_size = keep_dec.sink_size
-        win_size = keep_dec.win_size
+        tail_size = keep_dec.tail_size
         adjusted_ratio = keep_dec.adjusted_ratio
-        eval_len = max(0, keep_dec.eval_end - keep_dec.eval_start)
+        eval_len = keep_dec.eval_len
+        budget_tokens = keep_dec.budget_tokens
 
         num_layers = self.num_layers
         num_groups = self.num_head_groups_per_layer
@@ -588,7 +606,8 @@ class KVCompressor:
             np.int64, copy=False).reshape(num_layers, num_groups)
         total_seen = prev_lens + chunk_len
 
-        # adjusted_ratio >= 1: keep every position in the eval region.
+        # adjusted_ratio >= 1: keep every position in the eval region. Under the
+        # budget regime this is the "cache still fits the budget" path.
         if adjusted_ratio >= 1.0:
             kept_lengths = total_seen.astype(np.int32)
             req.cached_kept_lengths_cpu = kept_lengths
@@ -599,6 +618,12 @@ class KVCompressor:
             if req.locked_count_cpu is not None
             else np.zeros((num_layers, num_groups), dtype=np.int64))
         k_new_cpu = req.cached_k_new_cpu
+        # Genuine (unpadded) eval width per (layer, group). Uniform under the
+        # ratio regime; ragged under the budget regime.
+        real_eval_len = (
+            req.real_eval_len_cpu
+            if req.real_eval_len_cpu is not None
+            else np.full((num_layers, num_groups), eval_len, dtype=np.int64))
 
         kept_lengths = np.zeros(
             (num_layers, num_groups), dtype=np.int32)
@@ -606,27 +631,45 @@ class KVCompressor:
             for group_idx in range(num_groups):
                 total_seen_g = int(total_seen[layer_idx, group_idx])
                 locked_count = int(locked_cpu[layer_idx, group_idx])
-                if eval_len > 0:
+                eval_len_g = int(real_eval_len[layer_idx, group_idx])
+                if eval_len_g > 0:
                     # adjusted_ratio == 0 ⇒ no sort cached, keep none.
                     k_new = (int(k_new_cpu[layer_idx, group_idx])
                              if k_new_cpu is not None else 0)
                     kept_now = (
-                        sink_size + locked_count + k_new + win_size)
+                        sink_size + locked_count + k_new + tail_size)
+                    # The floor cannot ask for more than the cache holds, nor
+                    # (under a budget) for more than the budget allows.
                     target_floor = min(floor_min_int, total_seen_g)
+                    if budget_tokens is not None:
+                        target_floor = min(target_floor, budget_tokens)
                     if kept_now < target_floor:
                         extra = min(
                             target_floor - kept_now,
-                            eval_len - k_new)
+                            eval_len_g - k_new)
                         if extra > 0:
                             k_new += extra
                     k_aligned = (
                         ((k_new + block_size - 1) // block_size)
                         * block_size)
-                    k_aligned = min(k_aligned, eval_len)
+                    k_aligned = min(k_aligned, eval_len_g)
+                    if budget_tokens is not None:
+                        # Hard cap. Rounding the selection UP to a block is what
+                        # keeps the kept span page-contiguous, so the cap is
+                        # rounded DOWN to a block multiple rather than cutting
+                        # mid-block: the kept length then never exceeds the
+                        # budget and stays block-aligned. Head-calibrated levels
+                        # (whose per-cluster length is a max over members) are
+                        # the case that actually needs this; the cluster-
+                        # calibrated levels already land on the budget.
+                        room = budget_tokens - sink_size - locked_count \
+                            - tail_size
+                        cap = max(0, (room // block_size) * block_size)
+                        k_aligned = min(k_aligned, cap)
                 else:
                     k_aligned = 0
                 new_locked = locked_count + k_aligned
-                kept_length = sink_size + new_locked + win_size
+                kept_length = sink_size + new_locked + tail_size
                 if kept_length > total_seen_g:
                     kept_length = total_seen_g
                 kept_lengths[layer_idx, group_idx] = kept_length
@@ -640,10 +683,38 @@ class KVCompressor:
                 kept_lengths=kept_lengths,
                 total_seen=total_seen,
                 sink_size=sink_size,
-                win_size=win_size,
+                win_size=tail_size,
                 eval_len=eval_len,
             )
         return kept_lengths
+
+    def compact_cluster_stats(
+        self,
+        req_id: str,
+        compressed_layer_idx: int,
+        group_idx: int,
+        keep_positions: torch.Tensor,
+        kept_length: int,
+    ) -> None:
+        """Follow one (layer, head-group)'s KV eviction in the score memory.
+
+        Called by the executor right after it gathers a cluster's kept KV, with
+        the same per-column position matrix, so the active regime's score memory
+        stays slot-aligned with the KV and an evicted position's statistics are
+        released. A no-op under the ratio regime, whose score memory is
+        chunk-local and holds nothing that outlives the eviction.
+
+        ``compressed_layer_idx`` is the index in COMPRESSED layer space (the
+        space the compressor's caches and the cluster ids live in), not the
+        physical layer the executor addresses the KV cache with.
+        """
+        req = self.req_state.get(req_id)
+        if req is None or req.score_store is None:
+            return
+        cluster_id = (
+            compressed_layer_idx * self.num_head_groups_per_layer + group_idx)
+        req.score_store.compact_cluster(
+            cluster_id, keep_positions, kept_length)
 
     def _assert_once_only(
         self,
@@ -691,19 +762,21 @@ class KVCompressor:
         num_layers: int,
         num_groups: int,
         num_kv_heads: int,
-        win_size: int,
         chunk_len: int,
-        dtype: torch.dtype,
-        device: torch.device,
-        neg_inf: float,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Stack per-layer pending / prior / prev_locked into [L, ...]
-        tensors. Consumes pending_score on every layer."""
-        empty_prior = torch.full(
-            (num_kv_heads, win_size), neg_inf, dtype=dtype, device=device)
-        zero_locked = torch.zeros(num_groups, dtype=torch.long, device=device)
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Stack the per-layer fresh scores and locked counts into
+        ``[num_layers, ...]`` tensors, consuming ``pending_score`` on every
+        layer. The score dtype / device are taken from the first layer and
+        enforced on the rest, so every regime downstream sees one consistent
+        tensor.
+
+        Returns ``(pending [L, num_kv_heads, chunk_len], prev_locked [L, G])``.
+        """
+        del num_kv_heads  # Shape is carried by the per-layer scores themselves.
+        dtype: torch.dtype | None = None
+        device: torch.device | None = None
+        zero_locked: torch.Tensor | None = None
         pending_list: list[torch.Tensor] = []
-        prior_list: list[torch.Tensor] = []
         locked_list: list[torch.Tensor] = []
         for layer_idx in range(num_layers):
             state = req.layer_states.get(layer_idx)
@@ -717,20 +790,16 @@ class KVCompressor:
                 raise ValueError(
                     f"layer {layer_idx}: pending_score chunk_len "
                     f"{fresh.shape[1]} != {chunk_len}.")
-            if fresh.dtype != dtype or fresh.device != device:
+            if dtype is None:
+                dtype, device = fresh.dtype, fresh.device
+                zero_locked = torch.zeros(
+                    num_groups, dtype=torch.long, device=device)
+            elif fresh.dtype != dtype or fresh.device != device:
                 raise RuntimeError(
                     f"layer {layer_idx}: pending_score dtype/device "
                     f"mismatch (got {fresh.dtype}/{fresh.device}, "
                     f"expected {dtype}/{device}).")
             pending_list.append(fresh)
-
-            prior = state.prior_window_scores
-            prior_ok = (
-                prior is not None and win_size > 0
-                and prior.shape[1] == win_size
-                and prior.dtype == dtype
-                and prior.device == device)
-            prior_list.append(prior if prior_ok else empty_prior)
 
             locked_list.append(
                 state.locked_count_per_group.to(torch.long)
@@ -738,12 +807,8 @@ class KVCompressor:
                 else zero_locked)
 
         pending = torch.stack(pending_list, dim=0)
-        prior = (torch.stack(prior_list, dim=0) if win_size > 0
-                 else torch.empty(
-                     num_layers, num_kv_heads, 0,
-                     dtype=dtype, device=device))
         prev_locked = torch.stack(locked_list, dim=0)
-        return pending, prior, prev_locked
+        return pending, prev_locked
 
     def attach_scorers(
         self,

@@ -180,9 +180,46 @@ class CacheConfig:
     # level (``compression_level``) and score producer (``compression_scorer``).
     compression_ratio: float = 1.0
     """Fraction of tokens kept per chunk (``floor(ratio * re_eval_size)``), and
-    the compression on/off switch: ``1.0`` (default) keeps everything (no
-    compression), ``< 1.0`` enables compression (requires ``page_group_size``).
-    Must satisfy ``0 < compression_ratio <= 1``; see ``compression_enabled``."""
+    one of the two compression on/off switches: ``1.0`` (default) keeps
+    everything (no compression), ``< 1.0`` enables compression (requires
+    ``page_group_size``). Must satisfy ``0 < compression_ratio <= 1``; see
+    ``compression_enabled``. Mutually exclusive with
+    ``compression_budget_tokens`` — a run has ONE retention target."""
+    compression_budget_tokens: int | None = None
+    """Fixed KV cache budget in tokens per (layer, head group), and the second
+    compression on/off switch (``None`` = off).
+
+    Setting it selects the BUDGET eviction regime instead of the ratio one, the
+    formulation the KeyDiff / H2O / SnapKV references use: while the cache fits
+    the budget nothing is evicted; the first chunk that would overflow it cuts
+    the cache back to the budget by keeping the highest-scoring positions
+    outside the sink and the protected recent tail (see
+    ``compression_evict_current_chunk``). Unlike ``compression_ratio`` the
+    target is absolute, so it holds without knowing the prompt length in
+    advance, and no position is locked in — one kept by an earlier chunk
+    competes again every chunk, which is what lets a bounded cache admit later,
+    more important tokens.
+
+    As with ``compression_ratio``, ``compression_level`` decides the SCOPE the
+    budget is shared over: ``"uniform"`` gives every (layer, head group) exactly
+    this length, while the per-layer / cross-layer levels pool it so strong
+    groups keep more than weak ones at the same total. The budget applies to
+    prompt processing; during decode the cache grows past it again (eviction
+    runs once, over the prefill).
+
+    Must exceed ``compression_n_sink_tokens`` plus the protected tail, so there
+    is something left to keep."""
+    compression_evict_current_chunk: bool = False
+    """Budget regime only: whether the chunk just written is itself an eviction
+    candidate.
+
+    ``False`` (default) protects the whole fresh chunk, so only positions from
+    earlier chunks compete — the reference behaviour, and the more accurate one
+    in our measurements. ``True`` protects only the always-kept
+    ``compression_window_size`` recent tokens and lets the rest of the fresh
+    chunk compete like any other region, which reaches the budget sooner on
+    prompts whose chunk size is large relative to the budget. Ignored under the
+    ratio regime, whose protected tail is always the recent window."""
     compression_window_size: int = 32
     """Recent tokens always kept during scoring."""
     compression_n_sink_tokens: int = 4
@@ -339,6 +376,8 @@ class CacheConfig:
             # stays hashed (it changes graph / backend); the compression on/off
             # bit is hashed separately below via ``compression_enabled``.
             "compression_ratio",
+            "compression_budget_tokens",
+            "compression_evict_current_chunk",
             "compression_floor_min",
             "compression_chunk_size",
             "compression_window_size",
@@ -411,10 +450,21 @@ class CacheConfig:
 
     @property
     def compression_enabled(self) -> bool:
-        """Whether KV cache compression runs: ``compression_ratio < 1.0``
-        (``1.0`` keeps every token, the no-op baseline). Single source of truth
-        for the gate — consumers read this rather than re-deriving the test."""
-        return self.compression_ratio < 1.0
+        """Whether KV cache compression runs — either retention target being
+        set turns it on: ``compression_ratio < 1.0`` (``1.0`` keeps every token,
+        the no-op baseline) or ``compression_budget_tokens`` not None. Single
+        source of truth for the gate — consumers read this rather than
+        re-deriving the test."""
+        return (self.compression_ratio < 1.0
+                or self.compression_budget_tokens is not None)
+
+    @property
+    def compression_regime(self) -> str:
+        """Which eviction regime the retention target selects (axis 3; see
+        ``vllm.v1.attention.compression.eviction_regime``). The two targets are
+        mutually exclusive, so the budget's presence decides."""
+        return ("budget" if self.compression_budget_tokens is not None
+                else "ratio")
 
     def _derive_head_groups(self) -> None:
         if self.page_group_size is None:
@@ -425,6 +475,40 @@ class CacheConfig:
         self.num_head_groups = (
             self.num_head_groups_per_layer * self.num_hidden_layers
         )
+
+    def _validate_budget_target(self) -> None:
+        """Reject budgets the eviction geometry could never reach.
+
+        A chunk's kept length is ``sink + selected + protected tail``, so the
+        sink and the tail alone must leave room for at least one selected
+        position — otherwise the cache would sit above the budget no matter how
+        aggressively it evicted, and the "fixed budget" promise would be silently
+        false. The tail is the fresh chunk unless the fresh chunk is evictable,
+        in which case it is the recent window.
+        """
+        budget = self.compression_budget_tokens
+        if budget is None:
+            return
+        if budget <= 0:
+            raise ValueError(
+                f"compression_budget_tokens must be > 0, got {budget}.")
+        tail = (self.compression_window_size
+                if self.compression_evict_current_chunk
+                else self.compression_chunk_size)
+        floor_needed = self.compression_n_sink_tokens + tail
+        if budget <= floor_needed:
+            tail_name = ("compression_window_size"
+                         if self.compression_evict_current_chunk
+                         else "compression_chunk_size")
+            raise ValueError(
+                f"compression_budget_tokens ({budget}) must exceed "
+                f"compression_n_sink_tokens ({self.compression_n_sink_tokens}) "
+                f"+ {tail_name} ({tail}) = {floor_needed}: those positions are "
+                "kept unconditionally, so a smaller budget is unreachable. "
+                "Raise the budget, lower --compression-chunk-size, or set "
+                "--compression-evict-current-chunk to protect only the recent "
+                "window instead of the whole fresh chunk."
+            )
 
     def _validate_extended_fields(self) -> None:
         # Ragged paging.
@@ -461,12 +545,25 @@ class CacheConfig:
                 f"compression_ratio must satisfy 0 < r <= 1, got "
                 f"{self.compression_ratio}."
             )
+        # The two retention targets are alternative answers to the same
+        # question ("how much KV survives"), and they disagree by construction:
+        # a ratio scales with the prompt, a budget does not. Reject rather than
+        # silently ranking one over the other.
+        if (self.compression_budget_tokens is not None
+                and self.compression_ratio < 1.0):
+            raise ValueError(
+                f"compression_ratio ({self.compression_ratio}) and "
+                f"compression_budget_tokens ({self.compression_budget_tokens}) "
+                "are mutually exclusive retention targets. Set a ratio to keep "
+                "a fraction of the prompt, or a budget to hold the cache at a "
+                "fixed token count — and leave compression_ratio at 1.0 when "
+                "using a budget."
+            )
         if self.compression_enabled:
             if self.page_group_size is None:
                 raise ValueError(
-                    "compression (compression_ratio < 1.0) requires "
-                    "page_group_size to be set; compression operates on top of "
-                    "ragged paging."
+                    "compression requires page_group_size to be set; "
+                    "compression operates on top of ragged paging."
                 )
             if self.compression_window_size <= 0:
                 raise ValueError(
@@ -494,6 +591,7 @@ class CacheConfig:
                     f"must be greater than compression_window_size "
                     f"({self.compression_window_size})."
                 )
+            self._validate_budget_target()
             # Axis 1 — selection level. Validated against the registry that
             # ``make_selection_level`` dispatches on (single source of truth);
             # the local import keeps the torch-backed runtime module out of the

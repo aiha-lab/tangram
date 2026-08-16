@@ -3,7 +3,7 @@
 """Per-request KV cache reordering after compression.
 
 Runs after ``model.forward``. For each (layer, head-group) it gathers
-the cached KV, assembles ``keep_idx = sink ∪ locked ∪ topk ∪ window``
+the cached KV, assembles ``keep_idx = sink ∪ locked ∪ topk ∪ tail``
 from the caches ``prepare_keep_decision`` stashed, and scatters the
 kept K/V back in block-aligned form. Backend-agnostic: touches only
 KV tensors and the block_table."""
@@ -22,19 +22,19 @@ def _new_region_from_kept_length(
     kept_length: int,
     sink_size: int,
     locked: int,
-    win_size: int,
+    tail_size: int,
     eval_len: int | None = None,
 ) -> int:
     """Recover the block-aligned top-k ("new") span from ``kept_length``.
 
     ``kept_length`` is produced once by
     ``KVCompressor.compute_kept_lengths_per_rank`` and packs
-    ``sink + locked + new + window`` slots; the writeback needs the ``new``
+    ``sink + locked + new + tail`` slots; the writeback needs the ``new``
     region back out. ``eval_len`` clamps it to the scored region when the
     caller slices ``sorted_idx``; the keep-all fast path takes no slice and
     omits the clamp.
     """
-    new = max(0, kept_length - sink_size - locked - win_size)
+    new = max(0, kept_length - sink_size - locked - tail_size)
     if eval_len is not None:
         new = min(new, eval_len)
     return new
@@ -93,7 +93,7 @@ class CompressionExecutor:
         self.num_compressed_layers = len(compressed_layer_ids)
         # Reused arange slabs; sink/win sizes are KeepDecision-uniform.
         self._sink_idx_cache: torch.Tensor | None = None
-        self._win_idx_cache: torch.Tensor | None = None
+        self._tail_idx_cache: torch.Tensor | None = None
 
     def run_request(
         self,
@@ -150,11 +150,21 @@ class CompressionExecutor:
                 "must run before run_request.")
         keep_dec = req.cross_layer_decision
         sink_size = keep_dec.sink_size
-        win_size = keep_dec.win_size
+        # Trailing always-kept span: the recent window under the ratio regime,
+        # the whole fresh chunk under the budget regime (unless configured
+        # otherwise). The writeback only needs its width.
+        tail_size = keep_dec.tail_size
         adjusted_ratio = keep_dec.adjusted_ratio
-        eval_start = keep_dec.eval_start
-        eval_end = keep_dec.eval_end
-        eval_len = max(0, eval_end - eval_start)
+        eval_len = keep_dec.eval_len
+        # Genuine (unpadded) eval width per (layer, group): uniform under the
+        # ratio regime, ragged under the budget regime, where the score tensor
+        # is padded to the widest group. Slicing ``sorted_idx`` past a group's
+        # own width would pick padding positions.
+        real_eval_len = (
+            req.real_eval_len_cpu
+            if req.real_eval_len_cpu is not None
+            else np.full((num_compressed, num_groups), eval_len,
+                         dtype=np.int64))
 
         # Under TP the runner cross-rank MAX-reduces kept_lengths before
         # reaching us.
@@ -178,12 +188,12 @@ class CompressionExecutor:
             self._sink_idx_cache = torch.arange(
                 max(sink_size, 64), device=device, dtype=torch.long)
         sink_idx_full = self._sink_idx_cache[:sink_size]
-        if (self._win_idx_cache is None
-                or self._win_idx_cache.numel() < win_size
-                or self._win_idx_cache.device != device):
-            self._win_idx_cache = torch.arange(
-                max(win_size, 4096), device=device, dtype=torch.long)
-        win_idx_base = self._win_idx_cache[:win_size]
+        if (self._tail_idx_cache is None
+                or self._tail_idx_cache.numel() < tail_size
+                or self._tail_idx_cache.device != device):
+            self._tail_idx_cache = torch.arange(
+                max(tail_size, 4096), device=device, dtype=torch.long)
+        tail_idx_base = self._tail_idx_cache[:tail_size]
 
         block_table_gpu = block_table.block_table.gpu
         new_locked_all = np.zeros((num_compressed, num_groups), dtype=np.int64)
@@ -216,7 +226,7 @@ class CompressionExecutor:
                     kept_length = int(
                         kept_lengths_all[static_idx, group_idx])
                     k_aligned = _new_region_from_kept_length(
-                        kept_length, sink_size, locked, win_size)
+                        kept_length, sink_size, locked, tail_size)
                     new_locked_all[static_idx, group_idx] = (
                         locked + k_aligned)
                 continue
@@ -225,14 +235,15 @@ class CompressionExecutor:
                 total_seen = int(total_seen_per_group[group_idx])
                 locked = int(locked_cpu[static_idx, group_idx])
                 kept_lo = sink_size + locked
-                win_lo = total_seen - win_size
+                tail_lo = total_seen - tail_size
 
                 # Under TP this rank may need to extend its top-k up to
                 # the cross-rank-MAX-reduced kept_length; sorted_idx
                 # already holds eval_len positions so the slice is safe.
                 kept_length = int(kept_lengths_all[static_idx, group_idx])
                 k_aligned = _new_region_from_kept_length(
-                    kept_length, sink_size, locked, win_size, eval_len)
+                    kept_length, sink_size, locked, tail_size,
+                    int(real_eval_len[static_idx, group_idx]))
                 new_locked_all[static_idx, group_idx] = locked + k_aligned
 
                 if kept_length == 0:
@@ -242,7 +253,7 @@ class CompressionExecutor:
                 block_ids = block_table_gpu[
                     row_idx, layer_first + group_idx, :n_blocks
                 ].long()
-                self._gather_and_writeback_kept_kv(
+                keep_positions = self._gather_and_writeback_kept_kv(
                     kv_cache=kv_cache,
                     block_ids=block_ids,
                     sink_idx=sink_idx_full,
@@ -252,11 +263,18 @@ class CompressionExecutor:
                     sorted_idx_group=(
                         sorted_idx[static_idx, group_idx]
                         if sorted_idx is not None else None),
-                    win_idx=win_idx_base,
-                    win_lo=win_lo,
+                    tail_idx=tail_idx_base,
+                    tail_lo=tail_lo,
                     kept_length=kept_length,
                     device=device,
                 )
+                # Keep the regime's score memory slot-aligned with the KV it
+                # just rewrote, using the very same positions: an evicted
+                # position's statistics are released, a surviving position's
+                # follow it to its new slot. No-op under the ratio regime.
+                compressor.compact_cluster_stats(
+                    metadata.req_id, static_idx, group_idx,
+                    keep_positions, kept_length)
 
         # Batched H2D: collapses L per-layer state writes into two. State is
         # indexed by compressed position (matches the compressor's caches).
@@ -281,11 +299,11 @@ class CompressionExecutor:
         k_aligned: int,
         kept_lo: int,
         sorted_idx_group: torch.Tensor | None,
-        win_idx: torch.Tensor,
-        win_lo: int,
+        tail_idx: torch.Tensor,
+        tail_lo: int,
         kept_length: int,
         device: torch.device,
-    ) -> None:
+    ) -> torch.Tensor:
         """Evict one (layer, group): gather the kept KV positions, write back.
 
         ``block_ids`` are the cluster's physical blocks covering the
@@ -298,14 +316,17 @@ class CompressionExecutor:
         with the trailing partial block zero-padded.
 
         The kept positions form a ``[page_group_size, kept_length]`` matrix:
-        every column (KV head) keeps the same sink / locked / window positions,
+        every column (KV head) keeps the same sink / locked / tail positions,
         and only the middle ``k_aligned`` block — that column's own top-k by
-        gate score, taken from ``sorted_idx_group`` (the per-(layer, group)
+        score, taken from ``sorted_idx_group`` (the per-(layer, group)
         descending ranking, shape ``[page_group_size, eval_len]``) — differs.
         ``sorted_idx_group`` is dereferenced only when ``k_aligned > 0``; the
         fast / zero paths pass ``k_aligned == 0`` (and may pass ``None``). The
-        shared sink/locked/k_aligned/win counts make every column the same
+        shared sink/locked/k_aligned/tail counts make every column the same
         length, so the pad + write-back are column-uniform.
+
+        Returns that matrix, so the caller can apply the identical positions to
+        anything else stored per cache slot (the regime's score memory).
 
         See vllm/v1/attention/backends/ragged_layout.py for the layout.
         """
@@ -333,9 +354,9 @@ class CompressionExecutor:
             mid = sorted_idx_group[:, :k_aligned]
             mid, _ = mid.sort(dim=-1)
             col_parts.append(mid + kept_lo)
-        if win_idx.numel() > 0:
+        if tail_idx.numel() > 0:
             col_parts.append(
-                (win_idx + win_lo).unsqueeze(0).expand(page_group_size, -1))
+                (tail_idx + tail_lo).unsqueeze(0).expand(page_group_size, -1))
         keep_mat = (
             torch.cat(col_parts, dim=1) if col_parts
             else torch.empty(
@@ -367,3 +388,4 @@ class CompressionExecutor:
                 2, n_blocks_write, block_size, page_group_size, head_size)
             .permute(0, 1, 3, 2, 4)
         )
+        return keep_mat

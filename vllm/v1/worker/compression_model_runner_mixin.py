@@ -49,6 +49,7 @@ from vllm.v1.attention.backends.utils import (
     sliding_window_layers,
 )
 from vllm.v1.attention.compression import (
+    ChunkParams,
     CompressionExecutor,
     CompressionMetadata,
     KVCompressor,
@@ -193,6 +194,7 @@ class CompressionModelRunnerMixin:
             dtype=dtype,
             device=self.device,
             level=cache_config.compression_level,
+            regime=cache_config.compression_regime,
         )
         # Axis-2 scorer selection. FastKVZip loads a
         # per-layer gate checkpoint over hidden_states; every other scorer is a
@@ -488,10 +490,14 @@ class CompressionModelRunnerMixin:
                 prev_seq_lens_per_layer=torch.from_numpy(
                     prev_seq_lens_static),
                 chunk_len=chunk_len,
-                ratio=req_md.compression_ratio,
-                window_size=req_md.window_size,
-                n_sink_tokens=req_md.n_sink_tokens,
-                total_prompt_tokens=req_md.total_prompt_tokens,
+                params=ChunkParams(
+                    ratio=req_md.compression_ratio,
+                    budget_tokens=req_md.budget_tokens,
+                    window_size=req_md.window_size,
+                    n_sink_tokens=req_md.n_sink_tokens,
+                    evict_current_chunk=req_md.evict_current_chunk,
+                    total_prompt_tokens=req_md.total_prompt_tokens,
+                ),
             )
 
             # Per-compressible-layer post-evict kept_lengths. Under TP,

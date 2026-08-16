@@ -554,6 +554,10 @@ class EngineArgs:
     page_group_size: int | None = CacheConfig.page_group_size
     head_group_cluster_map: str | None = CacheConfig.head_group_cluster_map
     compression_ratio: float = CacheConfig.compression_ratio
+    compression_budget_tokens: int | None = (
+        CacheConfig.compression_budget_tokens)
+    compression_evict_current_chunk: bool = (
+        CacheConfig.compression_evict_current_chunk)
     compression_window_size: int = CacheConfig.compression_window_size
     compression_n_sink_tokens: int = CacheConfig.compression_n_sink_tokens
     compression_floor_min: int = CacheConfig.compression_floor_min
@@ -982,6 +986,14 @@ class EngineArgs:
         )
         cache_group.add_argument(
             "--compression-ratio", **cache_kwargs["compression_ratio"]
+        )
+        cache_group.add_argument(
+            "--compression-budget-tokens",
+            **cache_kwargs["compression_budget_tokens"],
+        )
+        cache_group.add_argument(
+            "--compression-evict-current-chunk",
+            **cache_kwargs["compression_evict_current_chunk"],
         )
         cache_group.add_argument(
             "--compression-window-size",
@@ -1555,6 +1567,9 @@ class EngineArgs:
             page_group_size=self.page_group_size,
             head_group_cluster_map=self.head_group_cluster_map,
             compression_ratio=self.compression_ratio,
+            compression_budget_tokens=self.compression_budget_tokens,
+            compression_evict_current_chunk=(
+                self.compression_evict_current_chunk),
             compression_window_size=self.compression_window_size,
             compression_n_sink_tokens=self.compression_n_sink_tokens,
             compression_floor_min=self.compression_floor_min,
@@ -1823,7 +1838,8 @@ class EngineArgs:
                 != cache_config.compression_chunk_size
             ):
                 raise ValueError(
-                    "When compression is on (compression_ratio < 1.0), "
+                    "When compression is on (--compression-ratio < 1.0 or "
+                    "--compression-budget-tokens set), "
                     "--max-num-batched-tokens must equal "
                     f"--compression-chunk-size. Got "
                     f"max_num_batched_tokens="
@@ -2188,10 +2204,13 @@ class EngineArgs:
             # With compression on, default ``max_num_batched_tokens`` to
             # ``compression_chunk_size`` so at most one request's chunk
             # fits in a step.
-            if self.compression_ratio < 1.0 and self.compression_chunk_size:
+            compression_on = (
+                self.compression_ratio < 1.0
+                or self.compression_budget_tokens is not None)
+            if compression_on and self.compression_chunk_size:
                 self.max_num_batched_tokens = int(self.compression_chunk_size)
                 logger.debug(
-                    "compression on (compression_ratio < 1.0) — defaulting "
+                    "compression on (a retention target is set) — defaulting "
                     "max_num_batched_tokens to compression_chunk_size=%d.",
                     self.max_num_batched_tokens,
                 )

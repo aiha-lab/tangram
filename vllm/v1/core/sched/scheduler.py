@@ -882,6 +882,9 @@ class Scheduler(SchedulerInterface):
             run_compression=bool(run_compression),
             compression_chunk_len=int(compression_chunk_len),
             total_prompt_tokens=int(request.num_prompt_tokens),
+            budget_tokens=self.cache_config.compression_budget_tokens,
+            evict_current_chunk=bool(
+                self.cache_config.compression_evict_current_chunk),
         )
 
     def _update_after_schedule(

@@ -168,7 +168,8 @@ class CompressionRequestMetadata:
     req_id: str
     # Keep fraction of the re-eval region per chunk
     # (``CacheConfig.compression_ratio``). Per-chunk K_new is
-    # ``floor(ratio * re_eval_size)``. 0 < ratio <= 1.
+    # ``floor(ratio * re_eval_size)``. 0 < ratio <= 1. Left at 1.0 when a
+    # budget is the retention target instead.
     compression_ratio: float
     window_size: int
     n_sink_tokens: int
@@ -189,9 +190,17 @@ class CompressionRequestMetadata:
     # interior chunks, the remainder for the last chunk. Differs from this
     # step's scheduled token count only when budget sharing split the chunk.
     compression_chunk_len: int = 0
-    # Total prompt length of this request's first prefill cycle, for
-    # logging only.
+    # Total prompt length of this request's first prefill cycle. The ratio
+    # regime derives its per-chunk target from it; the budget regime does not
+    # need it (a budget is absolute).
     total_prompt_tokens: int = 0
+    # Fixed per-(layer, head group) KV token budget
+    # (``CacheConfig.compression_budget_tokens``), or None when the retention
+    # target is a ratio. Selects the budget eviction regime in the worker.
+    budget_tokens: int | None = None
+    # Budget regime only: whether the fresh chunk is an eviction candidate
+    # (``CacheConfig.compression_evict_current_chunk``).
+    evict_current_chunk: bool = False
 
 
 @bc_linter_include
