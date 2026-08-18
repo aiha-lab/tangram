@@ -253,6 +253,23 @@ def add_compression_args(parser: argparse.ArgumentParser) -> None:
             "ratio == 1.0 disables compression and runs the baseline."
         ),
     )
+    parser.add_argument(
+        "--compression-budget-tokens", type=int, default=None,
+        help=(
+            "Fixed KV cache budget in tokens per (layer, head group). "
+            "Mutually exclusive with --ratio < 1.0: setting it selects the "
+            "budget eviction regime, where nothing is evicted until the cache "
+            "would exceed the budget and it is then cut back to it. Leave "
+            "--ratio at its 1.0 default when using a budget."
+        ),
+    )
+    parser.add_argument(
+        "--compression-evict-current-chunk", action="store_true",
+        help=(
+            "Budget regime only: let the chunk just written compete for "
+            "eviction (the reference behaviour) instead of protecting it whole."
+        ),
+    )
     parser.add_argument("--page-group-size", type=int, default=4)
     parser.add_argument(
         "--head-group-cluster-map", type=str, default=None,
@@ -386,11 +403,26 @@ def build_llm(args: argparse.Namespace) -> LLM:
     if args.max_num_batched_tokens is not None:
         llm_kwargs["max_num_batched_tokens"] = args.max_num_batched_tokens
 
-    # ratio == 1.0 is the no-compression baseline; the compression machinery
-    # stays cold so we get a true reference point against the swept ratios.
-    if args.ratio < 1.0:
+    # Either retention target turns compression on; with neither, the machinery
+    # stays cold so we get a true reference point against the swept settings.
+    budget_tokens = getattr(args, "compression_budget_tokens", None)
+    # The two retention targets are mutually exclusive in the engine. A budget
+    # is the more specific request, so it wins and the ratio is reported as
+    # ignored rather than silently mixed in (--ratio has a non-1.0 default, so
+    # a budget run would otherwise always trip the engine's rejection).
+    effective_ratio = args.ratio
+    if budget_tokens is not None:
+        if args.ratio < 1.0:
+            print(f"  [budget] ignoring --ratio {args.ratio}: "
+                  f"--compression-budget-tokens {budget_tokens} is the "
+                  "retention target.")
+        effective_ratio = 1.0
+    if effective_ratio < 1.0 or budget_tokens is not None:
         llm_kwargs.update(
-            compression_ratio=args.ratio,
+            compression_ratio=effective_ratio,
+            compression_budget_tokens=budget_tokens,
+            compression_evict_current_chunk=getattr(
+                args, "compression_evict_current_chunk", False),
             compression_chunk_size=args.compression_chunk_size,
             compression_n_sink_tokens=args.compression_n_sink_tokens,
             compression_window_size=args.compression_window_size,

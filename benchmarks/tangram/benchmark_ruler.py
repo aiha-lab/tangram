@@ -226,6 +226,9 @@ def run_task(
         # CacheConfig.compression_ea_epsilon default (1e-2) applied.
         "compression_ea_epsilon": args.compression_ea_epsilon,
         "ratio": args.ratio,
+        "budget_tokens": args.compression_budget_tokens,
+        "evict_current_chunk": args.compression_evict_current_chunk,
+        "compression_chunk_size": args.compression_chunk_size,
         "page_group_size": args.page_group_size,
         "max_tokens": max_tokens,
         "metric": metric_name(task),
@@ -310,8 +313,12 @@ def main() -> None:
     def save_path_for(task: str) -> str:
         return os.path.join(
             args.output_dir, f"len{args.length}", task,
-            f"{model_basename}_r{args.ratio}_pg{args.page_group_size}"
-            f"{tag_suffix}.json",
+            # A budget run and a ratio run are different settings, so they
+            # must not share a result file even though both have ratio 1.0.
+            f"{model_basename}_r{args.ratio}"
+            + (f"_b{args.compression_budget_tokens}"
+               if args.compression_budget_tokens is not None else "")
+            + f"_pg{args.page_group_size}{tag_suffix}.json",
         )
 
     dataset = load_ruler(args.length, n_data=args.num, tasks=tasks)

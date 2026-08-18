@@ -60,6 +60,15 @@ LEVEL=${LEVEL:-crosslayer_head}
 # ---- Sweep ---------------------------------------------------------------
 LENGTHS=${LENGTHS:-"8192 4096 16384"}   # 8K -> 4K -> 16K completion order
 RATIOS=${RATIOS:-"1.0 0.7 0.5 0.3"}
+# Fixed KV budgets in tokens per (layer, head group), swept alongside RATIOS.
+# Empty (default) = ratio-only sweep. A budget run is a DIFFERENT retention
+# target, not a ratio: nothing is evicted until the cache would exceed the
+# budget, and it is then cut back to it. Compare a budget against the ratio that
+# keeps the same amount, i.e. budget ~= ratio * length.
+BUDGETS=${BUDGETS:-}
+# 1 = let the chunk just written compete for eviction (the KeyDiff paper's
+# behaviour); 0 (default) = protect it whole. Budget runs only.
+EVICT_CURRENT_CHUNK=${EVICT_CURRENT_CHUNK:-0}
 TASKS=${TASKS:-}            # empty = all 13 RULER tasks
 NUM=${NUM:-50}             # samples PER TASK (RULER ships 500/task)
 MAX_NUM_SEQS=${MAX_NUM_SEQS:-16}
@@ -94,6 +103,21 @@ if [ -n "${WINDOW_SIZE:-}" ]; then
 fi
 if [ -n "${FLOOR_MIN:-}" ]; then
     METHOD_ARGS+=(--compression-floor-min "${FLOOR_MIN}")
+fi
+# Compression chunk size. Under a fixed budget this also bounds the budget from
+# below (the fresh chunk is kept unconditionally unless EVICT_CURRENT_CHUNK=1),
+# so a small budget needs a small chunk.
+if [ -n "${CHUNK_SIZE:-}" ]; then
+    METHOD_ARGS+=(--compression-chunk-size "${CHUNK_SIZE}")
+fi
+
+# Budget-run extras. The tag keeps the two current-chunk policies in separate
+# result files so one sweep does not overwrite the other.
+BUDGET_ARGS=()
+BUDGET_TAG=""
+if [ "${EVICT_CURRENT_CHUNK}" = "1" ]; then
+    BUDGET_ARGS+=(--compression-evict-current-chunk)
+    BUDGET_TAG="evictcur"
 fi
 
 case "${SCORER}" in
@@ -141,21 +165,32 @@ fi
 # ---- Run -----------------------------------------------------------------
 # Outer loop over context lengths so each length's full ratio sweep completes
 # before the next (the all-task average is valid after every length).
+run_one() {
+    # $@ = the setting-specific args (a ratio, or a budget).
+    CUDA_VISIBLE_DEVICES="${GPU_ID}" "$PYTHON" "${SCRIPT_DIR}/benchmark_ruler.py" \
+        -l "${LENGTH}" \
+        --num "${NUM}" \
+        --max-num-seqs "${MAX_NUM_SEQS}" \
+        --gpu-memory-utilization "${GPU_MEM_UTIL}" \
+        --page-group-size "${PAGE_GROUP_SIZE}" \
+        "${TP_ARGS[@]}" \
+        "${METHOD_ARGS[@]}" \
+        "$@" \
+        -m "${MODEL}" \
+        --max-model-len "${MAX_LEN}" \
+        --output-dir "${OUTPUT_DIR}"
+}
+
 for LENGTH in ${LENGTHS}; do
     for RATIO in ${RATIOS}; do
         echo "===== ${SCORER} ${SELECTION}  length=${LENGTH}  ratio=${RATIO}  tp=${TP} ====="
-        CUDA_VISIBLE_DEVICES="${GPU_ID}" "$PYTHON" "${SCRIPT_DIR}/benchmark_ruler.py" \
-            -l "${LENGTH}" \
-            --num "${NUM}" \
-            --ratio "${RATIO}" \
-            --max-num-seqs "${MAX_NUM_SEQS}" \
-            --gpu-memory-utilization "${GPU_MEM_UTIL}" \
-            --page-group-size "${PAGE_GROUP_SIZE}" \
-            "${TP_ARGS[@]}" \
-            "${METHOD_ARGS[@]}" \
-            -m "${MODEL}" \
-            --max-model-len "${MAX_LEN}" \
-            --output-dir "${OUTPUT_DIR}"
+        run_one --ratio "${RATIO}"
+    done
+    for BUDGET in ${BUDGETS}; do
+        echo "===== ${SCORER} ${SELECTION}  length=${LENGTH}  budget=${BUDGET}" \
+             "evict_current_chunk=${EVICT_CURRENT_CHUNK}  tp=${TP} ====="
+        run_one --ratio 1.0 --compression-budget-tokens "${BUDGET}" \
+                ${BUDGET_TAG:+--tag "${BUDGET_TAG}"} "${BUDGET_ARGS[@]}"
     done
 done
 
@@ -177,19 +212,32 @@ for dp, _, files in os.walk(root):
         length, task, r = d.get("length"), d.get("task"), d.get("ratio")
         if length is None or task is None or r is None:
             continue
-        rows.setdefault((str(length), task), {})[r] = d.get("avg_score")
-        ratios.add(r)
+        # A budget run is its own setting even though its ratio is 1.0; label it
+        # by budget (and by the current-chunk policy) so the two never merge.
+        budget = d.get("budget_tokens")
+        if budget is None:
+            setting = f"r{r}"
+        else:
+            setting = f"b{budget}"
+            if d.get("evict_current_chunk"):
+                setting += "+ec"
+        rows.setdefault((str(length), task), {})[setting] = d.get("avg_score")
+        ratios.add(setting)
 if not rows:
     print("(no results found under", root, ")")
     sys.exit(0)
-ratios = sorted(ratios, reverse=True)
+# Ratios first (descending), then budgets (descending) — each group is a
+# different retention target and they are not comparable by their label alone.
+ratios = sorted(
+    ratios,
+    key=lambda s: (s.startswith("b"), -float(s.lstrip("rb").split("+")[0])))
 keyw = max(len(f"{ln}/{tk}") for ln, tk in rows)
-hdr = "  ".join(f"r{r:<6}" for r in ratios)
+hdr = "  ".join(f"{r:<8}" for r in ratios)
 print(f"{'length/task':<{keyw}}  {hdr}")
 for ln, tk in sorted(rows):
     cells = "  ".join(
-        (f"{rows[(ln, tk)][r]*100:5.1f}%" if rows[(ln, tk)].get(r) is not None
-         else "   -- ")
+        (f"{rows[(ln, tk)][r]*100:6.1f}% " if rows[(ln, tk)].get(r) is not None
+         else "    --  ")
         for r in ratios
     )
     print(f"{ln + '/' + tk:<{keyw}}  {cells}")
