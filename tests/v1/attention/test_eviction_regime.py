@@ -16,6 +16,10 @@ from vllm.v1.attention.compression.eviction_regime import (
     ChunkParams,
     RatioRegime,
 )
+from vllm.v1.attention.compression.workspace import (
+    CompressionWorkspace,
+    WorkspaceSpec,
+)
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -45,7 +49,33 @@ HEAD_SIZE = 8
 HIDDEN_DIM = 32
 
 
-def make_compressor(regime: str, level: str = "uniform") -> KVCompressor:
+def make_compressor(
+    regime: str,
+    level: str = "uniform",
+    *,
+    chunk_size: int = 32,
+    budget: int | None = 96,
+    window_size: int = 8,
+    n_sink_tokens: int = 4,
+    evict_current_chunk: bool = False,
+    max_num_reqs: int = 2,
+) -> KVCompressor:
+    spec = WorkspaceSpec.from_config(
+        num_layers=NUM_LAYERS,
+        num_kv_heads=NUM_KV_HEADS,
+        num_groups=NUM_GROUPS,
+        page_group_size=PAGE_GROUP_SIZE,
+        max_num_reqs=max_num_reqs,
+        max_model_len=1 << 20,
+        model_dtype=torch.float32,
+        chunk_size=chunk_size,
+        window_size=window_size,
+        n_sink_tokens=n_sink_tokens,
+        budget_tokens=budget if regime == "budget" else None,
+        evict_current_chunk=evict_current_chunk,
+        scorer="snapkv",
+    )
+    workspace = CompressionWorkspace(spec, torch.device("cpu"))
     compressor = KVCompressor(
         num_layers=NUM_LAYERS,
         num_kv_heads=NUM_KV_HEADS,
@@ -55,6 +85,7 @@ def make_compressor(regime: str, level: str = "uniform") -> KVCompressor:
         block_size=BLOCK_SIZE,
         dtype=torch.float32,
         device="cpu",
+        workspace=workspace,
         level=level,
         regime=regime,
     )
@@ -103,11 +134,12 @@ def run_chunk(
         floor_min=floor_min,
     )
     # The executor normally publishes this; without it the once-only assert
-    # would reject the next chunk.
-    kept_gpu = torch.from_numpy(kept.astype(np.int64))
-    for layer_idx in range(NUM_LAYERS):
-        compressor.req_state[req_id].layer_states[
-            layer_idx].valid_lengths_per_group = kept_gpu[layer_idx]
+    # would reject the next chunk. ``new_locked`` mirrors what the writeback
+    # derives: the kept length minus the unconditionally kept regions.
+    decision = compressor.req_state[req_id].cross_layer_decision
+    new_locked = np.maximum(
+        kept.astype(np.int64) - decision.sink_size - decision.tail_size, 0)
+    compressor.commit_chunk(req_id, new_locked, kept)
     return kept
 
 
@@ -133,7 +165,7 @@ def test_budget_no_eviction_until_budget_is_exceeded():
     """The worked example from the request: budget 64, chunk 32 — the first two
     chunks fit and must be kept whole; the third must come back under budget."""
     budget, chunk_len = 64, 32
-    compressor = make_compressor("budget")
+    compressor = make_compressor("budget", budget=budget, chunk_size=chunk_len)
     generator = torch.Generator().manual_seed(0)
     compressor.begin_request("r0")
 
@@ -185,7 +217,7 @@ def test_budget_protects_the_current_chunk_by_default():
             generator).astype(np.int64)
     assert np.all(prev >= sink + chunk_len)
 
-    evictable = make_compressor("budget")
+    evictable = make_compressor("budget", evict_current_chunk=True)
     evictable.begin_request("r0")
     prev_e = np.zeros((NUM_LAYERS, NUM_GROUPS), dtype=np.int64)
     for _ in range(4):

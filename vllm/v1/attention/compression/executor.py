@@ -276,17 +276,12 @@ class CompressionExecutor:
                     metadata.req_id, static_idx, group_idx,
                     keep_positions, kept_length)
 
-        # Batched H2D: collapses L per-layer state writes into two. State is
-        # indexed by compressed position (matches the compressor's caches).
-        new_locked_gpu = torch.from_numpy(new_locked_all).to(device)
-        valid_lengths_gpu = torch.from_numpy(
-            kept_lengths_all.astype(np.int64)).to(device)
-        for static_idx in range(num_compressed):
-            state = req.layer_states.get(static_idx)
-            if state is None:
-                continue
-            state.locked_count_per_group = new_locked_gpu[static_idx]
-            state.valid_lengths_per_group = valid_lengths_gpu[static_idx]
+        # Publish the committed result in one call: the positions now
+        # permanently kept and the length each (layer, group) was cut to. The
+        # compressor owns that state (it lives in the preallocated workspace),
+        # so the executor reports rather than writes it.
+        compressor.commit_chunk(
+            metadata.req_id, new_locked_all, kept_lengths_all)
 
         return kept_lengths_all
 

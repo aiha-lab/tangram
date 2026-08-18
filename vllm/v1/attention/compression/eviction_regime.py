@@ -50,9 +50,13 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import numpy as np
 import torch
+
+if TYPE_CHECKING:
+    from vllm.v1.attention.compression.workspace import CompressionWorkspace
 
 
 @dataclass(frozen=True)
@@ -118,9 +122,27 @@ class RegimeScoreStore(ABC):
     """Per-request score memory owned by one regime.
 
     A regime decides not only *which* positions may be evicted but also *how
-    long their scores must live*, so the two are owned together: the store is
-    created by :meth:`EvictionRegime.create_store` and reset with the request.
+    long their scores must live*, so the two are owned together. The memory
+    itself is never allocated here: a store is a set of VIEWS into the
+    preallocated :class:`CompressionWorkspace` (its own row for the parts that
+    outlive a step, the shared slabs for the parts that do not), created by
+    :meth:`EvictionRegime.create_store` and released with the request.
     """
+
+    def __init__(
+        self,
+        workspace: "CompressionWorkspace",
+        row: int,
+    ) -> None:
+        self.workspace = workspace
+        self.row = row
+        self.neg_inf = float(
+            torch.finfo(workspace.spec.score_dtype).min)
+
+    @abstractmethod
+    def reset(self) -> None:
+        """Clear the row's state so nothing leaks from the previous request that
+        occupied it (rows are recycled)."""
 
     @abstractmethod
     def build_eval_scores(
@@ -141,7 +163,9 @@ class RegimeScoreStore(ABC):
         Returns:
             ``[num_layers, num_kv_heads, geometry.eval_len]``, padded with the
             dtype's minimum where a (layer, group) has fewer real eval
-            positions, so a padding cell can never outrank a real one.
+            positions, so a padding cell can never outrank a real one. The
+            returned tensor is a view into shared workspace memory and is only
+            valid until the next request's decision in the same step.
         """
 
     @abstractmethod
@@ -166,13 +190,6 @@ class RegimeScoreStore(ABC):
             kept_length: number of live slots after this eviction.
         """
 
-    def note_no_eviction(self) -> None:
-        """Hook for a chunk that kept everything (no writeback ran).
-
-        Default: nothing to do — the scores absorbed by
-        :meth:`build_eval_scores` already sit at their final slots.
-        """
-
 
 class _ChunkLocalWorkspace(RegimeScoreStore):
     """Score memory for :class:`RatioRegime` — one chunk wide.
@@ -180,30 +197,29 @@ class _ChunkLocalWorkspace(RegimeScoreStore):
     Under lock-in an earlier chunk's kept positions can never be re-ranked, so
     their scores are dead the moment they are locked. The only score that must
     outlive its chunk is the previous chunk's window, which the next chunk
-    re-evaluates. So the store is a fixed ``[num_layers, num_kv_heads,
-    window + chunk]`` workspace laid out as ``[previous window | fresh chunk]``
-    plus that window carry — no growth with prompt length, and no compaction
-    work at eviction time.
+    re-evaluates. So this store needs just the shared ``[previous window |
+    fresh chunk]`` staging slab plus its row's window carry — no growth with
+    prompt length, and no compaction work at eviction time.
     """
 
     def __init__(
         self,
-        num_layers: int,
-        num_kv_heads: int,
+        workspace: "CompressionWorkspace",
+        row: int,
     ) -> None:
-        self.num_layers = num_layers
-        self.num_kv_heads = num_kv_heads
-        # Allocated on the first chunk, once the scorer's dtype / device and the
-        # chunk width are known; reused (refilled) by every later chunk.
-        self._workspace: torch.Tensor | None = None
-        self._workspace_width: int = 0
-        # [num_layers, num_kv_heads, win_size] scores of the previous chunk's
-        # window, the one region a later chunk still re-ranks.
-        self._prior_window: torch.Tensor | None = None
-        # Set by the regime before ``build_eval_scores`` — the workspace offset
-        # the eval region starts at (the first chunk skips its own sink+window,
-        # which occupy no prior-window slots).
+        super().__init__(workspace, row)
+        # Width of the window the carry was written for. The window grows over
+        # the first chunks of a short prompt; a carry written at a different
+        # width describes different positions, so it is discarded rather than
+        # reinterpreted.
+        self._carry_width: int = -1
+        # Workspace offset the eval region starts at, set by the regime before
+        # ``build_eval_scores`` (the first chunk skips its own sink + window,
+        # which no previous window occupies).
         self.eval_start: int = 0
+
+    def reset(self) -> None:
+        self._carry_width = -1
 
     def build_eval_scores(
         self,
@@ -215,47 +231,36 @@ class _ChunkLocalWorkspace(RegimeScoreStore):
         chunk_len = pending.shape[-1]
         win_size = geometry.tail_size
         width = win_size + chunk_len
-        neg_inf = torch.finfo(pending.dtype).min
+        staging = self.workspace.staging
+        if width > staging.shape[-1]:
+            raise RuntimeError(
+                f"RatioRegime: window + chunk ({width}) exceeds the reserved "
+                f"staging width ({staging.shape[-1]}).")
 
-        if (self._workspace is None
-                or self._workspace_width < width
-                or self._workspace.dtype != pending.dtype
-                or self._workspace.device != pending.device):
-            self._workspace = torch.empty(
-                self.num_layers, self.num_kv_heads, width,
-                dtype=pending.dtype, device=pending.device)
-            self._workspace_width = width
-        workspace = self._workspace
-        workspace.fill_(neg_inf)
-
-        if win_size > 0:
-            prior = self._prior_window
-            # A carry is usable only if it matches this chunk's window width;
-            # ``win_size`` grows on the early chunks of a short prompt, and the
-            # first chunk has no carry at all. Leaving the slot at -inf then is
-            # correct: there is no earlier window to re-rank.
-            if (prior is not None
-                    and prior.shape[-1] == win_size
-                    and prior.dtype == pending.dtype
-                    and prior.device == pending.device):
-                workspace[:, :, :win_size] = prior
-        workspace[:, :, win_size:width] = pending
+        staging[:, :, :width].fill_(self.neg_inf)
+        if win_size > 0 and self._carry_width == win_size:
+            staging[:, :, :win_size].copy_(
+                self.workspace.prior_window[self.row, :, :, :win_size])
+        # A width mismatch (or the first chunk) leaves the window slot at the
+        # dtype minimum, which is correct: there is no earlier window to rank.
+        staging[:, :, win_size:width].copy_(pending)
 
         # Carry this chunk's own window into the next chunk. Skipped when
         # nothing is evicted (the no-op path leaves the cache untouched, so no
         # window changes hands).
         if geometry.adjusted_ratio < 1.0:
             if win_size > 0 and chunk_len >= win_size:
-                self._prior_window = pending[
-                    :, :, chunk_len - win_size:].detach().clone()
+                self.workspace.prior_window[
+                    self.row, :, :, :win_size].copy_(
+                        pending[:, :, chunk_len - win_size:])
+                self._carry_width = win_size
             elif win_size == 0:
-                self._prior_window = torch.empty(
-                    self.num_layers, self.num_kv_heads, 0,
-                    dtype=pending.dtype, device=pending.device)
+                self._carry_width = 0
             # A window wider than the chunk is degenerate (config forbids it);
             # leaving the carry untouched keeps the previous chunk's window.
 
-        return workspace[:, :, self.eval_start:self.eval_start + geometry.eval_len]
+        return staging[
+            :, :, self.eval_start:self.eval_start + geometry.eval_len]
 
     def compact_cluster(
         self,
@@ -263,9 +268,9 @@ class _ChunkLocalWorkspace(RegimeScoreStore):
         keep_positions: torch.Tensor,
         kept_length: int,
     ) -> None:
-        # Nothing to compact: the workspace is chunk-local and rebuilt from
-        # scratch next chunk, and the window carry is taken from ``pending``
-        # (which the eviction does not touch).
+        # Nothing to compact: the staging slab is rebuilt from scratch next
+        # chunk, and the window carry is taken from ``pending`` (which the
+        # eviction does not touch).
         del cluster_id, keep_positions, kept_length
 
 
@@ -273,8 +278,8 @@ class _PersistentStatBuffer(RegimeScoreStore):
     """Score memory for :class:`BudgetRegime` — one entry per live cache slot.
 
     Without lock-in every live position stays rankable, so its statistics must
-    live exactly as long as its KV does. The buffer is therefore addressed in
-    CACHE-SLOT coordinates: ``buffer[layer, head, slot]`` describes whatever
+    live exactly as long as its KV does. The row's buffer is therefore addressed
+    in CACHE-SLOT coordinates: ``buffer[layer, head, slot]`` describes whatever
     token that head currently holds in that slot. Two consequences follow, and
     both are load-bearing:
 
@@ -285,64 +290,40 @@ class _PersistentStatBuffer(RegimeScoreStore):
       matrix the KV writeback used, and blanks the slots that fell out, so a
       score entry can never outlive — or drift away from — its KV entry.
 
-    Capacity grows on demand and is bounded by the budget plus one chunk, so it
-    does not scale with prompt length. This is the mechanism a statistics-
-    accumulating eviction policy (H2O-style running attention mass, recency
-    decay, hit counts) plugs into: the slot-aligned lifetime is the hard part,
-    and it is solved here once for any such policy.
+    This is the mechanism a statistics-accumulating eviction policy (H2O-style
+    running attention mass, recency decay, hit counts) plugs into: the
+    slot-aligned lifetime is the hard part, and it is solved here once for any
+    such policy.
     """
 
     def __init__(
         self,
-        num_layers: int,
-        num_kv_heads: int,
+        workspace: "CompressionWorkspace",
+        row: int,
         member_to_cluster: torch.Tensor,
         cluster_members: torch.Tensor,
     ) -> None:
-        self.num_layers = num_layers
-        self.num_kv_heads = num_kv_heads
+        super().__init__(workspace, row)
+        if workspace.stat_buffer is None:
+            raise RuntimeError(
+                "BudgetRegime needs the per-position statistics buffer, but the "
+                "workspace was built without one (slot_capacity == 0).")
+        # [num_layers, num_kv_heads, slot_capacity] — this row's slice.
+        self.buffer = workspace.stat_buffer[row]
+        self.capacity = self.buffer.shape[-1]
         # [num_layers * num_kv_heads] member row -> flat cluster id.
         self.member_to_cluster = member_to_cluster
         # [num_clusters, page_group_size] flat cluster id + column -> member row,
         # the inverse map the compaction needs (the writeback addresses columns,
         # the buffer addresses members).
         self.cluster_members = cluster_members
-        self._buffer: torch.Tensor | None = None
-        self._capacity: int = 0
+        num_layers, num_kv_heads, _ = self.buffer.shape
+        self._flat = self.buffer.view(num_layers * num_kv_heads, self.capacity)
+        self._num_layers = num_layers
+        self._num_kv_heads = num_kv_heads
 
-    @property
-    def buffer(self) -> torch.Tensor | None:
-        """The live ``[num_layers, num_kv_heads, capacity]`` statistics, or
-        ``None`` before the first chunk. Exposed for tests and for future
-        statistics-accumulating policies."""
-        return self._buffer
-
-    def _ensure_capacity(
-        self,
-        needed: int,
-        dtype: torch.dtype,
-        device: torch.device,
-    ) -> torch.Tensor:
-        """Return a buffer holding at least ``needed`` slots, preserving the
-        statistics already stored. Growth is rare: capacity is only ever
-        ``budget + chunk`` in the steady state."""
-        neg_inf = torch.finfo(dtype).min
-        current = self._buffer
-        if (current is not None
-                and self._capacity >= needed
-                and current.dtype == dtype
-                and current.device == device):
-            return current
-        grown = torch.full(
-            (self.num_layers, self.num_kv_heads, needed),
-            neg_inf, dtype=dtype, device=device)
-        if (current is not None
-                and current.dtype == dtype
-                and current.device == device):
-            grown[:, :, :self._capacity] = current
-        self._buffer = grown
-        self._capacity = needed
-        return grown
+    def reset(self) -> None:
+        self.buffer.fill_(self.neg_inf)
 
     def build_eval_scores(
         self,
@@ -351,40 +332,43 @@ class _PersistentStatBuffer(RegimeScoreStore):
         geometry: ChunkGeometry,
     ) -> torch.Tensor:
         chunk_len = pending.shape[-1]
-        neg_inf = torch.finfo(pending.dtype).min
-        # Widest live extent this chunk can produce, before any eviction.
         needed = int(prev_lens.max().item()) + chunk_len
-        buffer = self._ensure_capacity(needed, pending.dtype, pending.device)
+        if needed > self.capacity:
+            raise RuntimeError(
+                f"BudgetRegime: live cache length {needed} exceeds the reserved "
+                f"slot capacity {self.capacity}. The keep decision caps every "
+                "(layer, group) at the budget, so this means the cap was not "
+                "applied.")
 
         # Fresh scores land at each head's own cluster offset. Members of one
         # cluster share its length, so the offset is a per-member lookup into
         # the flattened [num_layers, num_groups] lengths.
-        member_offset = prev_lens.reshape(-1)[self.member_to_cluster]
-        member_offset = member_offset.view(
-            self.num_layers, self.num_kv_heads, 1)
+        member_offset = prev_lens.reshape(-1)[self.member_to_cluster].view(
+            self._num_layers, self._num_kv_heads, 1)
         write_idx = member_offset + torch.arange(
             chunk_len, device=pending.device, dtype=member_offset.dtype
         ).view(1, 1, chunk_len)
-        buffer.scatter_(2, write_idx, pending)
+        self.buffer.scatter_(2, write_idx, pending)
 
         # The eval region starts at ``sink_size`` for every (layer, group) —
         # the budget regime has no locked prefix — and ends where that group's
-        # protected tail begins, which differs per group. Read the rectangle and
-        # mask the overhang so the protected tail can never be selected.
+        # protected tail begins, which differs per group. Copy the rectangle out
+        # (the buffer itself must keep the tail scores) and mask the overhang so
+        # the protected tail can never be selected.
         eval_len = geometry.eval_len
-        if eval_len <= 0:
-            return pending.new_full(
-                (self.num_layers, self.num_kv_heads, 0), neg_inf)
+        out = self.workspace.eval_scores[:, :, :eval_len]
+        if eval_len == 0:
+            return out
         sink = geometry.sink_size
-        scores = buffer[:, :, sink:sink + eval_len].clone()
+        out.copy_(self.buffer[:, :, sink:sink + eval_len])
         real_len = torch.from_numpy(geometry.real_eval_len).to(
             device=pending.device, dtype=torch.long).reshape(-1)
         member_real_len = real_len[self.member_to_cluster].view(
-            self.num_layers, self.num_kv_heads, 1)
+            self._num_layers, self._num_kv_heads, 1)
         positions = torch.arange(
             eval_len, device=pending.device, dtype=torch.long
         ).view(1, 1, eval_len)
-        return scores.masked_fill_(positions >= member_real_len, neg_inf)
+        return out.masked_fill_(positions >= member_real_len, self.neg_inf)
 
     def compact_cluster(
         self,
@@ -392,18 +376,17 @@ class _PersistentStatBuffer(RegimeScoreStore):
         keep_positions: torch.Tensor,
         kept_length: int,
     ) -> None:
-        buffer = self._buffer
-        if buffer is None:
-            return
-        flat = buffer.view(self.num_layers * self.num_kv_heads, self._capacity)
         rows = self.cluster_members[cluster_id]
+        if bool((rows < 0).any()):
+            return  # Empty cluster: no member holds these slots.
         # Gather first (a fresh tensor), then write back: an in-place gather
         # along a permuted index would read slots it has already overwritten.
-        flat[rows, :kept_length] = flat[rows].gather(1, keep_positions)
+        self._flat[rows, :kept_length] = self._flat[rows].gather(
+            1, keep_positions)
         # Blank what fell out, so an evicted token's statistics can never be
         # read back by a later chunk (the score entry dies with the KV entry).
-        if kept_length < self._capacity:
-            flat[rows, kept_length:] = torch.finfo(buffer.dtype).min
+        if kept_length < self.capacity:
+            self._flat[rows, kept_length:] = self.neg_inf
 
 
 class EvictionRegime(ABC):
@@ -419,12 +402,12 @@ class EvictionRegime(ABC):
     @abstractmethod
     def create_store(
         self,
-        num_layers: int,
-        num_kv_heads: int,
+        workspace: "CompressionWorkspace",
+        row: int,
         member_to_cluster: torch.Tensor,
         cluster_members: torch.Tensor,
     ) -> RegimeScoreStore:
-        """Create this regime's per-request score memory."""
+        """Bind this regime's score memory to one reserved workspace row."""
 
     @abstractmethod
     def plan(
@@ -470,13 +453,13 @@ class RatioRegime(EvictionRegime):
 
     def create_store(
         self,
-        num_layers: int,
-        num_kv_heads: int,
+        workspace: "CompressionWorkspace",
+        row: int,
         member_to_cluster: torch.Tensor,
         cluster_members: torch.Tensor,
     ) -> RegimeScoreStore:
         del member_to_cluster, cluster_members  # Chunk-local: no slot mapping.
-        return _ChunkLocalWorkspace(num_layers, num_kv_heads)
+        return _ChunkLocalWorkspace(workspace, row)
 
     def plan(
         self,
@@ -571,13 +554,13 @@ class BudgetRegime(EvictionRegime):
 
     def create_store(
         self,
-        num_layers: int,
-        num_kv_heads: int,
+        workspace: "CompressionWorkspace",
+        row: int,
         member_to_cluster: torch.Tensor,
         cluster_members: torch.Tensor,
     ) -> RegimeScoreStore:
         return _PersistentStatBuffer(
-            num_layers, num_kv_heads, member_to_cluster, cluster_members)
+            workspace, row, member_to_cluster, cluster_members)
 
     def plan(
         self,

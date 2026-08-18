@@ -54,6 +54,10 @@ from vllm.v1.attention.compression import (
     CompressionMetadata,
     KVCompressor,
 )
+from vllm.v1.attention.compression.workspace import (
+    CompressionWorkspace,
+    WorkspaceSpec,
+)
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import (
@@ -184,6 +188,29 @@ class CompressionModelRunnerMixin:
         # Dense models keep ``num_compressed_layers == num_layers`` and the map
         # is already physical, so both paths see the same array.
 
+        # Reserve every tensor the keep decision needs BEFORE the worker
+        # profiles peak memory (this runs inside ``load_model``, the profiling
+        # right after it), so the KV cache pool is sized around the reservation
+        # and an over-large budget or concurrency fails at startup instead of
+        # mid-generation. See workspace.py.
+        workspace_spec = WorkspaceSpec.from_config(
+            num_layers=num_compressed_layers,
+            num_kv_heads=num_kv_heads_per_rank,
+            num_groups=num_kv_heads_per_rank // cache_config.page_group_size,
+            page_group_size=cache_config.page_group_size,
+            max_num_reqs=self.max_num_reqs,
+            max_model_len=self.model_config.max_model_len,
+            model_dtype=dtype,
+            chunk_size=cache_config.compression_chunk_size,
+            window_size=cache_config.compression_window_size,
+            n_sink_tokens=cache_config.compression_n_sink_tokens,
+            budget_tokens=cache_config.compression_budget_tokens,
+            evict_current_chunk=cache_config.compression_evict_current_chunk,
+            scorer=cache_config.compression_scorer,
+        )
+        self.compression_workspace = CompressionWorkspace(
+            workspace_spec, self.device)
+
         self.compressor = KVCompressor(
             num_layers=num_compressed_layers,
             num_kv_heads=num_kv_heads_per_rank,
@@ -193,6 +220,7 @@ class CompressionModelRunnerMixin:
             block_size=block_size,
             dtype=dtype,
             device=self.device,
+            workspace=self.compression_workspace,
             level=cache_config.compression_level,
             regime=cache_config.compression_regime,
         )
