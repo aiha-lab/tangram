@@ -59,7 +59,9 @@ LEVEL=${LEVEL:-crosslayer_head}
 
 # ---- Sweep ---------------------------------------------------------------
 LENGTHS=${LENGTHS:-"8192 4096 16384"}   # 8K -> 4K -> 16K completion order
-RATIOS=${RATIOS:-"1.0 0.7 0.5 0.3"}
+# ``${VAR-default}`` (not ``:-``) so an explicitly EMPTY value means "none":
+# RATIOS="" BUDGETS="4096 2048" sweeps budgets only.
+RATIOS=${RATIOS-"1.0 0.7 0.5 0.3"}
 # Fixed KV budgets in tokens per (layer, head group), swept alongside RATIOS.
 # Empty (default) = ratio-only sweep. A budget run is a DIFFERENT retention
 # target, not a ratio: nothing is evicted until the cache would exceed the
@@ -112,12 +114,13 @@ if [ -n "${CHUNK_SIZE:-}" ]; then
 fi
 
 # Budget-run extras. The tag keeps the two current-chunk policies in separate
-# result files so one sweep does not overwrite the other.
+# result files so one sweep does not overwrite the other; it is spelled out
+# because it ends up in result filenames a reader has to interpret.
 BUDGET_ARGS=()
 BUDGET_TAG=""
 if [ "${EVICT_CURRENT_CHUNK}" = "1" ]; then
     BUDGET_ARGS+=(--compression-evict-current-chunk)
-    BUDGET_TAG="evictcur"
+    BUDGET_TAG="evict-current-chunk"
 fi
 
 case "${SCORER}" in
@@ -216,11 +219,13 @@ for dp, _, files in os.walk(root):
         # by budget (and by the current-chunk policy) so the two never merge.
         budget = d.get("budget_tokens")
         if budget is None:
-            setting = f"r{r}"
+            setting = f"ratio{r}"
         else:
-            setting = f"b{budget}"
+            setting = f"budget{budget}"
             if d.get("evict_current_chunk"):
-                setting += "+ec"
+                # Spelled out: this column is a different eviction policy, not a
+                # variant of the one next to it.
+                setting += "+evict-current-chunk"
         rows.setdefault((str(length), task), {})[setting] = d.get("avg_score")
         ratios.add(setting)
 if not rows:
@@ -228,16 +233,23 @@ if not rows:
     sys.exit(0)
 # Ratios first (descending), then budgets (descending) — each group is a
 # different retention target and they are not comparable by their label alone.
-ratios = sorted(
-    ratios,
-    key=lambda s: (s.startswith("b"), -float(s.lstrip("rb").split("+")[0])))
+def _setting_key(label: str) -> tuple[int, float]:
+    """Sort ratio settings first (descending), then budgets (descending). The two
+    are different retention targets and are not comparable by label alone."""
+    head = label.split("+")[0]
+    if head.startswith("ratio"):
+        return (0, -float(head[len("ratio"):]))
+    return (1, -float(head[len("budget"):]))
+
+ratios = sorted(ratios, key=_setting_key)
 keyw = max(len(f"{ln}/{tk}") for ln, tk in rows)
-hdr = "  ".join(f"{r:<8}" for r in ratios)
+width = max(len(r) for r in ratios) + 1
+hdr = "  ".join(f"{r:<{width}}" for r in ratios)
 print(f"{'length/task':<{keyw}}  {hdr}")
 for ln, tk in sorted(rows):
     cells = "  ".join(
-        (f"{rows[(ln, tk)][r]*100:6.1f}% " if rows[(ln, tk)].get(r) is not None
-         else "    --  ")
+        (f"{rows[(ln, tk)][r]*100:>{width}.1f}"
+         if rows[(ln, tk)].get(r) is not None else f"{'--':>{width}}")
         for r in ratios
     )
     print(f"{ln + '/' + tk:<{keyw}}  {cells}")
