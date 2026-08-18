@@ -43,6 +43,13 @@ from vllm.v1.attention.compression.selection_level import (
     SelectionLevel,
     make_selection_level,
 )
+from vllm.v1.attention.compression.slot_scores import (
+    ChunkScoreInputs,
+    KVCacheView,
+    PersistedChunkScores,
+    SlotScoreSource,
+    make_slot_score_source,
+)
 from vllm.v1.attention.compression.workspace import CompressionWorkspace
 from vllm.v1.attention.compression.scorer import build_qk_scorer
 
@@ -195,6 +202,11 @@ class KVCompressor:
         # ``attach_scorers``).
         self.scorers: list[nn.Module] = []
         self.scorer_consumes: str = "hidden_states"
+        # Where a live position's score comes from under a fixed budget (see
+        # slot_scores.py). Replaced once the scorer is installed, since the
+        # scorer is what decides whether the cache can be rescored; the default
+        # keeps unit tests that install no scorer working.
+        self.slot_score_source: SlotScoreSource = PersistedChunkScores()
 
         # member->(cluster, column) maps used by the keep decision. Member row
         # m = layer * num_kv_heads_per_layer + head; member_to_cluster[m] is the
@@ -225,6 +237,9 @@ class KVCompressor:
         # ``pending_req_offsets`` is a list of ``(req_id, start, end)``
         # triples giving each compression-active request's token range in
         # the batch's hidden_states. Tokens outside any triple are skipped.
+        # Whether the per-chunk scorer has to run at all. A score source that
+        # recomputes from the cached keys never reads the chunk's own scores, so
+        # the scorer forward and its buffer write are skipped outright.
         self.compress_active: bool = False
         self.pending_req_offsets: list[tuple[str, int, int]] | None = None
         # ``pending_req_pos_offsets`` maps a compression-active ``req_id`` to
@@ -262,6 +277,8 @@ class KVCompressor:
             device=self.device,
         )
         self.scorer_consumes = "hidden_states"
+        self._select_slot_score_source(
+            self.scorers[0] if self.scorers else None)
 
     def set_qk_scorers(
         self,
@@ -301,6 +318,15 @@ class KVCompressor:
         # length matches ``num_layers`` for ``attach_scorers``'s zip.
         self.scorers = [scorer for _ in range(self.num_layers)]
         self.scorer_consumes = scorer.consumes
+        self._select_slot_score_source(scorer)
+
+    def _select_slot_score_source(self, scorer: nn.Module | None) -> None:
+        """Bind the score source the installed scorer supports, and report it
+        when the active regime actually consumes it."""
+        self.slot_score_source = make_slot_score_source(scorer)
+        if self.regime.uses_slot_scores:
+            logger.info("KV budget eviction: %s.",
+                        self.slot_score_source.describe())
 
     def set_cluster_map(self, head_group_cluster_map: str | None) -> None:
         """Bind the member->(cluster, column) maps the keep decision uses.
@@ -363,7 +389,8 @@ class KVCompressor:
                 "set_cluster_map must run after construction.")
         row = self.workspace.acquire_row()
         store = self.regime.create_store(
-            self.workspace, row, self.member_to_cluster, self.cluster_members)
+            self.workspace, row, self.member_to_cluster, self.cluster_members,
+            self.slot_score_source)
         store.reset()
         self.req_state[req_id] = _RequestCompressState(row=row,
                                                        score_store=store)
@@ -426,12 +453,21 @@ class KVCompressor:
             state.row, layer_idx, :, cursor:end].copy_(score)
         workspace.pending_len[state.row, layer_idx] = end
 
+    @property
+    def chunk_scoring_enabled(self) -> bool:
+        """Whether the per-layer scorer has to run this step. False only when the
+        active regime reconstructs a position's score from the cache instead of
+        from the chunk that wrote it, in which case scoring the chunk would be
+        pure waste."""
+        return self.regime.consumes_chunk_scores(self.slot_score_source)
+
     def prepare_keep_decision(
         self,
         req_id: str,
         prev_seq_lens_per_layer: torch.Tensor,
         chunk_len: int,
         params: ChunkParams,
+        cache_view: KVCacheView | None = None,
     ) -> KeepDecision:
         """Run the keep decision for one chunk.
 
@@ -494,7 +530,15 @@ class KVCompressor:
                 "the two disagree.")
 
         eval_scores = store.build_eval_scores(
-            pending, prev_lens.to(device), geometry)
+            ChunkScoreInputs(
+                pending=pending,
+                prev_lens_cpu=prev_lens.numpy(),
+                prev_lens_device=prev_lens.to(device),
+                chunk_len=chunk_len,
+                cache_view=cache_view,
+            ),
+            geometry,
+        )
 
         # The regime owns the locked counts for this chunk; publish them so the
         # executor and the next chunk read one value.
@@ -781,6 +825,10 @@ class KVCompressor:
         mismatch means a layer's scorer did not fire and the keep decision would
         silently rank stale scores.
         """
+        if not self.chunk_scoring_enabled:
+            # The scorer never ran, by design; hand back an empty view so the
+            # score source sees a well-formed (zero-width) chunk.
+            return self.workspace.pending_score[req.row, :, :, :0]
         cursors = self.workspace.pending_len[req.row, :num_layers]
         bad = np.flatnonzero(cursors != chunk_len)
         if bad.size:
@@ -877,7 +925,7 @@ class KVCompressor:
 
         def capture(hidden_states: torch.Tensor,
                     _idx=layer_idx, _scorer=scorer) -> None:
-            if not self.compress_active:
+            if not self.compress_active or not self.chunk_scoring_enabled:
                 return
             offsets = self.pending_req_offsets
             if not offsets:
@@ -933,7 +981,7 @@ class KVCompressor:
         def score_qk(query: torch.Tensor, key: torch.Tensor,
                      value: torch.Tensor | None,
                      _idx=layer_idx, _scorer=scorer, _parent=parent) -> None:
-            if not self.compress_active:
+            if not self.compress_active or not self.chunk_scoring_enabled:
                 return
             offsets = self.pending_req_offsets
             if not offsets:

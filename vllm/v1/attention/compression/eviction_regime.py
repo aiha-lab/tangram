@@ -55,6 +55,12 @@ from typing import TYPE_CHECKING
 import numpy as np
 import torch
 
+from vllm.v1.attention.compression.slot_scores import (
+    ChunkScoreInputs,
+    SlotFillTarget,
+    SlotScoreSource,
+)
+
 if TYPE_CHECKING:
     from vllm.v1.attention.compression.workspace import CompressionWorkspace
 
@@ -147,17 +153,14 @@ class RegimeScoreStore(ABC):
     @abstractmethod
     def build_eval_scores(
         self,
-        pending: torch.Tensor,
-        prev_lens: torch.Tensor,
+        inputs: ChunkScoreInputs,
         geometry: ChunkGeometry,
     ) -> torch.Tensor:
-        """Absorb this chunk's fresh scores and return the eval-region scores.
+        """Bring the score memory up to date and return the eval-region scores.
 
         Args:
-            pending: ``[num_layers, num_kv_heads, chunk_len]`` scorer output for
-                the tokens just written to the cache.
-            prev_lens: ``[num_layers, num_groups]`` int64 pre-chunk kept length
-                per (layer, group), on the score device.
+            inputs: this chunk's scorer output, pre-chunk lengths and (when the
+                regime's score source rescores the cache) read access to it.
             geometry: this chunk's geometry.
 
         Returns:
@@ -223,11 +226,12 @@ class _ChunkLocalWorkspace(RegimeScoreStore):
 
     def build_eval_scores(
         self,
-        pending: torch.Tensor,
-        prev_lens: torch.Tensor,
+        inputs: ChunkScoreInputs,
         geometry: ChunkGeometry,
     ) -> torch.Tensor:
-        del prev_lens  # Chunk-local layout: kept lengths do not address it.
+        # Chunk-local layout: kept lengths do not address it, and there is
+        # nothing cached to rescore.
+        pending = inputs.pending
         chunk_len = pending.shape[-1]
         win_size = geometry.tail_size
         width = win_size + chunk_len
@@ -274,26 +278,23 @@ class _ChunkLocalWorkspace(RegimeScoreStore):
         del cluster_id, keep_positions, kept_length
 
 
-class _PersistentStatBuffer(RegimeScoreStore):
+class _SlotScoreStore(RegimeScoreStore):
     """Score memory for :class:`BudgetRegime` — one entry per live cache slot.
 
-    Without lock-in every live position stays rankable, so its statistics must
-    live exactly as long as its KV does. The row's buffer is therefore addressed
-    in CACHE-SLOT coordinates: ``buffer[layer, head, slot]`` describes whatever
-    token that head currently holds in that slot. Two consequences follow, and
-    both are load-bearing:
+    Without lock-in every live position stays rankable, so a score must be
+    available for it exactly as long as its KV is. The row's buffer is therefore
+    addressed in CACHE-SLOT coordinates: ``buffer[layer, head, slot]`` describes
+    whatever token that head currently holds in that slot. Two consequences
+    follow, and both are load-bearing:
 
-    * a chunk's fresh scores are scattered to ``[prev_len, prev_len + chunk)``,
-      where ``prev_len`` is that head's CLUSTER length (cluster members share one
-      length, so members of one cluster share the offset);
+    * bringing the buffer up to date each chunk is delegated to a
+      :class:`SlotScoreSource`, because the eviction methods disagree about what
+      "the score of an old position" even means — recompute it from the cached
+      keys (KeyDiff), accumulate it over the queries seen so far (H2O), or keep
+      what its own chunk produced (chunk-local scorers). See ``slot_scores.py``;
     * every eviction compacts the buffer with the SAME per-column position
       matrix the KV writeback used, and blanks the slots that fell out, so a
       score entry can never outlive — or drift away from — its KV entry.
-
-    This is the mechanism a statistics-accumulating eviction policy (H2O-style
-    running attention mass, recency decay, hit counts) plugs into: the
-    slot-aligned lifetime is the hard part, and it is solved here once for any
-    such policy.
     """
 
     def __init__(
@@ -302,37 +303,36 @@ class _PersistentStatBuffer(RegimeScoreStore):
         row: int,
         member_to_cluster: torch.Tensor,
         cluster_members: torch.Tensor,
+        source: SlotScoreSource,
     ) -> None:
         super().__init__(workspace, row)
         if workspace.stat_buffer is None:
             raise RuntimeError(
-                "BudgetRegime needs the per-position statistics buffer, but the "
+                "BudgetRegime needs the per-slot score buffer, but the "
                 "workspace was built without one (slot_capacity == 0).")
         # [num_layers, num_kv_heads, slot_capacity] — this row's slice.
         self.buffer = workspace.stat_buffer[row]
         self.capacity = self.buffer.shape[-1]
-        # [num_layers * num_kv_heads] member row -> flat cluster id.
-        self.member_to_cluster = member_to_cluster
-        # [num_clusters, page_group_size] flat cluster id + column -> member row,
-        # the inverse map the compaction needs (the writeback addresses columns,
-        # the buffer addresses members).
-        self.cluster_members = cluster_members
+        self.source = source
         num_layers, num_kv_heads, _ = self.buffer.shape
-        self._flat = self.buffer.view(num_layers * num_kv_heads, self.capacity)
         self._num_layers = num_layers
         self._num_kv_heads = num_kv_heads
+        self._flat = self.buffer.view(num_layers * num_kv_heads, self.capacity)
+        self._member_to_cluster = member_to_cluster
+        # The per-cluster loops address rows from the CPU so they do not
+        # synchronise on the device once per cluster.
+        self._cluster_members_cpu = cluster_members.cpu().numpy()
+        self._num_groups = self._cluster_members_cpu.shape[0] // num_layers
 
     def reset(self) -> None:
         self.buffer.fill_(self.neg_inf)
 
     def build_eval_scores(
         self,
-        pending: torch.Tensor,
-        prev_lens: torch.Tensor,
+        inputs: ChunkScoreInputs,
         geometry: ChunkGeometry,
     ) -> torch.Tensor:
-        chunk_len = pending.shape[-1]
-        needed = int(prev_lens.max().item()) + chunk_len
+        needed = int(inputs.prev_lens_cpu.max()) + inputs.chunk_len
         if needed > self.capacity:
             raise RuntimeError(
                 f"BudgetRegime: live cache length {needed} exceeds the reserved "
@@ -340,15 +340,19 @@ class _PersistentStatBuffer(RegimeScoreStore):
                 "(layer, group) at the budget, so this means the cap was not "
                 "applied.")
 
-        # Fresh scores land at each head's own cluster offset. Members of one
-        # cluster share its length, so the offset is a per-member lookup into
-        # the flattened [num_layers, num_groups] lengths.
-        member_offset = prev_lens.reshape(-1)[self.member_to_cluster].view(
-            self._num_layers, self._num_kv_heads, 1)
-        write_idx = member_offset + torch.arange(
-            chunk_len, device=pending.device, dtype=member_offset.dtype
-        ).view(1, 1, chunk_len)
-        self.buffer.scatter_(2, write_idx, pending)
+        self.source.fill(
+            SlotFillTarget(
+                buffer=self.buffer,
+                flat=self._flat,
+                member_to_cluster=self._member_to_cluster,
+                cluster_members_cpu=self._cluster_members_cpu,
+                num_layers=self._num_layers,
+                num_kv_heads=self._num_kv_heads,
+                num_groups=self._num_groups,
+                neg_inf=self.neg_inf,
+            ),
+            inputs,
+        )
 
         # The eval region starts at ``sink_size`` for every (layer, group) —
         # the budget regime has no locked prefix — and ends where that group's
@@ -362,11 +366,11 @@ class _PersistentStatBuffer(RegimeScoreStore):
         sink = geometry.sink_size
         out.copy_(self.buffer[:, :, sink:sink + eval_len])
         real_len = torch.from_numpy(geometry.real_eval_len).to(
-            device=pending.device, dtype=torch.long).reshape(-1)
-        member_real_len = real_len[self.member_to_cluster].view(
+            device=out.device, dtype=torch.long).reshape(-1)
+        member_real_len = real_len[self._member_to_cluster].view(
             self._num_layers, self._num_kv_heads, 1)
         positions = torch.arange(
-            eval_len, device=pending.device, dtype=torch.long
+            eval_len, device=out.device, dtype=torch.long
         ).view(1, 1, eval_len)
         return out.masked_fill_(positions >= member_real_len, self.neg_inf)
 
@@ -376,15 +380,15 @@ class _PersistentStatBuffer(RegimeScoreStore):
         keep_positions: torch.Tensor,
         kept_length: int,
     ) -> None:
-        rows = self.cluster_members[cluster_id]
-        if bool((rows < 0).any()):
+        rows = self._cluster_members_cpu[cluster_id]
+        if (rows < 0).any():
             return  # Empty cluster: no member holds these slots.
         # Gather first (a fresh tensor), then write back: an in-place gather
         # along a permuted index would read slots it has already overwritten.
         self._flat[rows, :kept_length] = self._flat[rows].gather(
             1, keep_positions)
-        # Blank what fell out, so an evicted token's statistics can never be
-        # read back by a later chunk (the score entry dies with the KV entry).
+        # Blank what fell out, so an evicted token's score can never be read
+        # back by a later chunk (the score entry dies with the KV entry).
         if kept_length < self.capacity:
             self._flat[rows, kept_length:] = self.neg_inf
 
@@ -406,8 +410,25 @@ class EvictionRegime(ABC):
         row: int,
         member_to_cluster: torch.Tensor,
         cluster_members: torch.Tensor,
+        slot_score_source: SlotScoreSource,
     ) -> RegimeScoreStore:
         """Bind this regime's score memory to one reserved workspace row."""
+
+    #: Whether the regime keeps a slot-addressed score buffer, i.e. whether the
+    #: slot score source (``slot_scores.py``) is consumed at all. False for a
+    #: chunk-local regime, which has no old position to score.
+    uses_slot_scores: bool = False
+
+    def consumes_chunk_scores(self, source: SlotScoreSource) -> bool:
+        """Whether the per-chunk scorer must run for this regime.
+
+        Always true by default: a chunk-local eval region has nothing but the
+        chunk's own scores to rank. A regime whose score source can reconstruct
+        a position's score from the cache overrides this, and the scorer's
+        forward pass is then skipped entirely.
+        """
+        del source
+        return True
 
     @abstractmethod
     def plan(
@@ -457,8 +478,10 @@ class RatioRegime(EvictionRegime):
         row: int,
         member_to_cluster: torch.Tensor,
         cluster_members: torch.Tensor,
+        slot_score_source: SlotScoreSource,
     ) -> RegimeScoreStore:
-        del member_to_cluster, cluster_members  # Chunk-local: no slot mapping.
+        # Chunk-local: no slot mapping, and no old position to score.
+        del member_to_cluster, cluster_members, slot_score_source
         return _ChunkLocalWorkspace(workspace, row)
 
     def plan(
@@ -535,7 +558,7 @@ class BudgetRegime(EvictionRegime):
     * **nothing is locked in** — a position kept by an earlier chunk competes
       again every chunk, which is the only way a bounded cache can admit later,
       more important tokens. Its score must therefore still be available, which
-      is what :class:`_PersistentStatBuffer` provides.
+      is what :class:`_SlotScoreStore` and its score source provide.
 
     The protected tail is the whole fresh chunk by default
     (``evict_current_chunk=False``): the reference protects the recent region,
@@ -551,6 +574,14 @@ class BudgetRegime(EvictionRegime):
     """
 
     name = "budget"
+    uses_slot_scores = True
+
+    def consumes_chunk_scores(self, source: SlotScoreSource) -> bool:
+        # Under a budget the eval region spans positions from earlier chunks, so
+        # what the chunk's own scorer produced is only one of several ways to
+        # score them — and a source that recomputes from the cached keys does not
+        # need it at all.
+        return source.needs_chunk_scores
 
     def create_store(
         self,
@@ -558,9 +589,11 @@ class BudgetRegime(EvictionRegime):
         row: int,
         member_to_cluster: torch.Tensor,
         cluster_members: torch.Tensor,
+        slot_score_source: SlotScoreSource,
     ) -> RegimeScoreStore:
-        return _PersistentStatBuffer(
-            workspace, row, member_to_cluster, cluster_members)
+        return _SlotScoreStore(
+            workspace, row, member_to_cluster, cluster_members,
+            slot_score_source)
 
     def plan(
         self,

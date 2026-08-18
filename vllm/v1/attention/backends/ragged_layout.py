@@ -81,6 +81,33 @@ def as_virtual_block_view(kv_cache: torch.Tensor) -> torch.Tensor:
         2, num_blocks * page_group_size, block_size, 1, head_size)
 
 
+def cluster_pages_token_major(
+    kv_cache: torch.Tensor,
+    block_ids: torch.Tensor,
+    key_only: bool = False,
+) -> torch.Tensor:
+    """Gather one cluster's pages and present them token-major within a block.
+
+    ``kv_cache`` is the column-major cache ``[2, num_blocks, page_group_size,
+    block_size, head_size]`` and ``block_ids`` the cluster's physical blocks.
+    Result: ``[2, n_blocks, block_size, page_group_size, head_size]``, or
+    ``[n_blocks, block_size, page_group_size, head_size]`` for ``key_only``
+    (the keys alone, which is all a key-based eviction score reads).
+
+    Token ``t`` of column ``c`` then lives at ``[t // block_size, t %
+    block_size, c]``. The permute is free; the gather is the unavoidable read of
+    the cluster's pages, which are strided across the pool.
+
+    Single source of truth for how the compression subsystem reads cached KV:
+    the eviction writeback and the cache-rescoring score source both go through
+    it, so they cannot disagree about the layout.
+    """
+    pages = kv_cache[0, block_ids] if key_only else kv_cache[:, block_ids]
+    # (blocks, columns, tokens, head) -> (blocks, tokens, columns, head)
+    return pages.permute(0, 2, 1, 3) if key_only else pages.permute(
+        0, 1, 3, 2, 4)
+
+
 # --- Identity-map addressing API (public; for cluster-map tooling/tests) -----
 #
 # The helpers in this section address the cache assuming the IDENTITY cluster

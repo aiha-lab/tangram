@@ -11,13 +11,19 @@ Ported from NVIDIA KVpress (``kvpress/presses/keydiff_press.py``); paper
 "KeyDiff: Key Similarity-Based KV Cache Eviction" (https://arxiv.org/abs/2504.15364).
 Reference: ``fastkvzip-accuracy-reproduce/prefill/attention/baseline.py:KeyDiff``.
 
-Intuition: within a chunk, the keys whose direction is closest to the chunk's
-average key direction are the least distinctive (most redundant), so they carry
-the least information and are evicted first. The score is the NEGATED cosine
-similarity to that average direction — higher (less similar to the mean) means
-more distinctive, hence kept. KeyDiff is gate-free and query-independent (it
-only reads keys); like the reference it defaults to a uniform per-head budget
-(pair-head), but the selection level stays an orthogonal knob.
+Intuition: the keys whose direction is closest to the average key direction are
+the least distinctive (most redundant), so they carry the least information and
+are evicted first. The score is the NEGATED cosine similarity to that average
+direction — higher (less similar to the mean) means more distinctive, hence
+kept. KeyDiff is gate-free and query-independent (it only reads keys); like the
+reference it defaults to a uniform per-head budget (pair-head), but the
+selection level stays an orthogonal knob.
+
+Two entry points, differing only in WHICH keys the average is taken over:
+``forward`` scores the fresh chunk against the chunk's own mean (the
+chunk-as-one-block variant), and ``score_cached_keys`` scores every live cache
+position against the mean of the whole cache, which is the paper's Eq. (8) and
+what a fixed KV budget needs.
 """
 from __future__ import annotations
 
@@ -42,6 +48,10 @@ class KeyDiffScorer(QKScorer):
     # not the outer block's hidden_states.
     consumes = "qk"
     name = "keydiff"
+    # The score is a function of the cached keys alone, so it can be recomputed
+    # for every live position at every eviction — which is what the paper's
+    # Eq. (8) actually asks for (see ``score_cached_keys``).
+    rescores_cache = True
 
     def __init__(
         self,
@@ -81,3 +91,32 @@ class KeyDiffScorer(QKScorer):
         # Negate so distinctive keys (far from the mean direction) score high.
         score = -F.cosine_similarity(k, anchor, dim=-1)               # [T, H]
         return score.transpose(0, 1).contiguous()                    # [H, T]
+
+    @torch.no_grad()
+    def score_cached_keys(self, keys: torch.Tensor) -> torch.Tensor:
+        """Score every live position of one head group from its cached keys.
+
+        This is the paper's Eq. (8) as written: the anchor is the mean direction
+        of ALL keys currently in the cache and every cached key is scored against
+        it, so the ranking is over the whole cache rather than within one chunk.
+
+        The distinction matters under a fixed KV budget. ``forward`` above takes
+        the chunk as one KeyDiff block (matching KVpress
+        ``BlockPress(block_size=chunk)``), which gives each chunk its OWN anchor;
+        scores from different chunks are then measured against different
+        references and ranking them together has no common scale. Recomputing
+        here removes that problem entirely — and needs no stored statistics,
+        because the keys the score depends on are already in the cache.
+
+        Args:
+            keys: ``[page_group_size, num_positions, head_size]`` post-RoPE keys
+                of the group's live slots, one row per KV head.
+
+        Returns:
+            ``[page_group_size, num_positions]`` float32, higher = keep.
+        """
+        # float32 for a stable mean / cosine over a cache-length reduction; the
+        # ranking, not the magnitude, is what the keep decision consumes.
+        k = keys.float()
+        anchor = F.normalize(k, p=2, dim=-1).mean(dim=1, keepdim=True)
+        return -F.cosine_similarity(k, anchor, dim=-1)

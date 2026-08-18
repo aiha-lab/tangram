@@ -14,6 +14,7 @@ from dataclasses import dataclass
 import numpy as np
 import torch
 
+from vllm.v1.attention.backends.ragged_layout import cluster_pages_token_major
 from vllm.v1.attention.compression.compressor import KVCompressor
 from vllm.v1.worker.block_table import BlockTable
 
@@ -330,10 +331,9 @@ class CompressionExecutor:
         head_size = self.head_size
         sink_size = int(sink_idx.numel())
 
-        # Token-major view of the cluster's blocks: permuting block_size ahead
-        # of page_group_size keeps it a view, so token t lives at block
-        # t // block_size, offset t % block_size.
-        slab_view = kv_cache[:, block_ids].permute(0, 1, 3, 2, 4)
+        # Token-major view of the cluster's blocks, so token t lives at block
+        # t // block_size, offset t % block_size (see ragged_layout).
+        slab_view = cluster_pages_token_major(kv_cache, block_ids)
 
         col_parts: list[torch.Tensor] = []
         if sink_size > 0:

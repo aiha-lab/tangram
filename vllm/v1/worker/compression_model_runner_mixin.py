@@ -54,6 +54,7 @@ from vllm.v1.attention.compression import (
     CompressionMetadata,
     KVCompressor,
 )
+from vllm.v1.attention.compression.slot_scores import KVCacheView
 from vllm.v1.attention.compression.workspace import (
     CompressionWorkspace,
     WorkspaceSpec,
@@ -512,12 +513,24 @@ class CompressionModelRunnerMixin:
                 req_id, num_static, num_groups)
 
             # Cross-layer KeepDecision; caches sorted indices + group scores
-            # for ``run_request`` (indexed by compressible position).
+            # for ``run_request`` (indexed by compressible position). The cache
+            # view is read access to this request's cached keys: a score that is
+            # relative to what is cached (KeyDiff under a fixed budget) is
+            # recomputed from them at every eviction rather than stored.
+            cache_view = KVCacheView(
+                layer_kv_caches=self.kv_caches,
+                block_table_gpu=block_table.block_table.gpu,
+                row_idx=row_idx,
+                compressed_layer_ids=static_layer_ids,
+                num_groups=num_groups,
+                block_size=self.compression_executor.block_size,
+            )
             self.compressor.prepare_keep_decision(
                 req_id=req_id,
                 prev_seq_lens_per_layer=torch.from_numpy(
                     prev_seq_lens_static),
                 chunk_len=chunk_len,
+                cache_view=cache_view,
                 params=ChunkParams(
                     ratio=req_md.compression_ratio,
                     budget_tokens=req_md.budget_tokens,
