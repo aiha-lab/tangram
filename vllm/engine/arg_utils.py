@@ -132,6 +132,26 @@ def optional_type(return_type: Callable[[str], T]) -> Callable[[str], T | None]:
     return _optional_type
 
 
+def _parse_compression_scorer_options(val: str) -> dict[str, str]:
+    """``--compression-scorer-options`` accepts ``key=value,key=value`` or JSON.
+
+    The key=value spelling is what a scorer setting reads like on a command
+    line; JSON is accepted so the flag round-trips with the config field. The
+    grammar itself lives in ``compression/scorer_options.py``, beside the
+    schema it is parsed against.
+    """
+    from vllm.v1.attention.compression.scorer_options import (
+        parse_scorer_options,
+    )
+    parsed = union_dict_and_str(val)
+    if isinstance(parsed, dict):
+        return {key: str(value) for key, value in parsed.items()}
+    try:
+        return parse_scorer_options(parsed or "")
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+
+
 def union_dict_and_str(val: str) -> str | dict[str, str] | None:
     if not re.match(r"(?s)^\s*{.*}\s*$", val):
         return str(val)
@@ -558,6 +578,10 @@ class EngineArgs:
         CacheConfig.compression_budget_tokens)
     compression_evict_current_chunk: bool = (
         CacheConfig.compression_evict_current_chunk)
+    compression_slot_score_source: str = (
+        CacheConfig.compression_slot_score_source)
+    compression_scorer_options: dict[str, str] = get_field(
+        CacheConfig, "compression_scorer_options")
     compression_window_size: int = CacheConfig.compression_window_size
     compression_n_sink_tokens: int = CacheConfig.compression_n_sink_tokens
     compression_floor_min: int = CacheConfig.compression_floor_min
@@ -994,6 +1018,18 @@ class EngineArgs:
         cache_group.add_argument(
             "--compression-evict-current-chunk",
             **cache_kwargs["compression_evict_current_chunk"],
+        )
+        cache_group.add_argument(
+            "--compression-slot-score-source",
+            **cache_kwargs["compression_slot_score_source"],
+        )
+        cache_group.add_argument(
+            "--compression-scorer-options",
+            # ``key=value,key=value`` (or a JSON object), resolved against the
+            # selected scorer's declared OPTIONS. The parser lives with the
+            # schema so the CLI, the config and the tests agree on the spelling.
+            **{**cache_kwargs["compression_scorer_options"],
+               "type": _parse_compression_scorer_options},
         )
         cache_group.add_argument(
             "--compression-window-size",
@@ -1570,6 +1606,8 @@ class EngineArgs:
             compression_budget_tokens=self.compression_budget_tokens,
             compression_evict_current_chunk=(
                 self.compression_evict_current_chunk),
+            compression_slot_score_source=self.compression_slot_score_source,
+            compression_scorer_options=self.compression_scorer_options,
             compression_window_size=self.compression_window_size,
             compression_n_sink_tokens=self.compression_n_sink_tokens,
             compression_floor_min=self.compression_floor_min,

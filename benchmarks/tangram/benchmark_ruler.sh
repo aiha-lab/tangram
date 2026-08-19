@@ -71,6 +71,25 @@ BUDGETS=${BUDGETS:-}
 # 1 = let the chunk just written compete for eviction (the KeyDiff paper's
 # behaviour); 0 (default) = protect it whole. Budget runs only.
 EVICT_CURRENT_CHUNK=${EVICT_CURRENT_CHUNK:-0}
+# Where a cached position's score comes from when it competes again under a
+# budget: auto (default) = whatever the scorer specifies; persist = keep the
+# score each position's own chunk produced. Budget runs only.
+#
+# Set it to "persist" with SCORER=keydiff to separate the two things a
+# ratio->budget comparison changes at once: the retention target (lock-in and
+# the candidate set) and the score itself (KeyDiff's anchor becomes the whole
+# cache instead of the chunk). A "budget + persist" run keeps the score a ratio
+# run would rank, so the remaining difference is the target alone. Not a serving
+# setting — the engine warns when it overrides a rescoring scorer.
+SLOT_SCORE_SOURCE=${SLOT_SCORE_SOURCE:-auto}
+# Settings the selected SCORER declares, as key=value,key=value. Empty = the
+# scorer's own defaults. Applies to ratio AND budget runs (unlike the two knobs
+# above, a scorer setting is not regime-specific).
+#
+# The one that changes what KeyDiff computes:
+#   SCORER_OPTIONS=anchor=normalized  -> Eq. (8) as written, mu(K-hat)
+#   (default, unset)                  -> mu(K), the paper's experimental setting
+SCORER_OPTIONS=${SCORER_OPTIONS:-}
 TASKS=${TASKS:-}            # empty = all 13 RULER tasks
 NUM=${NUM:-50}             # samples PER TASK (RULER ships 500/task)
 MAX_NUM_SEQS=${MAX_NUM_SEQS:-16}
@@ -112,16 +131,31 @@ fi
 if [ -n "${CHUNK_SIZE:-}" ]; then
     METHOD_ARGS+=(--compression-chunk-size "${CHUNK_SIZE}")
 fi
+# Scorer settings. Tagged into the result filename with the '=' dropped, since a
+# different setting is a different algorithm and must not overwrite a result.
+SCORER_OPTION_TAG=""
+if [ -n "${SCORER_OPTIONS}" ]; then
+    METHOD_ARGS+=(--compression-scorer-options "${SCORER_OPTIONS}")
+    SCORER_OPTION_TAG=$(echo "${SCORER_OPTIONS}" | tr '=,' '-_')
+fi
 
-# Budget-run extras. The tag keeps the two current-chunk policies in separate
-# result files so one sweep does not overwrite the other; it is spelled out
-# because it ends up in result filenames a reader has to interpret.
+# Budget-run extras. The tag keeps runs that differ only in eviction policy in
+# separate result files so one sweep does not overwrite another; each part is
+# spelled out because it ends up in result filenames a reader has to interpret.
 BUDGET_ARGS=()
-BUDGET_TAG=""
+BUDGET_TAG_PARTS=()
+if [ -n "${SCORER_OPTION_TAG}" ]; then
+    BUDGET_TAG_PARTS+=("${SCORER_OPTION_TAG}")
+fi
 if [ "${EVICT_CURRENT_CHUNK}" = "1" ]; then
     BUDGET_ARGS+=(--compression-evict-current-chunk)
-    BUDGET_TAG="evict-current-chunk"
+    BUDGET_TAG_PARTS+=("evict-current-chunk")
 fi
+if [ "${SLOT_SCORE_SOURCE}" != "auto" ]; then
+    BUDGET_ARGS+=(--compression-slot-score-source "${SLOT_SCORE_SOURCE}")
+    BUDGET_TAG_PARTS+=("${SLOT_SCORE_SOURCE}-scores")
+fi
+BUDGET_TAG=$(IFS=- ; echo "${BUDGET_TAG_PARTS[*]}")
 
 case "${SCORER}" in
     fastkvzip)
@@ -186,12 +220,16 @@ run_one() {
 
 for LENGTH in ${LENGTHS}; do
     for RATIO in ${RATIOS}; do
-        echo "===== ${SCORER} ${SELECTION}  length=${LENGTH}  ratio=${RATIO}  tp=${TP} ====="
-        run_one --ratio "${RATIO}"
+        echo "===== ${SCORER} ${SELECTION}  length=${LENGTH}  ratio=${RATIO}" \
+             "options=${SCORER_OPTIONS:-<defaults>}  tp=${TP} ====="
+        run_one --ratio "${RATIO}" \
+                ${SCORER_OPTION_TAG:+--tag "${SCORER_OPTION_TAG}"}
     done
     for BUDGET in ${BUDGETS}; do
         echo "===== ${SCORER} ${SELECTION}  length=${LENGTH}  budget=${BUDGET}" \
-             "evict_current_chunk=${EVICT_CURRENT_CHUNK}  tp=${TP} ====="
+             "evict_current_chunk=${EVICT_CURRENT_CHUNK}" \
+             "slot_score_source=${SLOT_SCORE_SOURCE}" \
+             "options=${SCORER_OPTIONS:-<defaults>}  tp=${TP} ====="
         run_one --ratio 1.0 --compression-budget-tokens "${BUDGET}" \
                 ${BUDGET_TAG:+--tag "${BUDGET_TAG}"} "${BUDGET_ARGS[@]}"
     done

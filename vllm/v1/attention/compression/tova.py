@@ -52,8 +52,8 @@ class TOVAScorer(QKScorer):
     def __init__(
         self,
         num_kv_heads: int,
-        num_q_per_kv: int,
         head_size: int,
+        num_q_per_kv: int = 1,
     ) -> None:
         super().__init__()
         self.num_kv_heads = num_kv_heads

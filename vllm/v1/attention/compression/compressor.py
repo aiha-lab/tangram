@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from typing import Protocol
+from typing import Mapping, Protocol
 
 import numpy as np
 import torch
@@ -44,6 +44,7 @@ from vllm.v1.attention.compression.selection_level import (
     make_selection_level,
 )
 from vllm.v1.attention.compression.slot_scores import (
+    SLOT_SCORE_SOURCE_AUTO,
     ChunkScoreInputs,
     KVCacheView,
     PersistedChunkScores,
@@ -160,6 +161,7 @@ class KVCompressor:
         workspace: CompressionWorkspace,
         level: str = "crosslayer_head",
         regime: str = "ratio",
+        slot_score_source: str = SLOT_SCORE_SOURCE_AUTO,
     ) -> None:
         assert num_kv_heads % page_group_size == 0, (
             f"num_kv_heads ({num_kv_heads}) must be divisible by "
@@ -206,6 +208,10 @@ class KVCompressor:
         # slot_scores.py). Replaced once the scorer is installed, since the
         # scorer is what decides whether the cache can be rescored; the default
         # keeps unit tests that install no scorer working.
+        # ``slot_score_source`` is ``cache_config.compression_slot_score_source``
+        # — "auto" in production, a source name only when an ablation pins the
+        # score provenance while the retention target changes.
+        self.slot_score_source_choice = slot_score_source
         self.slot_score_source: SlotScoreSource = PersistedChunkScores()
 
         # member->(cluster, column) maps used by the keep decision. Member row
@@ -284,34 +290,25 @@ class KVCompressor:
         self,
         scorer_name: str,
         num_q_per_kv: int,
-        snap_window: int,
-        snap_kernel: int,
-        ea_use_covariance: bool = True,
-        ea_use_vnorm: bool = True,
-        ea_n_future_positions: int = 512,
-        ea_epsilon: float = 1e-2,
+        options: Mapping[str, str] | None = None,
     ) -> None:
         """Install a gate-free query/key scorer (SnapKV, KeyDiff, StreamingLLM,
         TOVA, ExpectedAttention): one shared stateless instance per compressible
         layer. Scores come from the model's post-RoPE query/key, so no
         checkpoint is loaded. ``num_q_per_kv`` is the per-rank GQA ratio (model
         q-heads / kv-heads); scorers that ignore it (KeyDiff) simply do not use
-        it. Per-scorer hyperparameters (SnapKV ``snap_*``; ExpectedAttention
-        ``ea_*``) are forwarded but consumed only by their scorer. The concrete
-        scorer is chosen by ``build_qk_scorer`` — the one place the gate-free
-        scorer type branches — and ``scorer_consumes`` is read off the module so
-        the delivery dispatch in ``attach_scorers`` stays scorer-agnostic."""
+        it. ``options`` carries the settings the selected scorer declared in its
+        ``OPTIONS`` (see scorer_options.py), so this signature does not grow when
+        a scorer gains a hyperparameter. The concrete scorer comes from
+        ``build_qk_scorer`` — a registry lookup, with no scorer branch — and
+        ``scorer_consumes`` is read off the module so the delivery dispatch in
+        ``attach_scorers`` stays scorer-agnostic."""
         scorer = build_qk_scorer(
             scorer_name,
             num_kv_heads=self.num_kv_heads_per_layer,
             num_q_per_kv=num_q_per_kv,
             head_size=self.head_size,
-            snap_window=snap_window,
-            snap_kernel=snap_kernel,
-            ea_use_covariance=ea_use_covariance,
-            ea_use_vnorm=ea_use_vnorm,
-            ea_n_future_positions=ea_n_future_positions,
-            ea_epsilon=ea_epsilon,
+            options=options,
         ).to(device=self.device)
         scorer.eval()
         # The scorer is stateless, so all layers share one instance; the list
@@ -323,7 +320,8 @@ class KVCompressor:
     def _select_slot_score_source(self, scorer: nn.Module | None) -> None:
         """Bind the score source the installed scorer supports, and report it
         when the active regime actually consumes it."""
-        self.slot_score_source = make_slot_score_source(scorer)
+        self.slot_score_source = make_slot_score_source(
+            scorer, self.slot_score_source_choice)
         if self.regime.uses_slot_scores:
             logger.info("KV budget eviction: %s.",
                         self.slot_score_source.describe())

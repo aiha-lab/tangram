@@ -13,8 +13,11 @@ covers only the gate-free scorers that consume post-RoPE query/key.
 """
 from __future__ import annotations
 
+from typing import Mapping
+
 from torch import nn
 
+from vllm.logger import init_logger
 from vllm.v1.attention.compression.keydiff import KeyDiffScorer
 from vllm.v1.attention.compression.qk_scorer_base import QKScorer
 from vllm.v1.attention.compression.snapkv import SnapKVScorer
@@ -22,7 +25,14 @@ from vllm.v1.attention.compression.streamingllm import StreamingLLMScorer
 from vllm.v1.attention.compression.expected_attention import (
     ExpectedAttentionScorer,
 )
+from vllm.v1.attention.compression.scorer_options import (
+    ScorerOption,
+    describe_scorer_options,
+    resolve_scorer_options,
+)
 from vllm.v1.attention.compression.tova import TOVAScorer
+
+logger = init_logger(__name__)
 
 #: Axis-2 registry: ``compression_scorer`` value -> gate-free scorer class,
 #: keyed off each class's ``name`` so the accepted set has one source of truth.
@@ -45,6 +55,30 @@ _QK_SCORERS: dict[str, type[QKScorer]] = {
 #: checkpoint-backed ``"fastkvzip"`` to this set (see ``CacheConfig``).
 QK_SCORERS: tuple[str, ...] = tuple(_QK_SCORERS)
 
+#: The subset whose score is relative to the cache rather than to the chunk that
+#: wrote a position, i.e. those that can score positions already cached (they set
+#: ``rescores_cache`` and implement ``score_cached_keys``). Read off the classes
+#: so the property is stated once, on the scorer; config validation uses it to
+#: reject a forced ``compression_slot_score_source='recompute'`` at startup
+#: without constructing a scorer. The checkpoint-backed FastKVZip gate is not a
+#: member (its score comes from hidden_states, which the cache does not hold).
+RESCORING_QK_SCORERS: tuple[str, ...] = tuple(
+    name for name, cls in _QK_SCORERS.items() if cls.rescores_cache)
+
+
+def get_scorer_options(name: str) -> tuple[ScorerOption, ...]:
+    """The settings ``name`` declares, for validation and help text.
+
+    Exposed so configuration can reject a bad option at startup without
+    constructing a scorer (which needs model dimensions it does not have).
+    """
+    scorer_cls = _QK_SCORERS.get(name)
+    if scorer_cls is None:
+        raise ValueError(
+            f"get_scorer_options: unknown gate-free qk scorer {name!r}; "
+            f"expected one of {QK_SCORERS}.")
+    return scorer_cls.OPTIONS
+
 
 def build_qk_scorer(
     name: str,
@@ -52,53 +86,38 @@ def build_qk_scorer(
     num_kv_heads: int,
     num_q_per_kv: int,
     head_size: int,
-    snap_window: int,
-    snap_kernel: int,
-    ea_use_covariance: bool = True,
-    ea_use_vnorm: bool = True,
-    ea_n_future_positions: int = 512,
-    ea_epsilon: float = 1e-2,
+    options: Mapping[str, str] | None = None,
 ) -> nn.Module:
     """Construct the gate-free query/key scorer selected by ``name``.
 
-    ``num_q_per_kv`` is the per-rank GQA ratio (model q-heads / kv-heads);
-    scorers that ignore it (KeyDiff) simply do not use it. Per-scorer
-    hyperparameters (SnapKV's ``snap_window`` / ``snap_kernel``;
-    ExpectedAttention's ``ea_*``) are likewise consumed only by the scorer that
-    needs them. The returned module exposes ``consumes`` / ``name`` for the
-    delivery dispatch in ``attach_scorers``.
+    Every scorer is built through ONE shared contract — ``num_kv_heads`` /
+    ``head_size`` / ``num_q_per_kv`` (the per-rank GQA ratio), which a scorer
+    that does not need one simply ignores — plus the settings it declared in
+    ``OPTIONS``, resolved from ``options`` (see scorer_options.py). There is
+    deliberately no per-scorer branch here: adding a scorer, or a setting on
+    one, must not require editing this factory, the configuration, the CLI or
+    the entrypoint.
+
+    Args:
+        name: ``compression_scorer`` value; a registry key.
+        options: raw ``{key: value}`` strings for this scorer's declared
+            settings. Unknown keys raise rather than being ignored.
+
+    Returns:
+        The scorer module, exposing ``consumes`` / ``name`` for the delivery
+        dispatch in ``attach_scorers``.
     """
-    if name == "snapkv":
-        return SnapKVScorer(
-            num_kv_heads=num_kv_heads,
-            num_q_per_kv=num_q_per_kv,
-            head_size=head_size,
-            snap_window=snap_window,
-            snap_kernel=snap_kernel,
-        )
-    if name == "keydiff":
-        return KeyDiffScorer(
-            num_kv_heads=num_kv_heads,
-            head_size=head_size,
-        )
-    if name == "streamingllm":
-        return StreamingLLMScorer(num_kv_heads=num_kv_heads)
-    if name == "tova":
-        return TOVAScorer(
-            num_kv_heads=num_kv_heads,
-            num_q_per_kv=num_q_per_kv,
-            head_size=head_size,
-        )
-    if name == "expected_attention":
-        return ExpectedAttentionScorer(
-            num_kv_heads=num_kv_heads,
-            num_q_per_kv=num_q_per_kv,
-            head_size=head_size,
-            use_covariance=ea_use_covariance,
-            use_vnorm=ea_use_vnorm,
-            n_future_positions=ea_n_future_positions,
-            epsilon=ea_epsilon,
-        )
-    raise ValueError(
-        f"build_qk_scorer: unknown gate-free qk scorer {name!r}; "
-        f"expected one of {QK_SCORERS}.")
+    scorer_cls = _QK_SCORERS.get(name)
+    if scorer_cls is None:
+        raise ValueError(
+            f"build_qk_scorer: unknown gate-free qk scorer {name!r}; "
+            f"expected one of {QK_SCORERS}.")
+    resolved = resolve_scorer_options(name, scorer_cls.OPTIONS, options)
+    logger.info("Compression %s",
+                describe_scorer_options(name, scorer_cls.OPTIONS, resolved))
+    return scorer_cls(
+        num_kv_heads=num_kv_heads,
+        head_size=head_size,
+        num_q_per_kv=num_q_per_kv,
+        **resolved,
+    )

@@ -21,6 +21,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from vllm.v1.attention.compression.qk_scorer_base import QKScorer
+from vllm.v1.attention.compression.scorer_options import ScorerOption
 
 
 class SnapKVScorer(QKScorer):
@@ -37,20 +38,34 @@ class SnapKVScorer(QKScorer):
     consumes = "qk"
     name = "snapkv"
 
+    OPTIONS = (
+        ScorerOption(
+            "window", int, 32,
+            "Trailing queries used as the observation window when scoring a "
+            "chunk. Distinct from compression_window_size (the always-kept "
+            "recent region); auto-shrinks to 16 for chunks shorter than 1000, "
+            "matching the reference."),
+        ScorerOption(
+            "kernel", int, 7,
+            "Odd max-pool1d kernel size smoothing the observation-window "
+            "attention before ranking."),
+    )
+
     def __init__(
         self,
         num_kv_heads: int,
-        num_q_per_kv: int,
         head_size: int,
-        snap_window: int,
-        snap_kernel: int,
+        num_q_per_kv: int = 1,
+        *,
+        window: int = 32,
+        kernel: int = 7,
     ) -> None:
         super().__init__()
         self.num_kv_heads = num_kv_heads
         self.num_q_per_kv = num_q_per_kv
         self.head_size = head_size
-        self.snap_window = snap_window
-        self.snap_kernel = snap_kernel
+        self.snap_window = window
+        self.snap_kernel = kernel
         self._scale = math.sqrt(head_size)
 
     @torch.no_grad()

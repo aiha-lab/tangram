@@ -228,6 +228,12 @@ def run_task(
         "ratio": args.ratio,
         "budget_tokens": args.compression_budget_tokens,
         "evict_current_chunk": args.compression_evict_current_chunk,
+        # Which score the eviction ranked. Recorded because a forced source is
+        # a different experiment, not a different run of the same one.
+        "slot_score_source": args.compression_slot_score_source,
+        # Scorer settings in force; a different anchor is a different algorithm,
+        # so a result file that omitted them could not be compared later.
+        "scorer_options": args.compression_scorer_options,
         "compression_chunk_size": args.compression_chunk_size,
         "page_group_size": args.page_group_size,
         "max_tokens": max_tokens,

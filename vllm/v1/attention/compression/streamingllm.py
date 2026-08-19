@@ -49,7 +49,16 @@ class StreamingLLMScorer(QKScorer):
     consumes = "qk"
     name = "streamingllm"
 
-    def __init__(self, num_kv_heads: int) -> None:
+    def __init__(
+        self,
+        num_kv_heads: int,
+        head_size: int = 0,
+        num_q_per_kv: int = 1,
+    ) -> None:
+        # ``head_size`` / ``num_q_per_kv`` are part of the shared
+        # construction contract every scorer is built with; a purely
+        # positional score needs neither.
+        del head_size, num_q_per_kv
         super().__init__()
         self.num_kv_heads = num_kv_heads
 

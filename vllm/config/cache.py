@@ -3,7 +3,7 @@
 
 import os
 from dataclasses import field
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, ClassVar, Literal
 
 from pydantic import Field, SkipValidation, field_validator
 from pydantic.dataclasses import dataclass
@@ -220,6 +220,25 @@ class CacheConfig:
     chunk compete like any other region, which reaches the budget sooner on
     prompts whose chunk size is large relative to the budget. Ignored under the
     ratio regime, whose protected tail is always the recent window."""
+    compression_slot_score_source: str = "auto"
+    """Budget regime only: where a cached position's score comes from when it
+    competes in a later chunk's eviction.
+
+    ``"auto"`` (default, the only setting meant for serving) derives it from the
+    scorer, which is the thing that decides it: a scorer whose score is relative
+    to the cache (KeyDiff) rescores every live position from the cached keys
+    (``"recompute"``), and any other scorer keeps the score each position's own
+    chunk produced (``"persist"``). See ``slot_scores.py``.
+
+    Naming a source forces it, which exists for ablations: switching a KeyDiff
+    run from a ratio to a budget changes the retention target AND the score
+    (chunk-local anchor -> whole-cache anchor) at once, and forcing ``"persist"``
+    holds the score at what the ratio regime ranks so the two effects can be
+    measured apart. Forcing ``"persist"`` on a rescoring scorer therefore ranks
+    positions by scores the method does not specify; forcing ``"recompute"`` on a
+    scorer that cannot rescore is rejected. Requires
+    ``compression_budget_tokens``: the ratio regime has no cached position to
+    score, so a forced source there would silently do nothing."""
     compression_window_size: int = 32
     """Recent tokens always kept during scoring."""
     compression_n_sink_tokens: int = 4
@@ -276,6 +295,30 @@ class CacheConfig:
     position) alone — a recency baseline, and TOVA from the last query's
     attention averaged across heads (head-uniform). ``"fastkvzip"`` instead uses
     the trained gate over hidden_states (needs a checkpoint)."""
+    compression_scorer_options: dict[str, str] = field(default_factory=dict)
+    """Axis 2 — settings that only the selected ``compression_scorer``
+    understands, as ``{key: value}`` (CLI: ``--compression-scorer-options
+    key=value,key=value``, or a JSON object).
+
+    Each scorer DECLARES the settings it accepts, their types, their defaults
+    and their help text (``QKScorer.OPTIONS``; see
+    ``compression/scorer_options.py``), and this one channel carries them. That
+    is deliberate: a scorer-specific configuration field would have to be added
+    here, in the CLI, in the ``LLM`` entrypoint and in two factory signatures
+    every time a scorer gains a setting, which is precisely what the axis-2
+    registry exists to avoid. An unknown key is rejected at startup, naming the
+    keys the active scorer does accept.
+
+    Example — reproduce the KeyDiff paper's Eq. (8) anchor instead of the
+    unnormalized mean its experiments use::
+
+        --compression-scorer keydiff --compression-scorer-options anchor=normalized
+
+    TODO(compression): the per-scorer fields below (``compression_snap_*``,
+    ``compression_ea_*``) predate this channel and are kept as aliases into it
+    so existing scripts and documentation keep working. They should be removed
+    once callers have migrated; the scorer's ``OPTIONS`` already own the
+    defaults, so removing them is a deletion, not a redesign."""
     compression_snap_window: int = 32
     """SnapKV observation window: number of trailing queries used to score a
     chunk. Distinct from ``compression_window_size`` (the always-kept recent
@@ -378,6 +421,7 @@ class CacheConfig:
             "compression_ratio",
             "compression_budget_tokens",
             "compression_evict_current_chunk",
+            "compression_slot_score_source",
             "compression_floor_min",
             "compression_chunk_size",
             "compression_window_size",
@@ -385,6 +429,7 @@ class CacheConfig:
             "compression_gate_path",
             "compression_level",
             "compression_scorer",
+            "compression_scorer_options",
             "compression_snap_window",
             "compression_snap_kernel",
             "compression_ea_use_covariance",
@@ -448,6 +493,43 @@ class CacheConfig:
         self._derive_head_groups()
         self._validate_extended_fields()
 
+    #: Per-scorer configuration fields that predate ``compression_scorer_options``,
+    #: as ``{scorer: {option name: field name}}``. They are pure aliases: the
+    #: scorer's ``OPTIONS`` hold the real defaults, and a test pins the two in
+    #: agreement so the aliases cannot drift. Remove with the fields (see the
+    #: TODO on ``compression_scorer_options``).
+    _LEGACY_SCORER_OPTION_FIELDS: ClassVar[dict[str, dict[str, str]]] = {
+        "snapkv": {
+            "window": "compression_snap_window",
+            "kernel": "compression_snap_kernel",
+        },
+        "expected_attention": {
+            "use_covariance": "compression_ea_use_covariance",
+            "use_vnorm": "compression_ea_use_vnorm",
+            "n_future_positions": "compression_ea_n_future_positions",
+            "epsilon": "compression_ea_epsilon",
+        },
+    }
+
+    @property
+    def resolved_scorer_options(self) -> dict[str, str]:
+        """The active scorer's settings as raw strings: legacy alias fields
+        first, then ``compression_scorer_options`` on top.
+
+        Explicit options win, so a user migrating to the generic channel can
+        override a legacy flag without having to unset it. Aliases for other
+        scorers are never included — a SnapKV field must not reach KeyDiff.
+        """
+        options = {
+            option: str(getattr(self, field_name))
+            for option, field_name in self._LEGACY_SCORER_OPTION_FIELDS.get(
+                self.compression_scorer, {}).items()
+        }
+        options.update(
+            {key: str(value)
+             for key, value in self.compression_scorer_options.items()})
+        return options
+
     @property
     def compression_enabled(self) -> bool:
         """Whether KV cache compression runs — either retention target being
@@ -509,6 +591,48 @@ class CacheConfig:
                 "--compression-evict-current-chunk to protect only the recent "
                 "window instead of the whole fresh chunk."
             )
+
+    def _validate_slot_score_source(self) -> None:
+        """Reject a forced score provenance that cannot mean what it says.
+
+        The setting is an ablation instrument (see the field docstring), so a
+        value that would quietly do nothing is worse than an error: the run
+        would look like the ablation and not be it. Two ways that happens — the
+        ratio regime, which never scores a cached position at all, and a source
+        the active scorer cannot produce.
+        """
+        from vllm.v1.attention.compression.slot_scores import (
+            SLOT_SCORE_SOURCE_AUTO,
+            SLOT_SCORE_SOURCE_CHOICES,
+        )
+        source = self.compression_slot_score_source
+        if source not in SLOT_SCORE_SOURCE_CHOICES:
+            raise ValueError(
+                f"compression_slot_score_source must be one of "
+                f"{SLOT_SCORE_SOURCE_CHOICES}, got {source!r}.")
+        if source == SLOT_SCORE_SOURCE_AUTO:
+            return
+        if self.compression_budget_tokens is None:
+            raise ValueError(
+                f"compression_slot_score_source={source!r} requires "
+                "compression_budget_tokens. Only a budget lets an old position "
+                "compete again, so only it needs that position's score; under "
+                "the ratio regime a kept position is locked in and the setting "
+                "would have no effect. Leave it at 'auto'.")
+        if source == "recompute":
+            # Checked here too so the failure lands at startup naming both
+            # knobs; the factory enforces the same rule against the scorer
+            # instance (``rescores_cache``), which stays the authority.
+            from vllm.v1.attention.compression.scorer import (
+                RESCORING_QK_SCORERS,
+            )
+            if self.compression_scorer not in RESCORING_QK_SCORERS:
+                raise ValueError(
+                    f"compression_slot_score_source='recompute' needs a scorer "
+                    f"that scores cached positions (one of "
+                    f"{RESCORING_QK_SCORERS}), but compression_scorer is "
+                    f"{self.compression_scorer!r}. Use 'auto', or pick a "
+                    "rescoring scorer.")
 
     def _validate_extended_fields(self) -> None:
         # Ragged paging.
@@ -592,6 +716,7 @@ class CacheConfig:
                     f"({self.compression_window_size})."
                 )
             self._validate_budget_target()
+            self._validate_slot_score_source()
             # Axis 1 — selection level. Validated against the registry that
             # ``make_selection_level`` dispatches on (single source of truth);
             # the local import keeps the torch-backed runtime module out of the
@@ -614,6 +739,29 @@ class CacheConfig:
                     f"compression_scorer must be one of {valid_scorers}, "
                     f"got {self.compression_scorer!r}."
                 )
+            # Axis-2 scorer settings. Resolved (not just parsed) here so an
+            # unknown key or an out-of-range value fails at startup with the
+            # scorer's accepted keys in the message, rather than deep inside
+            # model loading. The scorer class owns the schema; this is only the
+            # early check.
+            if self.compression_scorer == "fastkvzip":
+                if self.compression_scorer_options:
+                    raise ValueError(
+                        "compression_scorer_options is for the gate-free "
+                        "query/key scorers; the fastkvzip gate has no options "
+                        "(its behaviour comes from the checkpoint, see "
+                        "compression_gate_path).")
+            else:
+                from vllm.v1.attention.compression.scorer import (
+                    get_scorer_options,
+                )
+                from vllm.v1.attention.compression.scorer_options import (
+                    resolve_scorer_options,
+                )
+                resolve_scorer_options(
+                    self.compression_scorer,
+                    get_scorer_options(self.compression_scorer),
+                    self.resolved_scorer_options)
             # The gate checkpoint is only consumed by the fastkvzip scorer;
             # every other (gate-free) scorer ignores the path.
             if self.compression_scorer == "fastkvzip" and (

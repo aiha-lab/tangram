@@ -224,6 +224,7 @@ class CompressionModelRunnerMixin:
             workspace=self.compression_workspace,
             level=cache_config.compression_level,
             regime=cache_config.compression_regime,
+            slot_score_source=cache_config.compression_slot_score_source,
         )
         # Axis-2 scorer selection. FastKVZip loads a
         # per-layer gate checkpoint over hidden_states; every other scorer is a
@@ -241,13 +242,7 @@ class CompressionModelRunnerMixin:
                 cache_config.compression_scorer,
                 num_q_per_kv=self.model_config.get_num_attention_heads(
                     self.parallel_config) // num_kv_heads_per_rank,
-                snap_window=cache_config.compression_snap_window,
-                snap_kernel=cache_config.compression_snap_kernel,
-                ea_use_covariance=cache_config.compression_ea_use_covariance,
-                ea_use_vnorm=cache_config.compression_ea_use_vnorm,
-                ea_n_future_positions=(
-                    cache_config.compression_ea_n_future_positions),
-                ea_epsilon=cache_config.compression_ea_epsilon,
+                options=cache_config.resolved_scorer_options,
             )
         # Bind the same member->cluster map the FlashAttention builder uses so
         # scoring max-pools over the physical clusters (cross-layer when a map

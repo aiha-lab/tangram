@@ -13,7 +13,14 @@ import torch
 import torch.nn.functional as F
 
 from vllm.v1.attention.compression.keydiff import KeyDiffScorer
+from vllm.v1.attention.compression.qk_scorer_base import (
+    RESCORE_KEYS,
+    RESCORE_POSITIONS,
+    RESCORE_VALUES,
+    CachedPositions,
+)
 from vllm.v1.attention.compression.slot_scores import (
+    SLOT_SCORE_SOURCE_CHOICES,
     KVCacheView,
     PersistedChunkScores,
     RecomputedCacheScores,
@@ -80,7 +87,7 @@ def build_cache_and_view(
 
 
 def test_cache_view_reads_the_documented_layout():
-    """``cluster_keys`` must return exactly the keys that were written, in slot
+    """``materialize`` must return exactly the keys that were written, in slot
     order — the whole rescoring path rests on this addressing."""
     generator = torch.Generator().manual_seed(0)
     live_lens = np.array([[7, 4], [12, 1]], dtype=np.int64)
@@ -88,21 +95,24 @@ def test_cache_view_reads_the_documented_layout():
     for layer_idx in range(NUM_LAYERS):
         for group_idx in range(NUM_GROUPS):
             num_positions = int(live_lens[layer_idx, group_idx])
-            got = view.cluster_keys(layer_idx, group_idx, num_positions)
+            got = view.materialize(
+                layer_idx, group_idx, num_positions,
+                (RESCORE_KEYS, )).require(RESCORE_KEYS)
             assert got.shape == (
                 PAGE_GROUP_SIZE, num_positions, HEAD_SIZE)
             torch.testing.assert_close(got, written[(layer_idx, group_idx)])
 
 
 def test_keydiff_cached_score_is_the_paper_formula():
-    """``score_cached_keys`` is Eq. (8): the anchor is the mean direction of ALL
-    the keys handed to it, and every key is scored against it."""
+    """``score_cached`` is the paper's rule: ONE anchor over all the keys handed
+    to it, and every key scored against it. The default anchor is the paper's
+    experimental setting, the mean of the raw keys."""
     generator = torch.Generator().manual_seed(1)
     keys = torch.rand(PAGE_GROUP_SIZE, 13, HEAD_SIZE, generator=generator)
     scorer = KeyDiffScorer(num_kv_heads=NUM_KV_HEADS, head_size=HEAD_SIZE)
 
-    got = scorer.score_cached_keys(keys)
-    anchor = F.normalize(keys.float(), p=2, dim=-1).mean(dim=1, keepdim=True)
+    got = scorer.score_cached(CachedPositions(keys=keys, num_positions=keys.shape[1]))
+    anchor = keys.float().mean(dim=1, keepdim=True)
     expected = -F.cosine_similarity(keys.float(), anchor, dim=-1)
     torch.testing.assert_close(got, expected)
     assert got.shape == (PAGE_GROUP_SIZE, 13)
@@ -120,9 +130,9 @@ def test_keydiff_whole_cache_anchor_differs_from_the_chunk_anchor():
     whole = torch.cat([chunk_a, chunk_b], dim=1)
 
     per_chunk = torch.cat(
-        [scorer.score_cached_keys(chunk_a),
-         scorer.score_cached_keys(chunk_b)], dim=1)
-    whole_cache = scorer.score_cached_keys(whole)
+        [scorer.score_cached(CachedPositions(keys=chunk_a, num_positions=chunk_a.shape[1])),
+         scorer.score_cached(CachedPositions(keys=chunk_b, num_positions=chunk_b.shape[1]))], dim=1)
+    whole_cache = scorer.score_cached(CachedPositions(keys=whole, num_positions=whole.shape[1]))
     per_chunk_rank = per_chunk.argsort(dim=-1)
     whole_rank = whole_cache.argsort(dim=-1)
     assert not torch.equal(per_chunk_rank, whole_rank), (
@@ -176,8 +186,9 @@ def test_recompute_source_fills_every_live_slot():
     for layer_idx in range(NUM_LAYERS):
         for group_idx in range(NUM_GROUPS):
             num_positions = int(live_lens[layer_idx, group_idx])
-            expected = scorer.score_cached_keys(
-                written[(layer_idx, group_idx)])
+            group_keys = written[(layer_idx, group_idx)]
+            expected = scorer.score_cached(CachedPositions(
+                keys=group_keys, num_positions=group_keys.shape[1]))
             for col in range(PAGE_GROUP_SIZE):
                 head = group_idx * PAGE_GROUP_SIZE + col
                 torch.testing.assert_close(
@@ -213,7 +224,7 @@ def test_source_selection_follows_the_scorer():
     keydiff = KeyDiffScorer(num_kv_heads=NUM_KV_HEADS, head_size=HEAD_SIZE)
     snapkv = SnapKVScorer(
         num_kv_heads=NUM_KV_HEADS, num_q_per_kv=2, head_size=HEAD_SIZE,
-        snap_window=8, snap_kernel=3)
+        window=8, kernel=3)
     assert isinstance(make_slot_score_source(keydiff), RecomputedCacheScores)
     assert isinstance(make_slot_score_source(snapkv), PersistedChunkScores)
     assert isinstance(make_slot_score_source(None), PersistedChunkScores)
@@ -238,3 +249,194 @@ def test_budget_regime_skips_chunk_scoring_only_when_recomputing():
     assert RatioRegime().consumes_chunk_scores(recompute)
     assert not RatioRegime().uses_slot_scores
     assert BudgetRegime().uses_slot_scores
+
+
+def test_forcing_a_source_overrides_the_scorer_for_ablations():
+    """A source name pins the provenance so a budget run can rank the same
+    scores a ratio run would, isolating the retention target from the score."""
+    keydiff = KeyDiffScorer(num_kv_heads=NUM_KV_HEADS, head_size=HEAD_SIZE)
+    snapkv = SnapKVScorer(
+        num_kv_heads=NUM_KV_HEADS, num_q_per_kv=2, head_size=HEAD_SIZE,
+        window=8, kernel=3)
+
+    forced = make_slot_score_source(keydiff, "persist")
+    assert isinstance(forced, PersistedChunkScores)
+    # The chunk scorer must run again: the ablation ranks the scores the chunks
+    # produced, so skipping them would leave the buffer empty.
+    assert forced.needs_chunk_scores
+    # The startup line must not claim the scorer is incapable — it is not.
+    assert forced.forced_over_recompute
+    assert "forced for an ablation" in forced.describe()
+
+    # Forcing what auto would have picked anyway is a no-op, not an ablation.
+    assert isinstance(
+        make_slot_score_source(keydiff, "recompute"), RecomputedCacheScores)
+    plain = make_slot_score_source(snapkv, "persist")
+    assert isinstance(plain, PersistedChunkScores)
+    assert not plain.forced_over_recompute
+
+
+def test_forcing_recompute_on_a_non_rescoring_scorer_is_rejected():
+    """Not degradable: the score simply cannot be reconstructed, so failing
+    loudly beats ranking cached positions by something else."""
+    snapkv = SnapKVScorer(
+        num_kv_heads=NUM_KV_HEADS, num_q_per_kv=2, head_size=HEAD_SIZE,
+        window=8, kernel=3)
+    with pytest.raises(ValueError, match="rescores_cache"):
+        make_slot_score_source(snapkv, "recompute")
+    with pytest.raises(ValueError, match="rescores_cache"):
+        make_slot_score_source(None, "recompute")
+    with pytest.raises(ValueError, match="must be one of"):
+        make_slot_score_source(snapkv, "accumulate")
+
+
+def test_config_rejects_a_forced_source_that_would_do_nothing():
+    """The setting is a measurement instrument: a run that silently ignores it
+    would look like the ablation without being it."""
+    from vllm.config.cache import CacheConfig
+
+    def build(**overrides):
+        kwargs = dict(page_group_size=PAGE_GROUP_SIZE,
+                      compression_budget_tokens=4096,
+                      compression_chunk_size=1024,
+                      compression_scorer="keydiff")
+        kwargs.update(overrides)
+        return CacheConfig(**kwargs)
+
+    assert build().compression_slot_score_source == "auto"
+    assert "auto" in SLOT_SCORE_SOURCE_CHOICES
+    for source in SLOT_SCORE_SOURCE_CHOICES:
+        assert build(compression_slot_score_source=source)
+
+    # Ratio regime: nothing ever scores a cached position.
+    with pytest.raises(ValueError, match="requires compression_budget_tokens"):
+        build(compression_slot_score_source="persist",
+              compression_budget_tokens=None, compression_ratio=0.5)
+    # Recompute against a scorer that cannot.
+    with pytest.raises(ValueError, match="needs a scorer"):
+        build(compression_slot_score_source="recompute",
+              compression_scorer="snapkv")
+    with pytest.raises(ValueError, match="must be one of"):
+        build(compression_slot_score_source="accumulate")
+
+
+def test_scorer_options_are_declared_by_the_scorer():
+    """A setting's default, accepted values and type live with the scorer, so
+    adding one is a subclass change rather than a config/CLI/factory change."""
+    from vllm.v1.attention.compression.scorer import (
+        QK_SCORERS,
+        build_qk_scorer,
+        get_scorer_options,
+    )
+    from vllm.v1.attention.compression.scorer_options import (
+        parse_scorer_options,
+        resolve_scorer_options,
+    )
+
+    # Every registered scorer builds through the one shared contract.
+    for name in QK_SCORERS:
+        scorer = build_qk_scorer(
+            name, num_kv_heads=NUM_KV_HEADS, num_q_per_kv=2,
+            head_size=HEAD_SIZE, options=None)
+        assert scorer.name == name
+
+    assert parse_scorer_options("anchor=normalized, window=8") == {
+        "anchor": "normalized", "window": "8"}
+    assert parse_scorer_options("") == {}
+    with pytest.raises(ValueError, match="key=value"):
+        parse_scorer_options("anchor")
+
+    # Types come from the declaration, not from the caller.
+    resolved = resolve_scorer_options(
+        "expected_attention", get_scorer_options("expected_attention"),
+        {"use_vnorm": "false", "n_future_positions": "128"})
+    assert resolved["use_vnorm"] is False
+    assert resolved["n_future_positions"] == 128
+    assert resolved["use_covariance"] is True          # untouched default
+
+    with pytest.raises(ValueError, match="unknown scorer option"):
+        resolve_scorer_options("keydiff", get_scorer_options("keydiff"),
+                               {"anchr": "normalized"})
+    with pytest.raises(ValueError, match="expected one of"):
+        resolve_scorer_options("keydiff", get_scorer_options("keydiff"),
+                               {"anchor": "mean"})
+
+
+def test_legacy_scorer_flags_agree_with_the_declared_defaults():
+    """The pre-existing per-scorer config fields are aliases into the option
+    channel, so their defaults must equal what the scorer declares — otherwise
+    removing the aliases later would silently change behaviour."""
+    from vllm.config.cache import CacheConfig
+    from vllm.v1.attention.compression.scorer import get_scorer_options
+
+    for scorer, aliases in CacheConfig._LEGACY_SCORER_OPTION_FIELDS.items():
+        declared = {opt.name: opt for opt in get_scorer_options(scorer)}
+        for option_name, field_name in aliases.items():
+            assert option_name in declared, (
+                f"{field_name} aliases {scorer}.{option_name}, which the "
+                "scorer does not declare")
+            assert getattr(CacheConfig, field_name) == \
+                declared[option_name].default, (
+                    f"{field_name} default disagrees with "
+                    f"{scorer}.{option_name}")
+
+
+def test_keydiff_anchor_option_selects_the_published_formula():
+    """Both entry points must use the SAME anchor: a scorer that ranked the
+    fresh chunk by one definition and the cache by another would be neither."""
+    generator = torch.Generator().manual_seed(7)
+    keys = torch.rand(1, 12, HEAD_SIZE, generator=generator) + 0.5
+    flat_key = keys[0].reshape(12, 1 * HEAD_SIZE)
+
+    for anchor_name, anchor_fn in (
+        ("unnormalized", lambda k: k.mean(dim=1, keepdim=True)),
+        ("normalized",
+         lambda k: F.normalize(k, p=2, dim=-1).mean(dim=1, keepdim=True)),
+    ):
+        scorer = KeyDiffScorer(num_kv_heads=1, head_size=HEAD_SIZE,
+                               anchor=anchor_name)
+        expected = -F.cosine_similarity(
+            keys.float(), anchor_fn(keys.float()), dim=-1)
+        cached = scorer.score_cached(
+            CachedPositions(keys=keys, num_positions=keys.shape[1]))
+        torch.testing.assert_close(cached, expected)
+        # forward sees the same tokens as one chunk, so it must agree.
+        chunk = scorer(query=torch.empty(0), key=flat_key)
+        torch.testing.assert_close(chunk, expected)
+
+    # The two formulas really do rank differently (otherwise the option would
+    # be decoration): raw-mean lets a long key pull the anchor towards itself.
+    unnorm = KeyDiffScorer(num_kv_heads=1, head_size=HEAD_SIZE,
+                           anchor="unnormalized")
+    norm = KeyDiffScorer(num_kv_heads=1, head_size=HEAD_SIZE,
+                         anchor="normalized")
+    skewed = keys.clone()
+    skewed[0, 0] *= 20.0
+    request = CachedPositions(keys=skewed, num_positions=skewed.shape[1])
+    assert not torch.equal(
+        unnorm.score_cached(request).argsort(dim=-1),
+        norm.score_cached(request).argsort(dim=-1))
+
+
+def test_rescore_inputs_are_materialized_on_demand():
+    """The runner builds exactly what the scorer declared — so a scorer needing
+    values or positions can be added without changing this contract again."""
+    generator = torch.Generator().manual_seed(11)
+    live_lens = np.full((NUM_LAYERS, NUM_GROUPS), 6, dtype=np.int64)
+    view, _ = build_cache_and_view(live_lens, generator)
+
+    keys_only = view.materialize(0, 0, 6, (RESCORE_KEYS, ))
+    assert keys_only.keys is not None and keys_only.values is None
+    assert keys_only.num_positions == 6
+    with pytest.raises(RuntimeError, match="rescore_inputs"):
+        keys_only.require(RESCORE_VALUES)
+
+    both = view.materialize(0, 0, 6, (RESCORE_KEYS, RESCORE_VALUES))
+    assert both.values is not None
+    assert both.values.shape == both.keys.shape
+
+    # Declared but not yet servable: refused loudly, never approximated.
+    with pytest.raises(NotImplementedError, match="per-slot position channel"):
+        view.materialize(0, 0, 6, (RESCORE_KEYS, RESCORE_POSITIONS))
+    with pytest.raises(ValueError, match="not cache inputs"):
+        view.materialize(0, 0, 6, ("logits", ))

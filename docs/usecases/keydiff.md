@@ -9,8 +9,8 @@ The scorer reads the model's post-RoPE keys and nothing else:
 
 ```python
 k = key.reshape(chunk_len, self.num_kv_heads, self.head_size).float()
-anchor = F.normalize(k, p=2, dim=-1).mean(dim=0, keepdim=True)  # chunk mean direction
-score = -F.cosine_similarity(k, anchor, dim=-1)                 # [T, H], higher = keep
+anchor = k.mean(dim=0, keepdim=True)             # mean key of the chunk, mu(K)
+score = -F.cosine_similarity(k, anchor, dim=-1)  # [T, H], higher = keep
 ```
 
 Keys pointing near the chunk's mean direction are the least distinctive, so negating the
@@ -21,6 +21,29 @@ state across chunks).
 
 The `[num_kv_heads, chunk_len]` score it returns is the contract every Tangram scorer
 shares, so `compression_level` stays an orthogonal knob.
+
+### The anchor has two published spellings
+
+`--compression-scorer-options anchor=...` selects which mean the keys are compared
+against:
+
+| value | anchor | where it comes from |
+|---|---|---|
+| `unnormalized` (default) | mean of the raw keys, `mu(K)` | the paper's §3.2: *"We evaluate the efficient KeyDiff described in Figure 3 using unnormalized keys k in all subsequent sections"* — what its reported numbers use |
+| `normalized` | mean of the L2-normalized directions, `mu(K-hat)` | Eq. (8) as written; also what NVIDIA KVpress computes |
+
+The paper reports the two as equally accurate (Table 15). `cosine_similarity`
+normalizes both of its arguments, so only the anchor's *direction* differs: averaging
+raw keys lets a long key pull the mean towards itself, averaging directions gives every
+key the same pull.
+
+### Under a fixed KV budget the anchor spans the whole cache
+
+With `--compression-budget-tokens` nothing is locked in, so every live position competes
+at each eviction and KeyDiff rescores them all against the mean of the keys **currently
+cached** — Eq. (8)'s `K`, not one chunk's. That is the paper's rule (Eq. 4:
+`C <- [K || k_new]; C' <- pi_N(C)`), and it needs no stored statistics because the keys
+it depends on are already in the cache. The selected `anchor` applies there too.
 
 ## How to run
 

@@ -27,6 +27,9 @@ from typing import Any
 import numpy as np
 
 from vllm import LLM
+from vllm.v1.attention.compression.scorer_options import (
+    parse_scorer_options,
+)
 
 
 DEFAULT_PERCENTILES: tuple[float, ...] = (50.0, 90.0, 95.0, 99.0)
@@ -270,6 +273,28 @@ def add_compression_args(parser: argparse.ArgumentParser) -> None:
             "eviction (the reference behaviour) instead of protecting it whole."
         ),
     )
+    parser.add_argument(
+        "--compression-slot-score-source", type=str, default="auto",
+        choices=("auto", "persist", "recompute"),
+        help=(
+            "Budget regime only: where a cached position's score comes from "
+            "when it competes again. 'auto' (default) takes what the scorer "
+            "specifies. Forcing 'persist' with a rescoring scorer (keydiff) is "
+            "the ablation that separates the retention target from the score: "
+            "it ranks the chunk-local scores a ratio run also ranks, so what "
+            "remains between a ratio and a budget run is the target alone."
+        ),
+    )
+    parser.add_argument(
+        "--compression-scorer-options", type=str, default="",
+        help=(
+            "Settings the selected --compression-scorer declares, as "
+            "key=value,key=value (see the scorer's OPTIONS). Example: "
+            "--compression-scorer keydiff --compression-scorer-options "
+            "anchor=normalized to rank by KeyDiff Eq. (8)'s normalized anchor "
+            "instead of the unnormalized mean its experiments use."
+        ),
+    )
     parser.add_argument("--page-group-size", type=int, default=4)
     parser.add_argument(
         "--head-group-cluster-map", type=str, default=None,
@@ -423,6 +448,10 @@ def build_llm(args: argparse.Namespace) -> LLM:
             compression_budget_tokens=budget_tokens,
             compression_evict_current_chunk=getattr(
                 args, "compression_evict_current_chunk", False),
+            compression_slot_score_source=getattr(
+                args, "compression_slot_score_source", "auto"),
+            compression_scorer_options=parse_scorer_options(
+                getattr(args, "compression_scorer_options", "") or ""),
             compression_chunk_size=args.compression_chunk_size,
             compression_n_sink_tokens=args.compression_n_sink_tokens,
             compression_window_size=args.compression_window_size,
