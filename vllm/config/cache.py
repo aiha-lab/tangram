@@ -218,8 +218,8 @@ class CacheConfig:
     in our measurements. ``True`` protects only the always-kept
     ``compression_window_size`` recent tokens and lets the rest of the fresh
     chunk compete like any other region, which reaches the budget sooner on
-    prompts whose chunk size is large relative to the budget. Ignored under the
-    ratio regime, whose protected tail is always the recent window."""
+    prompts whose chunk size is large relative to the budget. Requires a
+    budget: the ratio regime's protected tail is always the recent window."""
     compression_slot_score_source: str = "auto"
     """Budget regime only: where a cached position's score comes from when it
     competes in a later chunk's eviction.
@@ -314,11 +314,8 @@ class CacheConfig:
 
         --compression-scorer keydiff --compression-scorer-options anchor=normalized
 
-    TODO(compression): the per-scorer fields below (``compression_snap_*``,
-    ``compression_ea_*``) predate this channel and are kept as aliases into it
-    so existing scripts and documentation keep working. They should be removed
-    once callers have migrated; the scorer's ``OPTIONS`` already own the
-    defaults, so removing them is a deletion, not a redesign."""
+    The per-scorer fields below (``compression_snap_*``, ``compression_ea_*``)
+    are aliases into this channel; the scorer's ``OPTIONS`` own the defaults."""
     compression_snap_window: int = 32
     """SnapKV observation window: number of trailing queries used to score a
     chunk. Distinct from ``compression_window_size`` (the always-kept recent
@@ -493,11 +490,9 @@ class CacheConfig:
         self._derive_head_groups()
         self._validate_extended_fields()
 
-    #: Per-scorer configuration fields that predate ``compression_scorer_options``,
-    #: as ``{scorer: {option name: field name}}``. They are pure aliases: the
-    #: scorer's ``OPTIONS`` hold the real defaults, and a test pins the two in
-    #: agreement so the aliases cannot drift. Remove with the fields (see the
-    #: TODO on ``compression_scorer_options``).
+    #: Alias fields into ``compression_scorer_options``, as
+    #: ``{scorer: {option name: field name}}``. The scorer's ``OPTIONS`` hold the
+    #: real defaults; a test pins the two in agreement so they cannot drift.
     _LEGACY_SCORER_OPTION_FIELDS: ClassVar[dict[str, dict[str, str]]] = {
         "snapkv": {
             "window": "compression_snap_window",
@@ -537,8 +532,14 @@ class CacheConfig:
         the no-op baseline) or ``compression_budget_tokens`` not None. Single
         source of truth for the gate — consumers read this rather than
         re-deriving the test."""
-        return (self.compression_ratio < 1.0
-                or self.compression_budget_tokens is not None)
+        return CacheConfig.is_compression_enabled(
+            self.compression_ratio, self.compression_budget_tokens)
+
+    @staticmethod
+    def is_compression_enabled(ratio: float,
+                               budget_tokens: int | None) -> bool:
+        """The gate, for callers holding the raw values rather than a config."""
+        return ratio < 1.0 or budget_tokens is not None
 
     @property
     def compression_regime(self) -> str:
@@ -574,6 +575,8 @@ class CacheConfig:
         if budget <= 0:
             raise ValueError(
                 f"compression_budget_tokens must be > 0, got {budget}.")
+        # The widest tail any chunk can protect, so a budget that admits here
+        # admits every prompt length.
         tail = (self.compression_window_size
                 if self.compression_evict_current_chunk
                 else self.compression_chunk_size)
@@ -605,6 +608,14 @@ class CacheConfig:
             SLOT_SCORE_SOURCE_AUTO,
             SLOT_SCORE_SOURCE_CHOICES,
         )
+        if (self.compression_budget_tokens is None
+                and self.compression_evict_current_chunk):
+            raise ValueError(
+                "compression_evict_current_chunk requires "
+                "compression_budget_tokens. The ratio regime's protected tail "
+                "is always the recent window, so the setting would have no "
+                "effect and the run would look like the ablation without "
+                "being it.")
         source = self.compression_slot_score_source
         if source not in SLOT_SCORE_SOURCE_CHOICES:
             raise ValueError(
@@ -772,29 +783,6 @@ class CacheConfig:
                     "compression_gate_path must be a non-empty string "
                     "(either 'fastkvzip' for HF download or a local path)."
                 )
-            if self.compression_scorer == "snapkv":
-                if self.compression_snap_window <= 0:
-                    raise ValueError(
-                        f"compression_snap_window must be > 0, got "
-                        f"{self.compression_snap_window}."
-                    )
-                if (self.compression_snap_kernel <= 0
-                        or self.compression_snap_kernel % 2 == 0):
-                    raise ValueError(
-                        f"compression_snap_kernel must be a positive odd "
-                        f"integer, got {self.compression_snap_kernel}."
-                    )
-            if self.compression_scorer == "expected_attention":
-                if self.compression_ea_n_future_positions <= 0:
-                    raise ValueError(
-                        "compression_ea_n_future_positions must be > 0, got "
-                        f"{self.compression_ea_n_future_positions}."
-                    )
-                if self.compression_ea_epsilon < 0:
-                    raise ValueError(
-                        "compression_ea_epsilon must be >= 0, got "
-                        f"{self.compression_ea_epsilon}."
-                    )
 
         # Multi-turn rides on top of ragged paging but does not
         # require compression.

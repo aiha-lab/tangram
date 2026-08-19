@@ -7,6 +7,8 @@ cosine, so a synthetic cache written through the documented column-major layout
 is enough — and pins that layout against the helper both the writeback and the
 rescoring path use.
 """
+import inspect
+
 import numpy as np
 import pytest
 import torch
@@ -15,15 +17,16 @@ import torch.nn.functional as F
 from vllm.v1.attention.compression.keydiff import KeyDiffScorer
 from vllm.v1.attention.compression.qk_scorer_base import (
     RESCORE_KEYS,
-    RESCORE_POSITIONS,
     RESCORE_VALUES,
     CachedPositions,
 )
 from vllm.v1.attention.compression.slot_scores import (
     SLOT_SCORE_SOURCE_CHOICES,
+    ChunkScoreInputs,
     KVCacheView,
     PersistedChunkScores,
     RecomputedCacheScores,
+    SlotFillTarget,
     make_slot_score_source,
 )
 from vllm.v1.attention.compression.snapkv import SnapKVScorer
@@ -129,23 +132,35 @@ def test_keydiff_whole_cache_anchor_differs_from_the_chunk_anchor():
     chunk_b = torch.rand(1, 16, HEAD_SIZE, generator=generator) + 3.0
     whole = torch.cat([chunk_a, chunk_b], dim=1)
 
-    per_chunk = torch.cat(
-        [scorer.score_cached(CachedPositions(keys=chunk_a, num_positions=chunk_a.shape[1])),
-         scorer.score_cached(CachedPositions(keys=chunk_b, num_positions=chunk_b.shape[1]))], dim=1)
-    whole_cache = scorer.score_cached(CachedPositions(keys=whole, num_positions=whole.shape[1]))
+    def score(keys: torch.Tensor) -> torch.Tensor:
+        return scorer.score_cached(
+            CachedPositions(keys=keys, num_positions=keys.shape[1]))
+
+    per_chunk = torch.cat([score(chunk_a), score(chunk_b)], dim=1)
+    whole_cache = score(whole)
     per_chunk_rank = per_chunk.argsort(dim=-1)
     whole_rank = whole_cache.argsort(dim=-1)
     assert not torch.equal(per_chunk_rank, whole_rank), (
         "if these agreed, recomputing over the cache would be pointless")
 
 
+def identity_cluster_maps() -> tuple[torch.Tensor, np.ndarray]:
+    """Member row ``layer * num_kv_heads + head`` belongs to cluster
+    ``layer * num_groups + head // page_group_size`` at column
+    ``head % page_group_size``."""
+    member_to_cluster = torch.tensor([
+        layer * NUM_GROUPS + head // PAGE_GROUP_SIZE
+        for layer in range(NUM_LAYERS) for head in range(NUM_KV_HEADS)])
+    cluster_members = np.array([
+        [layer * NUM_KV_HEADS + group * PAGE_GROUP_SIZE + col
+         for col in range(PAGE_GROUP_SIZE)]
+        for layer in range(NUM_LAYERS) for group in range(NUM_GROUPS)])
+    return member_to_cluster, cluster_members
+
+
 def test_recompute_source_fills_every_live_slot():
     """The source must leave a score at every live slot and nothing selectable
     beyond it, for each (layer, group) independently."""
-    from vllm.v1.attention.compression.slot_scores import (
-        ChunkScoreInputs,
-        SlotFillTarget,
-    )
     generator = torch.Generator().manual_seed(3)
     chunk_len = 4
     prev_lens = np.array([[3, 0], [8, 1]], dtype=np.int64)
@@ -156,16 +171,7 @@ def test_recompute_source_fills_every_live_slot():
     buffer = torch.full(
         (NUM_LAYERS, NUM_KV_HEADS, capacity), float("-inf"))
     flat = buffer.view(NUM_LAYERS * NUM_KV_HEADS, capacity)
-    # Identity maps: member row m = layer * num_kv_heads + head belongs to
-    # cluster layer * num_groups + head // page_group_size at column
-    # head % page_group_size.
-    member_to_cluster = torch.tensor([
-        layer * NUM_GROUPS + head // PAGE_GROUP_SIZE
-        for layer in range(NUM_LAYERS) for head in range(NUM_KV_HEADS)])
-    cluster_members = np.array([
-        [layer * NUM_KV_HEADS + group * PAGE_GROUP_SIZE + col
-         for col in range(PAGE_GROUP_SIZE)]
-        for layer in range(NUM_LAYERS) for group in range(NUM_GROUPS)])
+    member_to_cluster, cluster_members = identity_cluster_maps()
 
     scorer = KeyDiffScorer(num_kv_heads=NUM_KV_HEADS, head_size=HEAD_SIZE)
     source = RecomputedCacheScores(scorer)
@@ -199,10 +205,6 @@ def test_recompute_source_fills_every_live_slot():
 
 
 def test_recompute_source_requires_cache_access():
-    from vllm.v1.attention.compression.slot_scores import (
-        ChunkScoreInputs,
-        SlotFillTarget,
-    )
     source = RecomputedCacheScores(
         KeyDiffScorer(num_kv_heads=NUM_KV_HEADS, head_size=HEAD_SIZE))
     target = SlotFillTarget(
@@ -435,8 +437,102 @@ def test_rescore_inputs_are_materialized_on_demand():
     assert both.values is not None
     assert both.values.shape == both.keys.shape
 
-    # Declared but not yet servable: refused loudly, never approximated.
-    with pytest.raises(NotImplementedError, match="per-slot position channel"):
-        view.materialize(0, 0, 6, (RESCORE_KEYS, RESCORE_POSITIONS))
     with pytest.raises(ValueError, match="not cache inputs"):
         view.materialize(0, 0, 6, ("logits", ))
+
+
+def test_persist_source_writes_the_chunk_after_each_cluster_length():
+    """Each member's chunk scores land just past its own cluster's pre-chunk
+    length, leaving earlier chunks' scores untouched."""
+    chunk_len = 4
+    capacity = 32
+    prev_lens = np.array([[3, 0], [8, 1]], dtype=np.int64)
+    buffer = torch.full((NUM_LAYERS, NUM_KV_HEADS, capacity), float("-inf"))
+    flat = buffer.view(NUM_LAYERS * NUM_KV_HEADS, capacity)
+    member_to_cluster, cluster_members = identity_cluster_maps()
+    pending = torch.arange(
+        NUM_LAYERS * NUM_KV_HEADS * chunk_len, dtype=torch.float32).view(
+            NUM_LAYERS, NUM_KV_HEADS, chunk_len)
+
+    PersistedChunkScores().fill(
+        SlotFillTarget(
+            buffer=buffer, flat=flat, member_to_cluster=member_to_cluster,
+            cluster_members_cpu=cluster_members, num_layers=NUM_LAYERS,
+            num_kv_heads=NUM_KV_HEADS, num_groups=NUM_GROUPS,
+            neg_inf=float("-inf")),
+        ChunkScoreInputs(
+            pending=pending,
+            prev_lens_cpu=prev_lens,
+            prev_lens_device=torch.from_numpy(prev_lens),
+            chunk_len=chunk_len,
+            cache_view=None),
+    )
+
+    for layer_idx in range(NUM_LAYERS):
+        for head in range(NUM_KV_HEADS):
+            start = int(prev_lens[layer_idx, head // PAGE_GROUP_SIZE])
+            torch.testing.assert_close(
+                buffer[layer_idx, head, start:start + chunk_len],
+                pending[layer_idx, head])
+            assert torch.all(
+                buffer[layer_idx, head, :start] == float("-inf")), (
+                "a write must not reach slots earlier chunks own")
+
+
+def test_constructor_defaults_match_the_declared_options():
+    """``OPTIONS`` owns each default, so a constructor that also states one must
+    state the same value — the factory path and direct construction otherwise
+    build differently configured scorers from the same declaration."""
+    from vllm.v1.attention.compression.scorer import _QK_SCORERS
+
+    for name, scorer_cls in _QK_SCORERS.items():
+        signature = inspect.signature(scorer_cls.__init__)
+        for option in scorer_cls.OPTIONS:
+            parameter = signature.parameters.get(option.name)
+            if parameter is None or parameter.default is inspect.Parameter.empty:
+                continue
+            assert parameter.default == option.default, (
+                f"{name}.{option.name}: constructor default "
+                f"{parameter.default!r} != declared {option.default!r}")
+
+
+def test_recompute_source_skips_empty_clusters_and_rejects_partial_ones():
+    """Same rule as the score store's compaction: a cross-layer cluster map may
+    leave a cluster with no member at all, but a half-filled one would leave the
+    members that are there ranking on the previous chunk's scores while their
+    peers rank on rescored ones."""
+    generator = torch.Generator().manual_seed(7)
+    chunk_len = 2
+    prev_lens = np.array([[3, 0], [8, 1]], dtype=np.int64)
+    view, _ = build_cache_and_view(prev_lens + chunk_len, generator)
+    capacity = 32
+    buffer = torch.full((NUM_LAYERS, NUM_KV_HEADS, capacity), float("-inf"))
+    flat = buffer.view(NUM_LAYERS * NUM_KV_HEADS, capacity)
+    member_to_cluster, cluster_members = identity_cluster_maps()
+    source = RecomputedCacheScores(
+        KeyDiffScorer(num_kv_heads=NUM_KV_HEADS, head_size=HEAD_SIZE))
+
+    def fill_with(members: np.ndarray) -> None:
+        source.fill(
+            SlotFillTarget(
+                buffer=buffer, flat=flat, member_to_cluster=member_to_cluster,
+                cluster_members_cpu=members, num_layers=NUM_LAYERS,
+                num_kv_heads=NUM_KV_HEADS, num_groups=NUM_GROUPS,
+                neg_inf=float("-inf")),
+            ChunkScoreInputs(
+                pending=torch.empty(NUM_LAYERS, NUM_KV_HEADS, 0),
+                prev_lens_cpu=prev_lens,
+                prev_lens_device=torch.from_numpy(prev_lens),
+                chunk_len=chunk_len,
+                cache_view=view))
+
+    empty = cluster_members.copy()
+    empty[0] = -1
+    fill_with(empty)
+    assert torch.all(torch.isinf(buffer[0, :PAGE_GROUP_SIZE])), (
+        "an empty cluster owns no slots, so none may be written")
+
+    partial = cluster_members.copy()
+    partial[0, 1:] = -1
+    with pytest.raises(RuntimeError, match="some columns but not others"):
+        fill_with(partial)

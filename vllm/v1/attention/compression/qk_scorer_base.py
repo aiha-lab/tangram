@@ -64,26 +64,11 @@ class QKScorer(nn.Module, ABC):
 
     # --- Optional: scoring the whole cache, not just the fresh chunk ---------
     #
-    # ``forward`` scores one chunk as it is written, which is all a chunk-local
-    # eviction target needs. A FIXED KV BUDGET needs more: every live position
-    # competes at every eviction, so a position written many chunks ago must be
-    # scorable now. Two kinds of scorer can satisfy that, and they differ in
-    # what has to be remembered:
-    #
-    # * A score that is a function of the cached KEYS alone (KeyDiff: similarity
-    #   to the mean direction of the keys in the cache) can be RECOMPUTED at
-    #   every eviction from the cache itself — nothing needs to be stored, and
-    #   the score is the paper's, not an approximation of it. Such a scorer sets
-    #   ``rescores_cache`` and implements ``score_cached``.
-    # * A score that depends on the history of queries (H2O: attention mass
-    #   accumulated over every query so far) cannot be recovered from the cache,
-    #   and is instead accumulated into a per-position buffer. That is a separate
-    #   mechanism (see ``slot_scores.py``), not this method.
-    #
-    # A scorer that does neither keeps the score its chunk produced, which is an
-    # approximation under a budget: scores from different chunks were computed
-    # against different reference quantities, so ranking them together has no
-    # common scale.
+    # ``forward`` scores one chunk as it is written; under a fixed budget an old
+    # position competes again and must be scorable now. A scorer whose score is
+    # a function of the cached keys sets ``rescores_cache`` and implements
+    # ``score_cached``; where every other scorer's score comes from is
+    # ``slot_scores.py``.
 
     #: Whether the scorer can rescore already-cached positions (``score_cached``
     #: implemented). Read by ``slot_scores`` to pick the score source under a
@@ -120,9 +105,7 @@ class QKScorer(nn.Module, ABC):
 #: runner that builds them and the tests agree on one vocabulary.
 RESCORE_KEYS = "keys"
 RESCORE_VALUES = "values"
-RESCORE_POSITIONS = "positions"
-RESCORE_INPUTS: tuple[str, ...] = (
-    RESCORE_KEYS, RESCORE_VALUES, RESCORE_POSITIONS)
+RESCORE_INPUTS: tuple[str, ...] = (RESCORE_KEYS, RESCORE_VALUES)
 
 
 @dataclass(frozen=True)
@@ -134,17 +117,14 @@ class CachedPositions:
     surfaces immediately rather than a silently wrong score.
 
     Slot order, not sequence order: eviction compacts survivors towards the
-    front, so slot ``i`` holds whatever token survived into it. That is why
-    ``positions`` exists as a separate field — after the first eviction a
-    slot's global sequence position can no longer be inferred from its index.
+    front, so slot ``i`` holds whatever token survived into it, and a slot's
+    global sequence position cannot be inferred from its index.
     """
     #: ``[page_group_size, num_positions, head_size]`` post-RoPE keys, one row
     #: per KV head (cluster column).
     keys: torch.Tensor | None = None
     #: ``[page_group_size, num_positions, head_size]`` values, same layout.
     values: torch.Tensor | None = None
-    #: ``[num_positions]`` global sequence position of each live slot.
-    positions: torch.Tensor | None = None
     #: Live slots in this group; the trailing dimension of every field above.
     num_positions: int = 0
 
@@ -152,7 +132,7 @@ class CachedPositions:
         """Return an input the scorer declared, or say which declaration is
         missing. Scorers use this instead of asserting on ``None`` so the error
         names the fix (``rescore_inputs``) rather than the symptom."""
-        value = getattr(self, field, None)
+        value = getattr(self, field)
         if value is None:
             raise RuntimeError(
                 f"cached {field} were not materialised; a scorer that reads "

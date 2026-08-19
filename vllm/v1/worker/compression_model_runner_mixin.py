@@ -194,23 +194,16 @@ class CompressionModelRunnerMixin:
         # right after it), so the KV cache pool is sized around the reservation
         # and an over-large budget or concurrency fails at startup instead of
         # mid-generation. See workspace.py.
-        workspace_spec = WorkspaceSpec.from_config(
-            num_layers=num_compressed_layers,
-            num_kv_heads=num_kv_heads_per_rank,
-            num_groups=num_kv_heads_per_rank // cache_config.page_group_size,
-            page_group_size=cache_config.page_group_size,
-            max_num_reqs=self.max_num_reqs,
-            max_model_len=self.model_config.max_model_len,
-            model_dtype=dtype,
-            chunk_size=cache_config.compression_chunk_size,
-            window_size=cache_config.compression_window_size,
-            n_sink_tokens=cache_config.compression_n_sink_tokens,
-            budget_tokens=cache_config.compression_budget_tokens,
-            evict_current_chunk=cache_config.compression_evict_current_chunk,
-            scorer=cache_config.compression_scorer,
-        )
-        self.compression_workspace = CompressionWorkspace(
-            workspace_spec, self.device)
+        workspace = CompressionWorkspace(
+            WorkspaceSpec.from_cache_config(
+                cache_config,
+                num_layers=num_compressed_layers,
+                num_kv_heads=num_kv_heads_per_rank,
+                max_num_reqs=self.max_num_reqs,
+                max_model_len=self.model_config.max_model_len,
+                model_dtype=dtype,
+            ),
+            self.device)
 
         self.compressor = KVCompressor(
             num_layers=num_compressed_layers,
@@ -221,7 +214,7 @@ class CompressionModelRunnerMixin:
             block_size=block_size,
             dtype=dtype,
             device=self.device,
-            workspace=self.compression_workspace,
+            workspace=workspace,
             level=cache_config.compression_level,
             regime=cache_config.compression_regime,
             slot_score_source=cache_config.compression_slot_score_source,

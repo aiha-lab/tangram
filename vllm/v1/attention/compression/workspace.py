@@ -5,9 +5,7 @@
 Every tensor the keep decision needs is allocated ONCE here, from sizes that
 follow from the configuration alone, and is then reused for the lifetime of the
 engine. Nothing in the compression path allocates a decision-sized tensor while
-requests are in flight.
-
-That is not a micro-optimisation; it is what makes the feature safe to deploy:
+requests are in flight. This matters for two reasons:
 
 * The worker profiles peak memory AFTER ``load_model`` and sizes the KV cache
   pool with whatever is left (``GPUWorker.determine_available_memory``). This
@@ -40,11 +38,16 @@ request finishes, which would silently reassign another request's buffers.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import numpy as np
 import torch
 
 from vllm.logger import init_logger
+from vllm.v1.attention.compression.scorer import QK_SCORERS
+
+if TYPE_CHECKING:
+    from vllm.config.cache import CacheConfig
 
 logger = init_logger(__name__)
 
@@ -76,6 +79,32 @@ class WorkspaceSpec:
     #: (FastKVZip) emits the model dtype while the query/key scorers emit
     #: float32, and rounding either way would change the keep decision.
     score_dtype: torch.dtype
+
+    @staticmethod
+    def from_cache_config(
+        cache_config: "CacheConfig",
+        num_layers: int,
+        num_kv_heads: int,
+        max_num_reqs: int,
+        max_model_len: int,
+        model_dtype: torch.dtype,
+    ) -> "WorkspaceSpec":
+        """``from_config`` with the knobs read off ``CacheConfig``."""
+        return WorkspaceSpec.from_config(
+            num_layers=num_layers,
+            num_kv_heads=num_kv_heads,
+            num_groups=num_kv_heads // cache_config.page_group_size,
+            page_group_size=cache_config.page_group_size,
+            max_num_reqs=max_num_reqs,
+            max_model_len=max_model_len,
+            model_dtype=model_dtype,
+            chunk_size=cache_config.compression_chunk_size,
+            window_size=cache_config.compression_window_size,
+            n_sink_tokens=cache_config.compression_n_sink_tokens,
+            budget_tokens=cache_config.compression_budget_tokens,
+            evict_current_chunk=cache_config.compression_evict_current_chunk,
+            scorer=cache_config.compression_scorer,
+        )
 
     @staticmethod
     def from_config(
@@ -123,9 +152,10 @@ class WorkspaceSpec:
                              if evict_current_chunk
                              else effective_budget - n_sink_tokens)
             eval_capacity = max(eval_capacity, 0)
-        # The gate scores in the model dtype; every gate-free query/key scorer
-        # promotes to float32 for a stable reduction.
-        score_dtype = model_dtype if scorer == "fastkvzip" else torch.float32
+        # Query/key scorers promote to float32 for a stable reduction; the
+        # checkpoint-backed gate scores in the model dtype.
+        score_dtype = (torch.float32
+                       if scorer in QK_SCORERS else model_dtype)
         return WorkspaceSpec(
             num_layers=num_layers,
             num_kv_heads=num_kv_heads,
@@ -146,6 +176,23 @@ class CompressionWorkspace:
     def __init__(self, spec: WorkspaceSpec, device: torch.device) -> None:
         self.spec = spec
         self.device = device
+        try:
+            self._allocate()
+        except torch.OutOfMemoryError as exc:
+            raise ValueError(
+                f"The KV compression workspace does not fit on the device: "
+                f"{spec.max_num_reqs} rows for eval_capacity="
+                f"{spec.eval_capacity}, slot_capacity={spec.slot_capacity}, "
+                f"chunk={spec.chunk_size}. Lower --max-num-seqs, "
+                f"--compression-budget-tokens or --compression-chunk-size."
+            ) from exc
+        self._free_rows: list[int] = list(reversed(range(spec.max_num_reqs)))
+        self.log_reservation()
+        self._reject_if_unusable()
+
+    def _allocate(self) -> None:
+        spec = self.spec
+        device = self.device
         num_layers = spec.num_layers
         num_kv_heads = spec.num_kv_heads
         num_groups = spec.num_groups
@@ -203,27 +250,21 @@ class CompressionWorkspace:
                 dtype=dtype, device=device)
             if spec.slot_capacity > 0 else None)
 
-        self._free_rows: list[int] = list(reversed(range(num_rows)))
-        self.log_reservation()
-
     # ------------------------------------------------------------------ rows
     def acquire_row(self) -> int:
         """Reserve a row for one request. Raises when the pool is exhausted,
-        which can only mean more concurrent compression-active requests than
-        ``max_num_seqs`` — a bookkeeping bug (a row was never released), not a
-        capacity question."""
+        which means a row outlived the request that held it — a bookkeeping
+        bug, not a capacity question."""
         if not self._free_rows:
             raise RuntimeError(
                 f"CompressionWorkspace: all {self.spec.max_num_reqs} rows are "
-                "in use. The scheduler bounds concurrency by max_num_seqs, so "
-                "this means a finished request never released its row.")
+                "in use. Rows are released when a request finishes or is "
+                "preempted, so one of those paths missed a request.")
         return self._free_rows.pop()
 
     def release_row(self, row: int) -> None:
         """Return a row to the pool and clear the state that must not leak into
         the next request to occupy it."""
-        if row in self._free_rows:
-            return  # Idempotent: shutdown paths may release twice.
         self.pending_len[row, :] = 0
         self.locked[row].zero_()
         self.valid_lengths[row].zero_()
@@ -271,7 +312,6 @@ class CompressionWorkspace:
                 "--compression-budget-tokens and --compression-chunk-size "
                 "reduce it too.",
                 self.reserved_bytes / (1024 * _MIB))
-        self._reject_if_unusable()
 
     def _reject_if_unusable(self) -> None:
         """Fail now if the reservation leaves no room for a KV cache.

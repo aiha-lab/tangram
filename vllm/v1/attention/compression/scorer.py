@@ -57,7 +57,7 @@ QK_SCORERS: tuple[str, ...] = tuple(_QK_SCORERS)
 
 #: The subset whose score is relative to the cache rather than to the chunk that
 #: wrote a position, i.e. those that can score positions already cached (they set
-#: ``rescores_cache`` and implement ``score_cached_keys``). Read off the classes
+#: ``rescores_cache`` and implement ``score_cached``). Read off the classes
 #: so the property is stated once, on the scorer; config validation uses it to
 #: reject a forced ``compression_slot_score_source='recompute'`` at startup
 #: without constructing a scorer. The checkpoint-backed FastKVZip gate is not a
@@ -66,18 +66,22 @@ RESCORING_QK_SCORERS: tuple[str, ...] = tuple(
     name for name, cls in _QK_SCORERS.items() if cls.rescores_cache)
 
 
+def _scorer_class(name: str) -> type[QKScorer]:
+    scorer_cls = _QK_SCORERS.get(name)
+    if scorer_cls is None:
+        raise ValueError(
+            f"unknown gate-free qk scorer {name!r}; "
+            f"expected one of {QK_SCORERS}.")
+    return scorer_cls
+
+
 def get_scorer_options(name: str) -> tuple[ScorerOption, ...]:
     """The settings ``name`` declares, for validation and help text.
 
     Exposed so configuration can reject a bad option at startup without
     constructing a scorer (which needs model dimensions it does not have).
     """
-    scorer_cls = _QK_SCORERS.get(name)
-    if scorer_cls is None:
-        raise ValueError(
-            f"get_scorer_options: unknown gate-free qk scorer {name!r}; "
-            f"expected one of {QK_SCORERS}.")
-    return scorer_cls.OPTIONS
+    return _scorer_class(name).OPTIONS
 
 
 def build_qk_scorer(
@@ -107,11 +111,7 @@ def build_qk_scorer(
         The scorer module, exposing ``consumes`` / ``name`` for the delivery
         dispatch in ``attach_scorers``.
     """
-    scorer_cls = _QK_SCORERS.get(name)
-    if scorer_cls is None:
-        raise ValueError(
-            f"build_qk_scorer: unknown gate-free qk scorer {name!r}; "
-            f"expected one of {QK_SCORERS}.")
+    scorer_cls = _scorer_class(name)
     resolved = resolve_scorer_options(name, scorer_cls.OPTIONS, options)
     logger.info("Compression %s",
                 describe_scorer_options(name, scorer_cls.OPTIONS, resolved))

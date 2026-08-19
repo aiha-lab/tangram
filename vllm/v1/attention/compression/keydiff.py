@@ -35,8 +35,7 @@ by one definition here and another there):
   reported numbers use.
 * ``"normalized"`` — the mean of the L2-normalized key directions, mu(K-hat),
   which is how Eq. (8) is written. The paper reports the two as equally
-  accurate (Table 15); NVIDIA KVpress, and hence tangram before this option
-  existed, computes this one.
+  accurate (Table 15); NVIDIA KVpress computes this one.
 """
 from __future__ import annotations
 
@@ -96,7 +95,6 @@ class KeyDiffScorer(QKScorer):
         super().__init__()
         self.num_kv_heads = num_kv_heads
         self.head_size = head_size
-        self.anchor = anchor
         self._normalize_before_mean = anchor == "normalized"
 
     def _anchor(self, keys: torch.Tensor, dim: int) -> torch.Tensor:
@@ -136,7 +134,9 @@ class KeyDiffScorer(QKScorer):
         # BlockPress(block_size=chunk), so the mean is over this chunk's keys.
         anchor = self._anchor(k, dim=0)                               # [1,H,d]
 
-        # ``cosine_similarity`` re-normalizes both arguments internally.
+        # ``cosine_similarity`` re-normalizes both arguments, so the
+        # anchor's magnitude never reaches the score — the two anchor
+        # formulas differ only in direction.
         # Negate so distinctive keys (far from the mean direction) score high.
         score = -F.cosine_similarity(k, anchor, dim=-1)               # [T, H]
         return score.transpose(0, 1).contiguous()                    # [H, T]

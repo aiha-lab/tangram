@@ -389,3 +389,44 @@ def test_budget_floor_min_cannot_exceed_the_budget():
             budget_params(budget), generator,
             floor_min=4096).astype(np.int64)
         assert np.all(prev <= budget), f"floor_min broke the budget: {prev}"
+
+
+def test_budget_protects_the_window_on_a_short_final_chunk():
+    """A prompt that is not a multiple of the chunk size ends with a chunk
+    shorter than the window; the tail still covers the window."""
+    window_size, chunk_len = 8, 2
+    prev_lens = np.full((NUM_LAYERS, NUM_GROUPS), 64, dtype=np.int64)
+    device = torch.device("cpu")
+
+    geometry = BudgetRegime().plan(
+        store=None, prev_lens=prev_lens, chunk_len=chunk_len,
+        prev_locked=torch.zeros(prev_lens.shape, dtype=torch.long),
+        is_first_chunk=False,
+        params=budget_params(96, window_size=window_size), device=device)
+
+    assert geometry.tail_size == window_size
+
+
+def test_compact_cluster_skips_an_empty_cluster_and_rejects_a_partial_one():
+    """A cross-layer cluster map may leave a cluster with no member at all,
+    which has no score slots to move. A cluster filled in some columns but not
+    others is instead a broken map: compacting it would leave the members that
+    are there holding scores for KV the eviction has already dropped."""
+    compressor = make_compressor("budget")
+    generator = torch.Generator().manual_seed(6)
+    compressor.begin_request("r0")
+    run_chunk(compressor, "r0", np.zeros((NUM_LAYERS, NUM_GROUPS),
+                                         dtype=np.int64),
+              32, budget_params(96), generator)
+    store = compressor.req_state["r0"].score_store
+    buffer = store.buffer
+    keep_positions = torch.zeros(PAGE_GROUP_SIZE, 8, dtype=torch.long)
+
+    store._cluster_members_cpu[0] = np.full(PAGE_GROUP_SIZE, -1)
+    before = buffer.clone()
+    store.compact_cluster(0, keep_positions, kept_length=8)
+    torch.testing.assert_close(buffer, before)
+
+    store._cluster_members_cpu[0, 0] = 0
+    with pytest.raises(RuntimeError, match="some columns but not others"):
+        store.compact_cluster(0, keep_positions, kept_length=8)

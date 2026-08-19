@@ -44,11 +44,14 @@ class SnapKVScorer(QKScorer):
             "Trailing queries used as the observation window when scoring a "
             "chunk. Distinct from compression_window_size (the always-kept "
             "recent region); auto-shrinks to 16 for chunks shorter than 1000, "
-            "matching the reference."),
+            "matching the reference.",
+            requirement=("a positive integer", lambda v: v > 0)),
         ScorerOption(
             "kernel", int, 7,
             "Odd max-pool1d kernel size smoothing the observation-window "
-            "attention before ranking."),
+            "attention before ranking.",
+            requirement=("a positive odd integer",
+                         lambda v: v > 0 and v % 2 == 1)),
     )
 
     def __init__(

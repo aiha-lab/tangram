@@ -15,8 +15,7 @@ KV writes and block-table updates live in the FlashAttention backend.
 """
 from __future__ import annotations
 
-import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Mapping, Protocol
 
 import numpy as np
@@ -35,7 +34,7 @@ from vllm.v1.attention.compression.eviction_regime import (
     RegimeScoreStore,
     make_eviction_regime,
 )
-from vllm.v1.attention.compression.gate import CompressionGate, load_gates
+from vllm.v1.attention.compression.gate import load_gates
 from vllm.v1.attention.compression.gate_capture import (
     _wrap_forward_with_gate_capture,
 )
@@ -96,7 +95,7 @@ class KeepDecision:
     ``sink_size + locked``; the sink, the locked prefix and the trailing
     ``tail_size`` slots are kept regardless of score. The kept COUNT and
     POSITION live in the per-(layer, group) caches (``cached_k_new_cpu`` /
-    ``cached_sorted_indices``), not here — the level-specific threshold is an
+    ``borrowed_sorted_indices``), not here — the level-specific threshold is an
     internal of ``SelectionLevel`` and never reaches downstream consumers.
     """
     sink_size: int
@@ -126,9 +125,12 @@ class _RequestCompressState:
     #: True once an eviction has committed a kept length for this request, so
     #: the next chunk is no longer the first one.
     has_committed: bool = False
-    #: [L, G, page_group_size, eval_len] view into the workspace: each KV head's
-    #: own descending score ranking, at its (cluster, column). Rebuilt each chunk.
-    cached_sorted_indices: torch.Tensor | None = None
+    #: [L, G, page_group_size, eval_len] view into the SHARED workspace ranking
+    #: buffer: each KV head's own descending score ranking, at its (cluster,
+    #: column). Borrowed, not owned — the next request to rank overwrites it, so
+    #: it is valid only between this request's ranking and its writeback, which
+    #: clears it.
+    borrowed_sorted_indices: torch.Tensor | None = None
     cached_k_new_cpu: np.ndarray | None = None           # [L, G]
     locked_count_cpu: np.ndarray | None = None           # [L, G]
     #: [L, G] genuine eval width per (layer, group). Under the budget regime the
@@ -240,13 +242,13 @@ class KVCompressor:
 
         self.req_state: dict[str, _RequestCompressState] = {}
 
-        # ``pending_req_offsets`` is a list of ``(req_id, start, end)``
-        # triples giving each compression-active request's token range in
-        # the batch's hidden_states. Tokens outside any triple are skipped.
         # Whether the per-chunk scorer has to run at all. A score source that
         # recomputes from the cached keys never reads the chunk's own scores, so
         # the scorer forward and its buffer write are skipped outright.
         self.compress_active: bool = False
+        # ``(req_id, start, end)`` token range of each compression-active
+        # request in the batch's hidden_states; tokens outside any triple are
+        # skipped.
         self.pending_req_offsets: list[tuple[str, int, int]] | None = None
         # ``pending_req_pos_offsets`` maps a compression-active ``req_id`` to
         # the global sequence position of its chunk's first scored token
@@ -560,7 +562,7 @@ class KVCompressor:
         # ratio <= 0, and at ratio 0 the base count is 0 (floor_min supplies the
         # retention against the ranking above).
         if eval_len > 0 and adjusted_ratio < 1.0:
-            req.cached_sorted_indices = self._rank_positions(
+            req.borrowed_sorted_indices = self._rank_positions(
                 eval_scores, num_layers, num_kv_heads, num_groups)
             if adjusted_ratio > 0.0:
                 # Clamp to the genuine eval width: under a ragged eval region
@@ -574,7 +576,7 @@ class KVCompressor:
             else:
                 req.cached_k_new_cpu = None
         else:
-            req.cached_sorted_indices = None
+            req.borrowed_sorted_indices = None
             req.cached_k_new_cpu = None
         req.locked_count_cpu = locked.cpu().numpy().astype(np.int64)
         req.real_eval_len_cpu = geometry.real_eval_len
@@ -680,17 +682,11 @@ class KVCompressor:
             req.cached_kept_lengths_cpu = kept_lengths
             return kept_lengths
 
-        locked_cpu = (
-            req.locked_count_cpu
-            if req.locked_count_cpu is not None
-            else np.zeros((num_layers, num_groups), dtype=np.int64))
+        locked_cpu = req.locked_count_cpu
         k_new_cpu = req.cached_k_new_cpu
         # Genuine (unpadded) eval width per (layer, group). Uniform under the
         # ratio regime; ragged under the budget regime.
-        real_eval_len = (
-            req.real_eval_len_cpu
-            if req.real_eval_len_cpu is not None
-            else np.full((num_layers, num_groups), eval_len, dtype=np.int64))
+        real_eval_len = req.real_eval_len_cpu
 
         kept_lengths = np.zeros(
             (num_layers, num_groups), dtype=np.int32)

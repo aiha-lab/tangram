@@ -92,11 +92,13 @@ class ExpectedAttentionScorer(QKScorer):
         ScorerOption(
             "n_future_positions", int, 512,
             "Number of future decode positions whose RoPE rotation is averaged "
-            "to anticipate where later queries attend."),
+            "to anticipate where later queries attend.",
+            requirement=("a positive integer", lambda v: v > 0)),
         ScorerOption(
             "epsilon", float, 1e-2,
             "Constant added before the value-norm reweighting, bounding the "
-            "score of a near-zero-norm value."),
+            "score of a near-zero-norm value.",
+            requirement=("a non-negative float", lambda v: v >= 0)),
     )
 
     def __init__(

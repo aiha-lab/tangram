@@ -382,7 +382,14 @@ class _SlotScoreStore(RegimeScoreStore):
     ) -> None:
         rows = self._cluster_members_cpu[cluster_id]
         if (rows < 0).any():
-            return  # Empty cluster: no member holds these slots.
+            if (rows < 0).all():
+                return  # Empty cluster: no member holds these slots.
+            # Score slots follow KV slots per column, so a member left behind
+            # here would keep scores the eviction has already discarded.
+            raise RuntimeError(
+                f"compact_cluster: cluster {cluster_id} holds members in some "
+                f"columns but not others ({rows.tolist()}); a cluster map must "
+                "leave a cluster either full or empty.")
         # Gather first (a fresh tensor), then write back: an in-place gather
         # along a permuted index would read slots it has already overwritten.
         self._flat[rows, :kept_length] = self._flat[rows].gather(
@@ -456,7 +463,7 @@ class EvictionRegime(ABC):
 
 
 class RatioRegime(EvictionRegime):
-    """Keep a fixed FRACTION of the prompt, with lock-in (historical default).
+    """Keep a fixed FRACTION of the prompt, with lock-in.
 
     The eval region is the previous chunk's window plus the fresh chunk minus
     its own new window; everything a previous chunk promoted is locked in and
@@ -464,10 +471,10 @@ class RatioRegime(EvictionRegime):
     ``ratio * prompt`` — which is why the target is derived from the whole
     prompt length rather than from what is currently cached.
 
-    ``adjusted_ratio`` reproduces baseline FastKVzip's window correction
-    (``wrapper.py:188-194``): the always-kept window is subtracted from both the
-    numerator and denominator, so the fraction applies to the genuinely
-    evictable region and the end-to-end retention still lands on ``ratio``.
+    ``adjusted_ratio`` reproduces baseline FastKVzip's window correction: the
+    always-kept window is subtracted from both the numerator and the
+    denominator, so the fraction applies to the genuinely evictable region and
+    the end-to-end retention still lands on ``ratio``.
     """
 
     name = "ratio"
@@ -560,17 +567,10 @@ class BudgetRegime(EvictionRegime):
       more important tokens. Its score must therefore still be available, which
       is what :class:`_SlotScoreStore` and its score source provide.
 
-    The protected tail is the whole fresh chunk by default
-    (``evict_current_chunk=False``): the reference protects the recent region,
-    and keeping the chunk that was just attended over measures better. Setting
-    ``evict_current_chunk`` shrinks the protection to the always-kept window, so
-    the fresh chunk competes like any other region.
-
-    ``budget_tokens`` is the per-(layer, head-group) length, and — exactly as
-    ``compression_ratio`` does — the selection level decides the SCOPE it is
-    shared over: ``uniform`` gives every (layer, group) that length, while the
-    per-layer / cross-layer levels pool it and let strong groups keep more than
-    weak ones at the same total.
+    ``budget_tokens`` is the per-(layer, head-group) length; the selection
+    level decides the scope it is shared over, exactly as it does for
+    ``compression_ratio``. See ``CacheConfig.compression_budget_tokens`` and
+    ``CacheConfig.compression_evict_current_chunk`` for the user-facing terms.
     """
 
     name = "budget"
@@ -612,12 +612,12 @@ class BudgetRegime(EvictionRegime):
         total_seen = prev_lens + chunk_len
         min_total = int(total_seen.min())
         sink_size = min(params.n_sink_tokens, min_total)
-        win_size = min(params.window_size, max(0, min_total - sink_size))
-        # Protected tail: the whole fresh chunk, or just the always-kept window
-        # when the fresh chunk is allowed to compete. Clamped so it cannot
-        # overlap the sink on a cache shorter than the chunk.
+        evictable = max(0, min_total - sink_size)
+        win_size = min(params.window_size, evictable)
+        # Protected tail: the recent window always, widened to the whole fresh
+        # chunk unless that chunk is allowed to compete.
         tail_size = win_size if params.evict_current_chunk else min(
-            chunk_len, max(0, min_total - sink_size))
+            max(win_size, chunk_len), evictable)
 
         # No lock-in: every position outside sink and tail is a candidate.
         locked = torch.zeros(
@@ -658,8 +658,6 @@ _REGIMES: dict[str, type[EvictionRegime]] = {
     BudgetRegime.name: BudgetRegime,
 }
 
-#: Valid regime names, so the accepted set lives in one place.
-EVICTION_REGIMES: tuple[str, ...] = tuple(_REGIMES)
 
 
 def make_eviction_regime(regime: str) -> EvictionRegime:
@@ -673,4 +671,4 @@ def make_eviction_regime(regime: str) -> EvictionRegime:
     except KeyError:
         raise ValueError(
             f"make_eviction_regime: unknown eviction regime {regime!r}; "
-            f"expected one of {EVICTION_REGIMES}.") from None
+            f"expected one of {tuple(_REGIMES)}.") from None

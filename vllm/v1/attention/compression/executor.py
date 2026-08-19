@@ -92,7 +92,7 @@ class CompressionExecutor:
             compressed_layer_ids = list(range(num_layers))
         self.compressed_layer_ids = compressed_layer_ids
         self.num_compressed_layers = len(compressed_layer_ids)
-        # Reused arange slabs; sink/win sizes are KeepDecision-uniform.
+        # Reused arange slabs; sink/tail sizes are KeepDecision-uniform.
         self._sink_idx_cache: torch.Tensor | None = None
         self._tail_idx_cache: torch.Tensor | None = None
 
@@ -161,11 +161,7 @@ class CompressionExecutor:
         # ratio regime, ragged under the budget regime, where the score tensor
         # is padded to the widest group. Slicing ``sorted_idx`` past a group's
         # own width would pick padding positions.
-        real_eval_len = (
-            req.real_eval_len_cpu
-            if req.real_eval_len_cpu is not None
-            else np.full((num_compressed, num_groups), eval_len,
-                         dtype=np.int64))
+        real_eval_len = req.real_eval_len_cpu
 
         # Under TP the runner cross-rank MAX-reduces kept_lengths before
         # reaching us.
@@ -177,11 +173,8 @@ class CompressionExecutor:
                 "run_request.")
         kept_lengths_all = req.cached_kept_lengths_cpu
 
-        locked_cpu = (
-            req.locked_count_cpu
-            if req.locked_count_cpu is not None
-            else np.zeros((num_compressed, num_groups), dtype=np.int64))
-        sorted_idx = req.cached_sorted_indices
+        locked_cpu = req.locked_count_cpu
+        sorted_idx = req.borrowed_sorted_indices
 
         if (self._sink_idx_cache is None
                 or self._sink_idx_cache.numel() < sink_size
@@ -283,6 +276,7 @@ class CompressionExecutor:
         # so the executor reports rather than writes it.
         compressor.commit_chunk(
             metadata.req_id, new_locked_all, kept_lengths_all)
+        req.borrowed_sorted_indices = None
 
         return kept_lengths_all
 

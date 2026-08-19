@@ -30,7 +30,7 @@ scorer modules into its import graph.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 #: Values accepted for a boolean option, spelled the way a CLI user would.
 _TRUE = frozenset(("1", "true", "yes", "on"))
@@ -50,12 +50,16 @@ class ScorerOption:
             configuration must not carry a second copy of it.
         help: one sentence for ``--help`` and the startup log.
         choices: accepted values for a ``str`` option, or ``None`` for free form.
+        requirement: what the converted value must satisfy, as the phrase for
+            the error message and the predicate, e.g.
+            ``("a positive odd integer", lambda v: v > 0 and v % 2 == 1)``.
     """
     name: str
     type: type
     default: Any
     help: str
     choices: tuple[str, ...] | None = None
+    requirement: tuple[str, Callable[[Any], bool]] | None = None
 
 
 def parse_scorer_options(raw: str) -> dict[str, str]:
@@ -93,23 +97,31 @@ def _convert(option: ScorerOption, raw: str, scorer_name: str) -> Any:
     if option.type is bool:
         lowered = raw.strip().lower()
         if lowered in _TRUE:
-            return True
-        if lowered in _FALSE:
-            return False
-        raise ValueError(
-            f"{where}: expected a boolean "
-            f"({'/'.join(sorted(_TRUE))} or {'/'.join(sorted(_FALSE))}), "
-            f"got {raw!r}.")
-    if option.type is str:
+            value = True
+        elif lowered in _FALSE:
+            value = False
+        else:
+            raise ValueError(
+                f"{where}: expected a boolean "
+                f"({'/'.join(sorted(_TRUE))} or {'/'.join(sorted(_FALSE))}), "
+                f"got {raw!r}.")
+    elif option.type is str:
         if option.choices is not None and raw not in option.choices:
             raise ValueError(
                 f"{where}: expected one of {option.choices}, got {raw!r}.")
-        return raw
-    try:
-        return option.type(raw)
-    except (TypeError, ValueError) as exc:
-        raise ValueError(
-            f"{where}: expected {option.type.__name__}, got {raw!r}.") from exc
+        value = raw
+    else:
+        try:
+            value = option.type(raw)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"{where}: expected {option.type.__name__}, "
+                f"got {raw!r}.") from exc
+    if option.requirement is not None:
+        phrase, holds = option.requirement
+        if not holds(value):
+            raise ValueError(f"{where}: expected {phrase}, got {value!r}.")
+    return value
 
 
 def resolve_scorer_options(

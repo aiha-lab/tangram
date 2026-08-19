@@ -13,17 +13,14 @@ and the eviction methods answer that in fundamentally different ways:
   nothing needs to be remembered and the score is always the method's own rather
   than a stale approximation of it. The cost is one extra read of the cached keys
   per eviction.
-* **Accumulate** — the score depends on the history of queries and cannot be
-  recovered from the cache. H2O is of this kind: a position's score is the
-  attention mass it has received from every query so far, so the running sum must
-  be carried in a per-position buffer and updated each step.
 * **Persist** — keep whatever score the position's own chunk produced. This is
   what a chunk-local scorer (SnapKV, TOVA, the FastKVZip gate) allows without
   extra machinery, and it is an approximation: those scores were computed against
   per-chunk reference quantities, so ranking positions from different chunks
   together has no common scale.
 
-All three write into the same slot-addressed buffer
+A third kind — accumulating a running score per position, as H2O does — has
+no source here yet. Both existing ones write into the same slot-addressed buffer
 (``[num_layers, num_kv_heads, slot_capacity]``, indexed by cache slot), which
 the eviction writeback compacts alongside the KV. Selecting between them is
 therefore a property of the SCORER, not a tuning knob:
@@ -47,7 +44,6 @@ from vllm.v1.attention.backends.ragged_layout import cluster_pages_token_major
 from vllm.v1.attention.compression.qk_scorer_base import (
     RESCORE_INPUTS,
     RESCORE_KEYS,
-    RESCORE_POSITIONS,
     RESCORE_VALUES,
     CachedPositions,
 )
@@ -100,17 +96,6 @@ class KVCacheView:
             raise ValueError(
                 f"rescore_inputs {unknown} are not cache inputs; expected a "
                 f"subset of {RESCORE_INPUTS}.")
-        if RESCORE_POSITIONS in wanted:
-            # A slot's global sequence position stops being its index the moment
-            # the first eviction compacts survivors forward, so serving it needs
-            # a per-slot position channel that follows the KV the way the score
-            # buffer does. That channel does not exist yet; refusing here keeps
-            # a scorer from silently ranking on something else.
-            raise NotImplementedError(
-                "rescoring from cached positions needs a per-slot position "
-                "channel, which is not implemented yet; a scorer requiring "
-                f"{RESCORE_POSITIONS!r} cannot run under a fixed budget.")
-
         layer_idx = int(self.compressed_layer_ids[compressed_layer_idx])
         kv_cache = self.layer_kv_caches[layer_idx]
         block_size = self.block_size
@@ -138,7 +123,6 @@ class KVCacheView:
             keys=group_major(keys_pages) if RESCORE_KEYS in wanted else None,
             values=(group_major(values_pages)
                     if values_pages is not None else None),
-            positions=None,
             num_positions=num_positions,
         )
 
@@ -271,7 +255,7 @@ class RecomputedCacheScores(SlotScoreSource):
     def describe(self) -> str:
         return (
             f"rescoring every live position from the cached keys with "
-            f"'{getattr(self.scorer, 'name', type(self.scorer).__name__)}' "
+            f"'{self.scorer.name}' "
             "at each eviction (its score is relative to the cache, so it is "
             "recomputed rather than stored)")
 
@@ -290,7 +274,14 @@ class RecomputedCacheScores(SlotScoreSource):
                 cluster_id = static_idx * target.num_groups + group_idx
                 rows = target.cluster_members_cpu[cluster_id]
                 if (rows < 0).any():
-                    continue  # Empty cluster: no member holds these slots.
+                    if (rows < 0).all():
+                        continue  # Empty cluster: no member holds these slots.
+                    # A member left unscored here would rank on the previous
+                    # chunk's scores while its peers rank on the rescored ones.
+                    raise RuntimeError(
+                        f"fill: cluster {cluster_id} holds members in some "
+                        f"columns but not others ({rows.tolist()}); a cluster "
+                        "map must leave a cluster either full or empty.")
                 num_positions = int(live_lens[static_idx, group_idx])
                 if num_positions == 0:
                     flat[rows] = neg_inf
@@ -306,14 +297,9 @@ class RecomputedCacheScores(SlotScoreSource):
                     flat[rows, num_positions:] = neg_inf
 
 
-#: Registry, so a new source is one subclass plus one entry.
-_SOURCES: dict[str, type[SlotScoreSource]] = {
-    PersistedChunkScores.name: PersistedChunkScores,
-    RecomputedCacheScores.name: RecomputedCacheScores,
-}
-
 #: Valid source names, for logging and tests.
-SLOT_SCORE_SOURCES: tuple[str, ...] = tuple(_SOURCES)
+SLOT_SCORE_SOURCES: tuple[str, ...] = (
+    PersistedChunkScores.name, RecomputedCacheScores.name)
 
 #: Value asking for the source the scorer supports — the production setting.
 SLOT_SCORE_SOURCE_AUTO = "auto"
@@ -337,7 +323,7 @@ def make_slot_score_source(
 
     ``source="auto"`` (the production setting) is not a user-facing choice: a
     scorer either can rescore cached positions or it cannot, and picking the
-    wrong one is either impossible (recompute without ``score_cached_keys``) or
+    wrong one is either impossible (recompute without ``score_cached``) or
     a silent accuracy loss (persist when the method specifies a cache-relative
     score). Hence recompute whenever the scorer offers it, persist otherwise.
 
@@ -357,7 +343,7 @@ def make_slot_score_source(
     if source == SLOT_SCORE_SOURCE_AUTO:
         return (RecomputedCacheScores(scorer) if _supports_recompute(scorer)
                 else PersistedChunkScores())
-    if source not in _SOURCES:
+    if source not in SLOT_SCORE_SOURCES:
         raise ValueError(
             f"slot score source must be one of {SLOT_SCORE_SOURCE_CHOICES}, "
             f"got {source!r}.")
@@ -368,7 +354,7 @@ def make_slot_score_source(
             raise ValueError(
                 f"slot score source 'recompute' needs a scorer that can score "
                 f"cached positions (sets rescores_cache and implements "
-                f"score_cached_keys), but the active scorer is "
+                f"score_cached), but the active scorer is "
                 f"'{scorer_name}'. Use 'auto', or pick a scorer from "
                 "scorer.RESCORING_QK_SCORERS.")
         return RecomputedCacheScores(scorer)

@@ -2242,9 +2242,8 @@ class EngineArgs:
             # With compression on, default ``max_num_batched_tokens`` to
             # ``compression_chunk_size`` so at most one request's chunk
             # fits in a step.
-            compression_on = (
-                self.compression_ratio < 1.0
-                or self.compression_budget_tokens is not None)
+            compression_on = CacheConfig.is_compression_enabled(
+                self.compression_ratio, self.compression_budget_tokens)
             if compression_on and self.compression_chunk_size:
                 self.max_num_batched_tokens = int(self.compression_chunk_size)
                 logger.debug(
