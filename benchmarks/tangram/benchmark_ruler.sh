@@ -68,8 +68,9 @@ RATIOS=${RATIOS-"1.0 0.7 0.5 0.3"}
 # budget, and it is then cut back to it. Compare a budget against the ratio that
 # keeps the same amount, i.e. budget ~= ratio * length.
 BUDGETS=${BUDGETS:-}
-# 1 = let the chunk just written compete for eviction (the KeyDiff paper's
-# behaviour); 0 (default) = protect it whole. Budget runs only.
+# 1 = let the chunk just written compete for eviction, protecting only the
+# always-kept recent window; 0 (default) = protect the whole fresh chunk, which
+# is the more accurate setting in our measurements. Budget runs only.
 EVICT_CURRENT_CHUNK=${EVICT_CURRENT_CHUNK:-0}
 # Where a cached position's score comes from when it competes again under a
 # budget: auto (default) = whatever the scorer specifies; persist = keep the
@@ -113,6 +114,11 @@ fi
 # cumulative "Preemptions: N" line when N>0).
 if [ "${LOG_STATS:-0}" = "1" ]; then
     METHOD_ARGS+=(--enable-log-stats)
+fi
+
+# Fixed KV cache size in blocks. Small values force preemption.
+if [ -n "${NUM_GPU_BLOCKS:-}" ]; then
+    METHOD_ARGS+=(--num-gpu-blocks-override "${NUM_GPU_BLOCKS}")
 fi
 
 # Compression keep-geometry overrides (the engine/bench defaults are tuned for
@@ -253,24 +259,22 @@ for dp, _, files in os.walk(root):
         length, task, r = d.get("length"), d.get("task"), d.get("ratio")
         if length is None or task is None or r is None:
             continue
-        # A budget run is its own setting even though its ratio is 1.0; label it
-        # by budget (and by the current-chunk policy) so the two never merge.
+        # Every knob that makes a run a different experiment belongs in the
+        # label; two experiments sharing a column silently overwrite each other.
         budget = d.get("budget_tokens")
-        if budget is None:
-            setting = f"ratio{r}"
-        else:
-            setting = f"budget{budget}"
-            if d.get("evict_current_chunk"):
-                # Spelled out: this column is a different eviction policy, not a
-                # variant of the one next to it.
-                setting += "+evict-current-chunk"
+        setting = f"ratio{r}" if budget is None else f"budget{budget}"
+        if d.get("evict_current_chunk"):
+            setting += "+evict-current-chunk"
+        source = d.get("slot_score_source")
+        if source and source != "auto":
+            setting += f"+{source}"
+        if d.get("scorer_options"):
+            setting += f"+{d['scorer_options']}"
         rows.setdefault((str(length), task), {})[setting] = d.get("avg_score")
         ratios.add(setting)
 if not rows:
     print("(no results found under", root, ")")
     sys.exit(0)
-# Ratios first (descending), then budgets (descending) — each group is a
-# different retention target and they are not comparable by their label alone.
 def _setting_key(label: str) -> tuple[int, float]:
     """Sort ratio settings first (descending), then budgets (descending). The two
     are different retention targets and are not comparable by label alone."""

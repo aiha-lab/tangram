@@ -36,6 +36,7 @@ from bench_common import (  # noqa: E402
     add_engine_args,
     build_benchmark_report,
     build_llm,
+    effective_ratio,
     extract_request_timing,
 )
 from ruler_local import (  # noqa: E402
@@ -222,10 +223,7 @@ def run_task(
         "model": args.model_path,
         "compression_algo": args.compression_scorer,
         "compression_level": args.compression_level,
-        # ExpectedAttention epsilon as requested; None = unset, so the engine's
-        # CacheConfig.compression_ea_epsilon default (1e-2) applied.
-        "compression_ea_epsilon": args.compression_ea_epsilon,
-        "ratio": args.ratio,
+        "ratio": effective_ratio(args),
         "budget_tokens": args.compression_budget_tokens,
         "evict_current_chunk": args.compression_evict_current_chunk,
         # Which score the eviction ranked. Recorded because a forced source is
@@ -321,7 +319,7 @@ def main() -> None:
             args.output_dir, f"len{args.length}", task,
             # A budget run and a ratio run are different settings, so they
             # must not share a result file even though both have ratio 1.0.
-            f"{model_basename}_r{args.ratio}"
+            f"{model_basename}_r{effective_ratio(args)}"
             + (f"_b{args.compression_budget_tokens}"
                if args.compression_budget_tokens is not None else "")
             + f"_pg{args.page_group_size}{tag_suffix}.json",

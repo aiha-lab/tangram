@@ -29,6 +29,7 @@ Example:
 from __future__ import annotations
 
 import argparse
+import gc
 import glob
 import json
 import os
@@ -127,6 +128,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--base-ratios", default="0.3,0.5,0.7",
                    help="comma-separated retention ratios (strictly increasing)")
     p.add_argument("--prefill-chunk", type=int, default=8192)
+    p.add_argument("--gpu-memory-utilization", type=float, default=0.85,
+                   help="Engine memory fraction. Larger models at long context "
+                        "can need more than the 0.85 default to fit a KV cache "
+                        "for max_ctx_len + 2048 tokens; gemma-3-12b at 120k "
+                        "fails at 0.85 with 'To serve at least one request "
+                        "with the model's max seq len'.")
     p.add_argument("--tensor-parallel-size", type=int, default=1,
                    help="run the profiling engine at this TP degree. Match the "
                         "serving TP so the profile (and the cluster map built "
@@ -135,6 +142,17 @@ def parse_args() -> argparse.Namespace:
                         "runtime validates the map against. The per-(layer,head) "
                         "retention is averaged across ranks (one shared map "
                         "applies to every rank). Needed for qwen3-30b (TP=2).")
+    p.add_argument("--no-mm-profiling", action="store_true",
+                   help="pass limit_mm_per_prompt={'image': 0} so vLLM's memory "
+                        "profiler skips the multimodal dummy forward. On a "
+                        "vision-language model that dummy pass ('profiled with "
+                        "126 image items of the maximum feature size') sets the "
+                        "activation peak and crowds out the KV cache: "
+                        "gemma-3-12b at TP=1 / max_model_len 122048 is left "
+                        "15.24 GiB for a 44.70 GiB cache and aborts, versus "
+                        "45.57 GiB with this flag. The profiling corpus is "
+                        "text-only, so the image path is never exercised "
+                        "either way. Only meaningful for multimodal models.")
     p.add_argument("--window-size", type=int, default=4096)
     p.add_argument("--max-ctx-len", type=int, default=131072,
                    help="upper bound on per-sample context length (longer "
@@ -247,6 +265,50 @@ def select_samples(mix: list[tuple[str, int]], datasets: dict, tokenizer,
 # --------------------------------------------------------------------------- #
 
 
+def release_engine(llm, *, timeout_s: float = 180.0) -> None:
+    """Tear down a vLLM engine and wait for its GPU memory to come back.
+
+    vLLM V1 runs the engine core in a separate process, and ``del llm`` only
+    drops the client-side handle -- the core exits asynchronously. Because this
+    tool stands up one engine per base ratio in a single process, the next
+    engine can start sizing its KV cache while the previous core still owns most
+    of the device, which fails as::
+
+        ValueError: Free memory on device (10.32/79.25 GiB) on startup is less
+        than desired GPU memory utilization (0.85, 67.36 GiB)
+
+    Shut the core down explicitly, then block until the device actually reports
+    the memory back before returning.
+    """
+    engine_core = getattr(getattr(llm, "llm_engine", None), "engine_core", None)
+    shutdown = getattr(engine_core, "shutdown", None)
+    if callable(shutdown):
+        try:
+            shutdown()
+        except Exception as exc:  # noqa: BLE001 - teardown must not mask results
+            print(f"[teardown] engine core shutdown raised {exc!r}; "
+                  f"falling back to the free-memory wait")
+    del llm
+    gc.collect()
+
+    import torch
+    if not torch.cuda.is_available():
+        return
+    torch.cuda.empty_cache()
+    free, total = torch.cuda.mem_get_info()
+    deadline = time.time() + timeout_s
+    while free / total < 0.9 and time.time() < deadline:
+        time.sleep(2.0)
+        gc.collect()
+        torch.cuda.empty_cache()
+        free, total = torch.cuda.mem_get_info()
+    print(f"[teardown] {free / 2**30:.1f}/{total / 2**30:.1f} GiB free "
+          f"({free / total:.0%}) after engine release")
+    if free / total < 0.9:
+        print("[teardown] WARNING: memory did not come back within "
+              f"{timeout_s:.0f}s; the next engine may fail to size its cache.")
+
+
 def out_dump_dir(out_path, ratio):
     """Per-ratio scratch dir for engine retention dumps, beside the output."""
     return Path(str(out_path) + f".dump_r{ratio}")
@@ -304,7 +366,8 @@ def measure_all(args, tokenizer, mix, base_ratios):
         llm = LLM(
             model=args.model, trust_remote_code=True, enforce_eager=True,
             tensor_parallel_size=tp,
-            gpu_memory_utilization=0.85, max_model_len=max_model_len,
+            gpu_memory_utilization=args.gpu_memory_utilization,
+            max_model_len=max_model_len,
             enable_prefix_caching=False, max_num_seqs=8,
             page_group_size=1,
             compression_ratio=ratio, compression_scorer=args.scorer,
@@ -321,13 +384,15 @@ def measure_all(args, tokenizer, mix, base_ratios):
             compression_ea_use_vnorm=args.ea_use_vnorm,
             compression_ea_n_future_positions=args.ea_n_future_positions,
             compression_retention_dump=dump_dir,
+            **({"limit_mm_per_prompt": {"image": 0}}
+               if args.no_mm_profiling else {}),
             # The engine requires max_num_batched_tokens == compression_chunk_size
             # when compression is on: it processes exactly one compression chunk
             # per prefill step. A context longer than the chunk is chunked
             # internally; a context that fits in one chunk is scored one-shot.
             max_num_batched_tokens=args.prefill_chunk)
         llm.generate(prompts, SamplingParams(max_tokens=1, temperature=0.0))
-        del llm
+        release_engine(llm)
         # Read the engine's per-request keep decisions back, grouped by
         # (req, rank): under TP each rank dumps only its own KV-head shard, so a
         # request yields one file per rank. Dedup each (req, rank) by max

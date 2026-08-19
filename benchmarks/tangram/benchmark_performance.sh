@@ -52,6 +52,10 @@ RATIOS=${RATIOS:-"1.0 0.3"}
 NUM=${NUM:-10}
 MAX_NUM_SEQS=${MAX_NUM_SEQS:-16}
 MAX_TOKENS=${MAX_TOKENS:-512}
+# Fraction of GPU memory the engine may claim; the leftover after weights is the
+# KV pool. Raise it when a long-context model cannot fit one full-length request
+# (e.g. gemma-3-12b at 124k needs ~46 GiB of KV, just over what 0.90 leaves).
+GPU_MEM_UTIL=${GPU_MEM_UTIL:-0.90}
 
 # Page-group size is 4 for every method; PAGE_GROUP_SIZE overrides it (the
 # fastkvzip cluster map below must then match the chosen page group).
@@ -98,6 +102,7 @@ for RATIO in ${RATIOS}; do
         --num "${NUM}" \
         --ratio "${RATIO}" \
         --max-num-seqs "${MAX_NUM_SEQS}" \
+        --gpu-memory-utilization "${GPU_MEM_UTIL}" \
         --page-group-size "${PAGE_GROUP_SIZE}" \
         --max-tokens "${MAX_TOKENS}" \
         --single-turn \
