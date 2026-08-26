@@ -131,6 +131,12 @@ fi
 if [ -n "${FLOOR_MIN:-}" ]; then
     METHOD_ARGS+=(--compression-floor-min "${FLOOR_MIN}")
 fi
+# Prefix sink tokens kept regardless of score. Set N_SINK=0 to reproduce a
+# reference that protects no prefix (KeyDiff's, for one), where a sink would
+# otherwise hold tokens the method under comparison is free to evict.
+if [ -n "${N_SINK:-}" ]; then
+    METHOD_ARGS+=(--compression-n-sink-tokens "${N_SINK}")
+fi
 # Compression chunk size. Under a fixed budget this also bounds the budget from
 # below (the fresh chunk is kept unconditionally unless EVICT_CURRENT_CHUNK=1),
 # so a small budget needs a small chunk.
