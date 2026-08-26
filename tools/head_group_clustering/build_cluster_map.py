@@ -67,11 +67,10 @@ def parse_args() -> argparse.Namespace:
         "--cluster-scope", choices=["global", "per_layer"], default="global",
         help="'global' clusters across the whole model (typically cross-layer); "
              "'per_layer' clusters within each layer independently. Use "
-             "'per_layer' to match a per-layer-threshold selection level "
-             "(perlayer_head, perlayer_cluster), which thresholds within each "
-             "layer and so needs same-layer clusters to avoid pooling across "
-             "disparate cross-layer score scales; use 'global' for the "
-             "cross-layer-threshold levels (crosslayer_head, crosslayer_cluster).")
+             "'per_layer' to match the 'layer' budget scope, which thresholds "
+             "within each layer and so needs same-layer clusters to avoid "
+             "pooling across disparate cross-layer score scales; use 'global' "
+             "for the 'global' budget scope.")
     return parser.parse_args()
 
 

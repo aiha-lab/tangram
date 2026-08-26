@@ -11,6 +11,9 @@ Tangram: Unlocking Non-Uniform KV Cache Compression for Efficient Multi-turn LLM
   <a href="https://arxiv.org/abs/2606.06302">
     <img src="https://img.shields.io/badge/arXiv-2606.06302-b31b1b.svg?logo=arxiv&logoColor=white" alt="arXiv"/>
   </a>
+  <a href="https://aiha-lab.github.io/tangram-docs/">
+    <img src="https://img.shields.io/badge/Docs-Tangram--vLLM-4051b5.svg?logo=materialformkdocs&logoColor=white" alt="Docs"/>
+  </a>
   <a href="https://aiha-lab.github.io/tangram-page/">
     <img src="https://img.shields.io/badge/Project%20Page-tangram-blue.svg?logo=data%3Aimage%2Fpng%3Bbase64%2CiVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAADEUlEQVR42u2WMW8cVRSFv%2FNmdjZxImw2TiiBIJTYDULiZ1AjQMgFpLFkiIJNYUEFiryJQAKRin%2FBT6BBSgEUIMcGCiiQgKy9M1kH27uedyhmbS%2FB9jraoFD4jkYz0tx599xz7r3vwYmd2GM2DXPwMXyGBPB%2FjXGkX4e5yPDEL0%2B%2FIMiZOMQphwO%2Frf866Yv%2B5p50OAvpIcQrIJ%2B75TOLXy7dXvrp8%2FPtMBYByd5fTZVGE4PrS9h2uhnCU%2B%2F%2F3AJeAjo2OghIehiyCDS%2BXVHz8rvna9lY48Pvr3M%2Fe5LgyKCs6gfFJkpIpsxTzl67C28U4nZDsM5DMlDZKmskvQvdjy5ddbe35ebKJ8prE8imSqYKXL1WoGIRyOb%2BNFcKxVbohcb6kRofCYBTzzsa1XobujG9gELQ0p2PKdJxICJ7nwZB7AROza2RvVVAISEPLcNwnGIugVo3pzm1wOLUAuM7OVEBoypzQdxIyGbWqL%2Faxh1VKx%2BjC44FwIhSgXS7TfPyPItT7zHRzYkSUaLcCNRmWtRfbxN%2FS4gdcF%2BdYZYOb1TtTZNSgVovpzm9ABJLyzf5a3uCbOYu6Ws5dAS1SHIfqJnk9KMAsFtkrvjaiSLdatOcmid2xfyLH%2BBXStSuQ4gQq1%2BSexC3IDnXGwHA1rqoX%2FhHzxtRAkm3zc1L1%2FjimYTQugXb4yAQJjoSsoBzW3%2BMGb4%2BtByGMDC5J8GgIkZEQ1BB%2Ft1V2K7BdAVCclW2DoBxZ0cjFGFrf%2BYMDjsE%2FS7Q6RytzJIsz1HLclKbFJHGSOJy1C6Y3M9eD7TV4DyuF8TVWcqVOZwV%2FbLRI%2BqCg%2FYs%2BQFmBFmB78xWQ%2FHyZxAb4HjkGD6eBMI4GttE2%2F0nHryry1nucnnWcfltK2sbEaExCgOTYDKSeiWAtDvyD2RJGMY2iT%2B%2BI%2BoZeu7TjI1nRwDQ3Ymuh9%2B10y0de8b8a0f1buC%2BTMaQrjv%2BcCWErc0WL1%2F3Xg8%2F%2FIHE4s3WWc5o329X0saQstkuxFcXI6vaYPRj2WM8lFbbykgh%2Fr%2FZn9iJAfwNA5Fiz3oR1tsAAAAASUVORK5CYII%3D&logoColor=white" alt="Project Page"/>
   </a>
@@ -40,7 +43,7 @@ practical for multi-turn LLM serving, built on top of
 - 🧩 **Ragged Paging for efficient KV compression** — non-uniform *and* uniform KV cache compression, natively integrated into vLLM
 - 🔌 **Seamless vLLM integration** — fully compatible with paged attention, continuous batching, chunked prefill, and CUDA graph mode
 - 💾 **Real memory reclamation** — compressed KV cache is actually freed, turning memory savings into higher serving throughput
-- ⚡ **Zero runtime scheduling overhead** — budget reservation and ahead-of-time (AOT) load balancing keep compression off the critical path
+- 🔁 **Multi-turn serving** — a native multi-turn request model that carries the compressed KV cache across turns
 
 ## Use cases
 
@@ -68,9 +71,9 @@ from vllm import LLM, SamplingParams
 
 llm = LLM(
     model="Qwen/Qwen3-4B-Instruct-2507",
-    compression_ratio=0.5,                  # keep 50% of the KV cache (1.0 = no compression)
+    compression_ratio=0.5,                  # evict 50% of the KV cache (0.0 = no compression)
     compression_scorer="snapkv",            # snapkv | keydiff | tova | expected_attention | streamingllm | fastkvzip
-    compression_level="crosslayer_cluster", # crosslayer_cluster | perlayer_cluster | uniform
+    compression_budget_scope="global",      # uniform | layer | global
 )
 
 out = llm.generate(["What is KV cache compression?"], SamplingParams(max_tokens=128))
@@ -81,16 +84,16 @@ print(out[0].outputs[0].text)
 
 | Config | Description |
 | ------ | ----------- |
-| `compression_ratio` | KV retention fraction; `1.0` = FullKV (no compression). |
+| `compression_ratio` | Fraction of the KV cache to **evict**, in `[0, 1)`; unset or `0.0` = FullKV (no compression). Mutually exclusive with `compression_budget_tokens`. |
 | `compression_scorer` | Importance scorer: `snapkv` \| `keydiff` \| `tova` \| `expected_attention` \| `streamingllm` \| `fastkvzip`. |
-| `compression_level` | KV-budget scope — see below. |
+| `compression_budget_scope` | Scope the retention budget is balanced over — see below. |
 | `page_group_size` | Heads per page (H<sub>p</sub>): attention heads managed together in one KV-cache page; they share one paged budget. |
 
-**`compression_level` options**
+**`compression_budget_scope` options**
 
-- `crosslayer_cluster` — non-uniform; a single global KV budget is distributed across all layers and heads, so important heads in any layer can keep more tokens (like [PyramidKV](https://arxiv.org/abs/2406.02069)).
-- `perlayer_cluster` — non-uniform; each layer gets an equal KV budget, distributed non-uniformly across the heads within that layer.
-- `uniform` — every attention head keeps the same number of tokens (`ratio × seq_len`); only *which* tokens are kept differs per head.
+- `global` — non-uniform; a single global KV budget is distributed across all layers and heads, so important heads in any layer can keep more tokens (like [PyramidKV](https://arxiv.org/abs/2406.02069)).
+- `layer` (default) — non-uniform; each layer gets an equal KV budget, distributed non-uniformly across the heads within that layer.
+- `uniform` — every attention head keeps the same number of tokens; only *which* tokens are kept differs per head.
 
 ## Supported Compression
 
@@ -113,7 +116,7 @@ The following models have been verified with Tangram. More models are on the way
 | GPT-OSS-20B | [`openai/gpt-oss-20b`](https://huggingface.co/openai/gpt-oss-20b) |
 | Qwen3-30B-A3B (MoE)&nbsp;* | [`Qwen/Qwen3-30B-A3B-Instruct-2507`](https://huggingface.co/Qwen/Qwen3-30B-A3B-Instruct-2507) |
 
-\* Verified with `tensor_parallel_size=2`.
+\* Verified with `tensor_parallel_size=2` and `compression_budget_scope="uniform"` — `layer` / `global` require `tensor_parallel_size=1`.
 
 ## Accuracy
 
@@ -126,10 +129,10 @@ The following models have been verified with Tangram. More models are on the way
 
 </details>
 
-[RULER](https://arxiv.org/abs/2404.06654) 8K
+[RULER](https://arxiv.org/abs/2404.06654) 8K — column percentages are **KV retention**, the fraction kept (`compression_ratio` = 1 − retention):
 
 <details>
-<summary><b>Non-uniform (<code>perlayer_cluster</code>), H<sub>p</sub> = 4</b></summary>
+<summary><b>Non-uniform (<code>layer</code> scope), H<sub>p</sub> = 4</b></summary>
 
 <table>
 <thead>
@@ -201,17 +204,17 @@ Run one compression method at one ratio on RULER 8K:
 cd benchmarks/tangram
 
 MODEL=meta-llama/Llama-3.1-8B-Instruct \
-SCORER=snapkv LEVEL=crosslayer_cluster RATIOS=0.5 LENGTHS=8192 \
+SCORER=snapkv SCOPE=global RATIOS=0.5 LENGTHS=8192 \
 bash benchmark_ruler.sh
 ```
 
 - `SCORER` — `snapkv` | `keydiff` | `tova` | `expected_attention` | `streamingllm`
-- `RATIOS` — KV retention fraction (`1.0` = FullKV reference)
-- `LEVEL` — selection level; see [Configuration](#configuration)
+- `RATIOS` — fraction of the KV cache to evict (`0.0` = FullKV reference)
+- `SCOPE` — budget scope; see [Configuration](#configuration)
 
 ### How to reproduce speedup
 
-Measure end-to-end generation speedup — wall-clock at `r=1.0` (uncompressed)
+Measure end-to-end generation speedup — wall-clock at `r=0` (uncompressed)
 vs compressed ratios on an SCBench task:
 
 ```bash

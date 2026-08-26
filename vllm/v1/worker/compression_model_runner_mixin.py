@@ -49,9 +49,15 @@ from vllm.v1.attention.backends.utils import (
     sliding_window_layers,
 )
 from vllm.v1.attention.compression import (
+    ChunkParams,
     CompressionExecutor,
     CompressionMetadata,
     KVCompressor,
+)
+from vllm.v1.attention.compression.slot_scores import KVCacheView
+from vllm.v1.attention.compression.workspace import (
+    CompressionWorkspace,
+    WorkspaceSpec,
 )
 
 if TYPE_CHECKING:
@@ -183,6 +189,22 @@ class CompressionModelRunnerMixin:
         # Dense models keep ``num_compressed_layers == num_layers`` and the map
         # is already physical, so both paths see the same array.
 
+        # Reserve every tensor the keep decision needs BEFORE the worker
+        # profiles peak memory (this runs inside ``load_model``, the profiling
+        # right after it), so the KV cache pool is sized around the reservation
+        # and an over-large budget or concurrency fails at startup instead of
+        # mid-generation. See workspace.py.
+        workspace = CompressionWorkspace(
+            WorkspaceSpec.from_cache_config(
+                cache_config,
+                num_layers=num_compressed_layers,
+                num_kv_heads=num_kv_heads_per_rank,
+                max_num_reqs=self.max_num_reqs,
+                max_model_len=self.model_config.max_model_len,
+                model_dtype=dtype,
+            ),
+            self.device)
+
         self.compressor = KVCompressor(
             num_layers=num_compressed_layers,
             num_kv_heads=num_kv_heads_per_rank,
@@ -192,7 +214,10 @@ class CompressionModelRunnerMixin:
             block_size=block_size,
             dtype=dtype,
             device=self.device,
-            level=cache_config.compression_level,
+            workspace=workspace,
+            budget_scope=cache_config.compression_budget_scope,
+            regime=cache_config.compression_regime,
+            slot_score_source=cache_config.compression_slot_score_source,
         )
         # Axis-2 scorer selection. FastKVZip loads a
         # per-layer gate checkpoint over hidden_states; every other scorer is a
@@ -210,13 +235,7 @@ class CompressionModelRunnerMixin:
                 cache_config.compression_scorer,
                 num_q_per_kv=self.model_config.get_num_attention_heads(
                     self.parallel_config) // num_kv_heads_per_rank,
-                snap_window=cache_config.compression_snap_window,
-                snap_kernel=cache_config.compression_snap_kernel,
-                ea_use_covariance=cache_config.compression_ea_use_covariance,
-                ea_use_vnorm=cache_config.compression_ea_use_vnorm,
-                ea_n_future_positions=(
-                    cache_config.compression_ea_n_future_positions),
-                ea_epsilon=cache_config.compression_ea_epsilon,
+                options=cache_config.resolved_scorer_options,
             )
         # Bind the same member->cluster map the FlashAttention builder uses so
         # scoring max-pools over the physical clusters (cross-layer when a map
@@ -482,16 +501,32 @@ class CompressionModelRunnerMixin:
                 req_id, num_static, num_groups)
 
             # Cross-layer KeepDecision; caches sorted indices + group scores
-            # for ``run_request`` (indexed by compressible position).
+            # for ``run_request`` (indexed by compressible position). The cache
+            # view is read access to this request's cached keys: a score that is
+            # relative to what is cached (KeyDiff under a fixed budget) is
+            # recomputed from them at every eviction rather than stored.
+            cache_view = KVCacheView(
+                layer_kv_caches=self.kv_caches,
+                block_table_gpu=block_table.block_table.gpu,
+                row_idx=row_idx,
+                compressed_layer_ids=static_layer_ids,
+                num_groups=num_groups,
+                block_size=self.compression_executor.block_size,
+            )
             self.compressor.prepare_keep_decision(
                 req_id=req_id,
                 prev_seq_lens_per_layer=torch.from_numpy(
                     prev_seq_lens_static),
                 chunk_len=chunk_len,
-                ratio=req_md.compression_ratio,
-                window_size=req_md.window_size,
-                n_sink_tokens=req_md.n_sink_tokens,
-                total_prompt_tokens=req_md.total_prompt_tokens,
+                cache_view=cache_view,
+                params=ChunkParams(
+                    keep_ratio=req_md.compression_keep_ratio,
+                    budget_tokens=req_md.budget_tokens,
+                    window_size=req_md.window_size,
+                    n_sink_tokens=req_md.n_sink_tokens,
+                    evict_current_chunk=req_md.evict_current_chunk,
+                    total_prompt_tokens=req_md.total_prompt_tokens,
+                ),
             )
 
             # Per-compressible-layer post-evict kept_lengths. Under TP,
@@ -610,7 +645,8 @@ class CompressionModelRunnerMixin:
         if active:
             assert self.compressor is not None, (
                 "scheduler emitted compression_metadata but the runner has "
-                "no KVCompressor; compression_ratio < 1.0 must be set."
+                "no KVCompressor; a retention target (compression_ratio or "
+                "compression_budget_tokens) must be set."
             )
             self._begin_compression_step(scheduler_output, compression_metadata)
         try:

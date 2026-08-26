@@ -752,12 +752,14 @@ class GPUModelRunner(
         for req_id in scheduler_output.finished_req_ids:
             self.requests.pop(req_id, None)
             self.num_prompt_logprobs.pop(req_id, None)
-            # Free the compressor's per-request GPU buffers on completion;
-            # request ids are unique within an llm.generate, so otherwise
-            # finished entries accumulate for the whole run and OOM mid-generate.
-            # end_request is idempotent — safe for non-compressed ids.
-            if self.compressor is not None:
+        if self.compressor is not None:
+            # Free the per-request GPU buffers. A preempted request frees its KV
+            # and restarts prefill, so its compression state belongs to the
+            # abandoned attempt and its workspace row must go back to the pool.
+            for req_id in (*scheduler_output.finished_req_ids,
+                           *(scheduler_output.preempted_req_ids or ())):
                 self.compressor.end_request(req_id)
+
         # Remove the finished requests from the persistent batch.
         # NOTE(woosuk): There could be an edge case where finished_req_ids and
         # scheduled_req_ids overlap. This happens when a request is aborted and

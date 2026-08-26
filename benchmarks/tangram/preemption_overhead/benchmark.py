@@ -14,7 +14,7 @@ over-admission. This script runs the same KV-pressured workload with that option
 OFF then ON and prints a side-by-side comparison of preemptions and throughput.
 
 Tangram KV-cache compression (FastKVZip prefill-with-eviction and the gate-free
-scorers) can be layered on top via ``--ratio`` (< 1.0 enables compression) plus
+scorers) can be layered on top via ``--compression-ratio`` (> 0 enables compression) plus
 the ``--compression-*`` knobs, which mirror ``bench_common.add_compression_args``
 one-for-one so the engine is built with the same semantics as the accuracy
 drivers. The admission OFF-vs-ON comparison then runs *under* compression — note
@@ -34,12 +34,12 @@ Examples
     # Run a single configuration only:
     CUDA_VISIBLE_DEVICES=0 python benchmark.py --reserve off
 
-    # Same comparison, but with FastKVZip compression at a 30% KV budget:
-    CUDA_VISIBLE_DEVICES=0 python benchmark.py --ratio 0.3
+    # Same comparison, but with FastKVZip compression evicting 70% of the KV:
+    CUDA_VISIBLE_DEVICES=0 python benchmark.py --compression-ratio 0.7
 
-    # A gate-free scorer (no checkpoint) with a per-layer selection level:
+    # A gate-free scorer (no checkpoint) with the uniform budget scope:
     CUDA_VISIBLE_DEVICES=0 python benchmark.py \\
-        --ratio 0.3 --compression-scorer snapkv --compression-level perlayer_head
+        --compression-ratio 0.7 --compression-scorer snapkv --compression-budget-scope uniform
 """
 from __future__ import annotations
 
@@ -113,28 +113,24 @@ def run_one(args: argparse.Namespace, reserve_full_isl: bool) -> dict:
         page_group_size=args.page_group_size,
         head_group_cluster_map=args.head_group_cluster_map,
     )
-    # ratio == 1.0 is the no-compression baseline; the compression machinery
-    # stays cold. ratio < 1.0 enables FastKVZip prefill-with-eviction. These
-    # knobs mirror bench_common.build_llm exactly.
-    if args.ratio < 1.0:
+    # ratio == 0 is the no-compression baseline; the compression machinery
+    # stays cold. ratio > 0 evicts that fraction via FastKVZip
+    # prefill-with-eviction. These knobs mirror bench_common.build_llm exactly.
+    if args.compression_ratio > 0.0:
         llm_kwargs.update(
-            compression_ratio=args.ratio,
+            compression_ratio=args.compression_ratio,
             compression_chunk_size=args.compression_chunk_size,
             compression_n_sink_tokens=args.compression_n_sink_tokens,
             compression_window_size=args.compression_window_size,
             compression_floor_min=args.compression_floor_min,
             compression_gate_path=args.compression_gate_path,
             compression_scorer=args.compression_scorer,
-            compression_level=args.compression_level,
-            compression_snap_window=args.compression_snap_window,
-            compression_snap_kernel=args.compression_snap_kernel,
-            compression_ea_use_covariance=args.compression_ea_use_covariance,
-            compression_ea_use_vnorm=args.compression_ea_use_vnorm,
-            compression_ea_n_future_positions=(
-                args.compression_ea_n_future_positions),
+            compression_budget_scope=args.compression_budget_scope,
+            compression_scorer_options=dict(
+                kv.split("=", 1)
+                for kv in (args.compression_scorer_options or "").split(",")
+                if kv),
         )
-        if args.compression_ea_epsilon is not None:
-            llm_kwargs["compression_ea_epsilon"] = args.compression_ea_epsilon
     llm = LLM(**llm_kwargs)
     sp = SamplingParams(temperature=0.0, max_tokens=args.max_tokens,
                         min_tokens=args.max_tokens, ignore_eos=True)
@@ -217,11 +213,11 @@ def print_comparison(args: argparse.Namespace, off: dict, on: dict) -> None:
           f"{str(off['e2e_s']) + ' s':>13}{str(off['throughput_tok_s']) + ' tok/s':>15}")
     print(f" {'ON  (full-input reserve)':<26}{on['preemptions']:>13}"
           f"{str(on['e2e_s']) + ' s':>13}{str(on['throughput_tok_s']) + ' tok/s':>15}")
-    if args.ratio < 1.0:
-        print(f" compression ratio={args.ratio} scorer={args.compression_scorer} "
-              f"level={args.compression_level}")
+    if args.compression_ratio > 0.0:
+        print(f" compression ratio={args.compression_ratio} scorer={args.compression_scorer} "
+              f"budget_scope={args.compression_budget_scope}")
     else:
-        print(" compression OFF (ratio=1.0, baseline)")
+        print(" compression OFF (ratio=0, baseline)")
     print(line)
     speedup = (off["e2e_s"] / on["e2e_s"]) if on["e2e_s"] else float("nan")
     print(f" → admission control removed {off['preemptions'] - on['preemptions']} "
@@ -264,10 +260,10 @@ def _add_compression_args(p: argparse.ArgumentParser) -> None:
     that bench_common performs at module load."""
     g = p.add_argument_group("compression (FastKVZip prefill-with-eviction)")
     g.add_argument(
-        "--ratio", type=float, default=1.0,
-        help="KV cache budget as a ratio of the full cache, in (0, 1]. "
-             "ratio == 1.0 (default) disables compression and runs the "
-             "uncompressed baseline; < 1.0 enables compression.")
+        "--compression-ratio", type=float, default=0.0,
+        help="Fraction of the KV cache to evict, in [0, 1). "
+             "0 (default) disables compression and runs the uncompressed "
+             "baseline; > 0 enables compression.")
     g.add_argument("--page-group-size", type=int, default=4)
     g.add_argument(
         "--head-group-cluster-map", type=str, default=None,
@@ -285,25 +281,12 @@ def _add_compression_args(p: argparse.ArgumentParser) -> None:
                  "expected_attention"],
         help="Score producer (axis 2). All but 'fastkvzip' are gate-free.")
     g.add_argument(
-        "--compression-level", default="crosslayer_head",
-        choices=("crosslayer_head", "perlayer_head", "crosslayer_cluster",
-                 "perlayer_cluster", "uniform"),
-        help="Selection level (axis 1), named {scope}_{granularity}.")
-    g.add_argument("--compression-snap-window", type=int, default=32,
-                   help="SnapKV observation window (trailing queries).")
-    g.add_argument("--compression-snap-kernel", type=int, default=7,
-                   help="SnapKV max-pool1d smoothing kernel size (odd).")
-    g.add_argument("--compression-ea-use-covariance",
-                   action=argparse.BooleanOptionalAction, default=True,
-                   help="ExpectedAttention: add the query-covariance term.")
-    g.add_argument("--compression-ea-use-vnorm",
-                   action=argparse.BooleanOptionalAction, default=True,
-                   help="ExpectedAttention: reweight by the value norm.")
-    g.add_argument("--compression-ea-n-future-positions", type=int, default=512,
-                   help="ExpectedAttention: #future positions averaged.")
-    g.add_argument("--compression-ea-epsilon", type=float, default=None,
-                   help="ExpectedAttention: constant before value-norm "
-                        "reweighting; unset uses the engine default (1e-2).")
+        "--compression-budget-scope", default="layer",
+        choices=("uniform", "layer", "global"),
+        help="Scope the retention budget is balanced over (axis 1).")
+    g.add_argument("--compression-scorer-options", type=str, default="",
+                   help="Settings the selected scorer declares, as "
+                        "key=value,key=value (see the scorer's OPTIONS).")
 
 
 def main() -> None:
@@ -316,8 +299,10 @@ def main() -> None:
             for k, v in json.load(f).items():
                 setattr(args, k, v)
 
-    if not (0.0 < args.ratio <= 1.0):
-        raise SystemExit(f"--ratio must satisfy 0 < ratio <= 1, got {args.ratio}.")
+    if not (0.0 <= args.compression_ratio < 1.0):
+        raise SystemExit(
+            f"--compression-ratio must satisfy 0 <= ratio < 1, "
+            f"got {args.compression_ratio}.")
 
     # Single-config (worker) mode.
     if args.reserve is not None:

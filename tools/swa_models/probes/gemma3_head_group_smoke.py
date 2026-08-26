@@ -44,7 +44,8 @@ def main() -> None:
         action="store_true",
         help="Activate FastKVZip compression (requires page-group-size).",
     )
-    parser.add_argument("--compression-ratio", type=float, default=1.0)
+    parser.add_argument("--compression-ratio", type=float, default=0.0,
+                        help="Fraction of the KV cache to evict; 0 = off.")
     parser.add_argument("--compression-gate-path", default="fastkvzip")
     args = parser.parse_args()
 

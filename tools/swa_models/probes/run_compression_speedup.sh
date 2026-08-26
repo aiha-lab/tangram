@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# Reproduce the KV-cache compression speedup (no-compression vs ratio=0.3) on a
+# Reproduce the KV-cache compression speedup (no-compression vs ratio=0.7) on a
 # single 80GB GPU, for gemma-3-12b-it, gpt-oss-20b, and Qwen2.5-7B-Instruct-1M.
 #
 # WHAT IS MEASURED
 #   The same long-context, concurrent workload is run twice with an IDENTICAL
 #   engine configuration; the ONLY thing that differs between the two runs is
-#   --ratio (1.0 = no compression, 0.3 = FastKVzip compression + sliding-window
+#   --compression-ratio (0 = no compression, 0.7 = FastKVzip compression + sliding-window
 #   eviction). Wall-clock generation time is compared. Any difference is
 #   therefore attributable solely to compression.
 #
@@ -18,7 +18,7 @@
 #   real serving scenario (many concurrent long-context requests on one GPU).
 #
 #   Fairness safeguards, verifiable by a third party:
-#     * Identical config for both ratios — only --ratio changes. Same model,
+#     * Identical config for both ratios — only --compression-ratio changes. Same model,
 #       dataset, --num, --max-num-seqs, --max-tokens, --gpu-memory-utilization,
 #       --page-group-size and head-group cluster map.
 #     * Standard greedy decoding (--temperature 0), deterministic + comparable.
@@ -78,8 +78,8 @@ NUM="${NUM_OVERRIDE:-$NUM}"; MNS="${MNS_OVERRIDE:-$MNS}"; GPU_MEM="${GPU_MEM_OVE
 PG="${PG_OVERRIDE:-$PG}"; CMAP="${CMAP_OVERRIDE:-$CMAP}"
 DATASET="${DATASET_OVERRIDE:-$DATASET}"; MML="${MML_OVERRIDE:-$MML}"
 MAX_TOKENS="${MAX_TOKENS_OVERRIDE:-$MAX_TOKENS}"
-# Compression chunk size is identical for both ratios (it is inert at ratio=1.0,
-# which runs no compression), so adjusting it keeps the "only --ratio differs"
+# Compression chunk size is identical for both ratios (it is inert at ratio=0,
+# which runs no compression), so adjusting it keeps the "only --compression-ratio differs"
 # fairness invariant. A smaller chunk lowers the in-flight prefill peak, which
 # matters for dense models whose per-request KV is otherwise close between the
 # two ratios.
@@ -90,9 +90,9 @@ OUT_BASE="${OUT_DIR:-/tmp/speedup_$KEY}"
 run_one () {  # $1 = ratio
     local ratio="$1" od="$OUT_BASE/r${1/./}"
     mkdir -p "$od"
-    echo "===== $KEY  ratio=$ratio  num=$NUM mns=$MNS gpu_mem=$GPU_MEM (identical config; only --ratio differs) ====="
+    echo "===== $KEY  ratio=$ratio  num=$NUM mns=$MNS gpu_mem=$GPU_MEM (identical config; only --compression-ratio differs) ====="
     python3 "$PY" \
-        -d "$DATASET" --num "$NUM" --ratio "$ratio" \
+        -d "$DATASET" --num "$NUM" --compression-ratio "$ratio" \
         --page-group-size "$PG" --head-group-cluster-map "$CMAP" \
         --max-num-seqs "$MNS" --single-turn --max-tokens "$MAX_TOKENS" \
         --force-exact-tokens \
@@ -106,8 +106,8 @@ run_one () {  # $1 = ratio
     echo "  ratio=$ratio exit=$?"
 }
 
-run_one 1.0
-run_one 0.3
+run_one 0.0
+run_one 0.7
 
 # --- Fair comparison report ---------------------------------------------------
 python3 - "$OUT_BASE" "$KEY" <<'PYEOF'
@@ -124,10 +124,10 @@ def metrics(ratio):
     b = d["benchmark"] if d else {}
     return dict(t=b.get("elapsed_sec"), out=b.get("total_output_tokens"),
                 kv=max(kv) if kv else None, pre=max(pre) if pre else 0)
-b, c = metrics("1.0"), metrics("0.3")
-print(f"\n================ {key}: compression speedup (fair: only --ratio differs) ================")
+b, c = metrics("0.0"), metrics("0.7")
+print(f"\n================ {key}: compression speedup (fair: only --compression-ratio differs) ================")
 print(f"  {'':18s} {'gen_time(s)':>12s} {'out_tokens':>11s} {'peak_KV%':>9s} {'preemptions':>12s}")
-for name, m in (("ratio=1.0 (none)", b), ("ratio=0.3 (compress)", c)):
+for name, m in (("ratio=0 (none)", b), ("ratio=0.7 (compress)", c)):
     print(f"  {name:18s} {m['t']:>12.1f} {str(m['out']):>11s} {str(m['kv']):>9s} {m['pre']:>12d}")
 if b['t'] and c['t']:
     print(f"\n  >>> SPEEDUP (r1.0 / r0.3) = {b['t']/c['t']:.2f}x"

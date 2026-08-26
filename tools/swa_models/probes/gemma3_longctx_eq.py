@@ -8,9 +8,9 @@ must retrieve it; if a tangram config fails the SAME easy retrieval, that config
 is where the bug is.
 
 Run matrix (compare ``retrieved`` and token_ids):
-  pg=0, ratio=1.0   vanilla (head-group OFF, no compression)  -- control
-  pg>0, ratio=1.0   head-group paging, no compression          -- paging bug?
-  pg>0, ratio<1.0   head-group + FastKVZip compression         -- compression bug?
+  pg=0, ratio=0     vanilla (head-group OFF, no compression)  -- control
+  pg>0, ratio=0     head-group paging, no compression          -- paging bug?
+  pg>0, ratio>0     head-group + FastKVZip compression         -- compression bug?
 """
 
 import argparse
@@ -36,7 +36,8 @@ def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--model", default="/raid/LLM/gemma-3-12b-it")
     p.add_argument("--page-group-size", type=int, required=True)  # 0 = vanilla
-    p.add_argument("--ratio", type=float, default=1.0)
+    p.add_argument("--ratio", type=float, default=0.0,
+               help="Fraction of the KV cache to evict; 0 = off.")
     p.add_argument("--out", required=True)
     p.add_argument("--repeats", type=int, default=620)  # ~9K tokens
     p.add_argument("--max-model-len", type=int, default=16384)
@@ -57,7 +58,7 @@ def main() -> None:
         max_model_len=args.max_model_len,
         gpu_memory_utilization=args.gpu_memory_utilization, enforce_eager=True,
     )
-    if pgs is not None and args.ratio < 1.0:
+    if pgs is not None and args.ratio > 0.0:
         kw.update(compression_ratio=args.ratio,
                   compression_chunk_size=8192, compression_window_size=4096,
                   compression_n_sink_tokens=32, compression_floor_min=0)

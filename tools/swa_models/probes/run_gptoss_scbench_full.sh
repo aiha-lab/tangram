@@ -30,7 +30,7 @@ export VLLM_WORKER_MULTIPROC_METHOD="${VLLM_WORKER_MULTIPROC_METHOD:-spawn}"
 
 MODEL=/raid/LLM/gpt-oss-20b
 GATE=/workspace/tangram_impl/FastKVzip-gpt-oss/result_gate/gpt-oss-20b/q8_dim16_sink16.pt
-read -r -a RATIOS <<< "${RATIOS:-0.3 0.5 0.7 1.0}"
+read -r -a RATIOS <<< "${RATIOS:-0.7 0.5 0.3 0.0}"
 
 CLUSTER_MAP="${CLUSTER_MAP:-}"
 map_args=()
@@ -64,7 +64,7 @@ for spec in "${SPECS[@]}"; do
         python3 "$PY" \
             -d "$DATASET" \
             --num "$NUM" \
-            --ratio "$RATIO" \
+            --compression-ratio "$RATIO" \
             --page-group-size 2 \
             --compression-chunk-size 8192 \
             --compression-window-size 4096 \

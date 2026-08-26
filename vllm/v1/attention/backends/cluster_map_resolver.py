@@ -4,7 +4,7 @@
 
 Finds the ``.npz`` map shipped under
 ``tools/head_group_clustering/cluster_maps/<scorer-dir>/<model-slug>/`` that
-matches the running model, scorer, ``page_group_size``, and selection level, so
+matches the running model, scorer, ``page_group_size``, and budget scope, so
 the default config needs no explicit ``--head-group-cluster-map``. This only
 *locates and identity-checks* a file; ``ragged_layout.load_cluster_map``
 stays the authoritative loader/validator of the array contents. Run once at
@@ -104,8 +104,8 @@ def _validate_cluster_map_meta(
     map_scope = meta.get("cluster_scope")
     if map_scope != expected_scope:
         logger.warning(
-            "Bundled cluster map %s has cluster_scope=%r but the selection "
-            "level needs %r; falling back to identity grouping.",
+            "Bundled cluster map %s has cluster_scope=%r but the budget "
+            "scope needs %r; falling back to identity grouping.",
             path, map_scope, expected_scope)
         return False
 
@@ -148,17 +148,17 @@ def resolve_bundled_cluster_map(
 ) -> str | None:
     """Path of the bundled cluster map for this run, or ``None`` for identity
     grouping. Returns ``None`` (logging why) when a map cannot be confidently
-    resolved: TP>1 (maps are TP=1 layouts), a level with no map
+    resolved: TP>1 (maps are TP=1 layouts), a scope with no map
     (``cluster_map_scope is None``), a scorer/tree with no map, no filename
-    match, or a metadata mismatch. ``cluster_map_scope`` is the level's
-    ``SelectionLevel.cluster_map_scope``."""
+    match, or a metadata mismatch. ``cluster_map_scope`` is the budget scope's
+    ``BudgetScope.cluster_map_scope``."""
     if tp_world_size > 1:
         logger.info(
             "Tensor parallelism (size %d) in use; cluster maps are TP=1 "
             "layouts, so using identity grouping.", tp_world_size)
         return None
 
-    if cluster_map_scope is None:  # level uses no cluster map (e.g. uniform)
+    if cluster_map_scope is None:  # scope uses no cluster map (uniform)
         return None
 
     suffix = _SCOPE_FILENAME_SUFFIX.get(cluster_map_scope)

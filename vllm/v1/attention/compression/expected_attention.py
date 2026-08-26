@@ -53,6 +53,7 @@ import torch
 from torch import nn
 
 from vllm.v1.attention.compression.qk_scorer_base import QKScorer
+from vllm.v1.attention.compression.scorer_options import ScorerOption
 from vllm.logger import init_logger
 from vllm.model_executor.layers.rotary_embedding.common import (
     apply_rotary_emb_torch,
@@ -79,11 +80,33 @@ class ExpectedAttentionScorer(QKScorer):
     #: outliers (kvpress ``get_query_statistics`` hardcodes 4; chunk-relative).
     _QUERY_OUTLIER_SINK = 4
 
+    OPTIONS = (
+        ScorerOption(
+            "use_covariance", bool, True,
+            "Add the query covariance term to the expected attention logit "
+            "(kvpress default)."),
+        ScorerOption(
+            "use_vnorm", bool, True,
+            "Reweight the expected attention by the value norm (kvpress "
+            "default)."),
+        ScorerOption(
+            "n_future_positions", int, 512,
+            "Number of future decode positions whose RoPE rotation is averaged "
+            "to anticipate where later queries attend.",
+            requirement=("a positive integer", lambda v: v > 0)),
+        ScorerOption(
+            "epsilon", float, 1e-2,
+            "Constant added before the value-norm reweighting, bounding the "
+            "score of a near-zero-norm value.",
+            requirement=("a non-negative float", lambda v: v >= 0)),
+    )
+
     def __init__(
         self,
         num_kv_heads: int,
-        num_q_per_kv: int,
         head_size: int,
+        num_q_per_kv: int = 1,
+        *,
         use_covariance: bool = True,
         use_vnorm: bool = True,
         n_future_positions: int = 512,

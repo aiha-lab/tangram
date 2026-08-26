@@ -32,7 +32,7 @@ MODEL=/raid/LLM/gemma-3-12b-it
 CLUSTER_MAP="${CLUSTER_MAP:-$REPO/tools/head_group_clustering/cluster_maps/gemma-3-12b-it_r0.3_pg4.npz}"
 DATASET=scbench_repoqa
 NUM=${NUM:-1}
-RATIO=${RATIO:-0.3}
+RATIO=${RATIO:-0.7}
 MML=${MML:-98304}
 GPU_MEM=${GPU_MEM:-0.90}
 
@@ -51,7 +51,7 @@ mns=${MAX_NUM_SEQS:-default} map=${CLUSTER_MAP:-identity} ====="
 python3 "$PY" \
     -d "$DATASET" \
     --num "$NUM" \
-    --ratio "$RATIO" \
+    --compression-ratio "$RATIO" \
     --page-group-size 4 \
     "${map_args[@]}" \
     "${seq_args[@]}" \

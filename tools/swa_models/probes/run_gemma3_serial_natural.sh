@@ -38,7 +38,7 @@ export VLLM_WORKER_MULTIPROC_METHOD="${VLLM_WORKER_MULTIPROC_METHOD:-spawn}"
 MODEL="${MODEL:-/raid/LLM/gemma-3-12b-it}"
 DATASET=scbench_kv_short
 NUM=${NUM:-20}
-RATIOS=(${RATIOS:-1.0 0.3})
+RATIOS=(${RATIOS:-0.0 0.7})
 
 for RATIO in "${RATIOS[@]}"; do
     LOG="$LOG_DIR/serial_r${RATIO}_n${NUM}.log"
@@ -47,7 +47,7 @@ for RATIO in "${RATIOS[@]}"; do
     python3 "$PY" \
         -d "$DATASET" \
         --num "$NUM" \
-        --ratio "$RATIO" \
+        --compression-ratio "$RATIO" \
         --max-num-seqs 1 \
         --page-group-size 2 \
         --compression-chunk-size 8192 \

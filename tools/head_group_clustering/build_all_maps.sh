@@ -6,11 +6,11 @@
 # build_all_profiles.sh produced. CPU-only and fast (no GPU, no engine).
 #
 # One map per profile, scope paired to the profile's threshold scope:
-#   profile.npz          (crosslayer_head) --cluster-scope global    -> pg4_r0.3.npz
-#   profile_perlayer.npz (perlayer_head)   --cluster-scope per_layer -> pg4_r0.3_perlayer.npz
-# The level/scope pairing is required: a per-layer selection level thresholds
-# within each layer, so its map must cluster within-layer (clustering across
-# layers would pool disparate cross-layer score scales).
+#   profile.npz          (global)    --cluster-scope global    -> pg4_r0.3.npz
+#   profile_perlayer.npz (per_layer) --cluster-scope per_layer -> pg4_r0.3_perlayer.npz
+# The pairing is required: the 'layer' budget scope thresholds within each
+# layer, so its map must cluster within-layer (clustering across layers would
+# pool disparate cross-layer score scales).
 #
 # page_group_size = 4 for all four TP=1 models (matches the serving / RULER
 # sweep config). Maps are ratio-independent (the runtime reads only
@@ -38,10 +38,10 @@ n_ok=0; n_fail=0
 for sc in "${SCORERS[@]}"; do
   for mo in "${MODELS[@]}"; do
     dir="$CMAPS/$sc/$mo"
-    # cross-layer map <- crosslayer_head profile (global scope)
+    # cross-layer map <- global-scope profile
     if build_one "$dir/profile.npz" global "$dir/pg${PG}_r${RATIO}.npz"; then
       n_ok=$((n_ok + 1)); else n_fail=$((n_fail + 1)); echo "[FAIL] $sc/$mo global"; fi
-    # per-layer map <- perlayer_head profile (per_layer scope)
+    # per-layer map <- per_layer-scope profile
     if build_one "$dir/profile_perlayer.npz" per_layer "$dir/pg${PG}_r${RATIO}_perlayer.npz"; then
       n_ok=$((n_ok + 1)); else n_fail=$((n_fail + 1)); echo "[FAIL] $sc/$mo per_layer"; fi
   done

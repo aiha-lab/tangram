@@ -26,10 +26,10 @@ DATASET=scbench_kv_short
 NUM=${NUM:-10}
 MEM=${MEM:-0.58}
 MAXLEN=${MAXLEN:-26624}
-for RATIO in ${RATIOS:-1.0 0.3}; do
+for RATIO in ${RATIOS:-0.0 0.7}; do
     LOG="$LOG_DIR/conc_r${RATIO}_n${NUM}_mem${MEM}.log"
     echo "===== gemma-3 ${DATASET} r=${RATIO} n=${NUM} mem=${MEM} CONCURRENT NATURAL multi-turn ====="
-    python3 "$PY" -d "$DATASET" --num "$NUM" --ratio "$RATIO" \
+    python3 "$PY" -d "$DATASET" --num "$NUM" --compression-ratio "$RATIO" \
         --page-group-size 2 --compression-chunk-size 8192 \
         --compression-window-size 4096 --compression-n-sink-tokens 32 \
         --compression-floor-min 0 -m "$MODEL" \

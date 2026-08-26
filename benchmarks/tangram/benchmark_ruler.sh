@@ -2,7 +2,7 @@
 # RULER accuracy across compression ratios for one method.
 #
 # Sibling of benchmark_scbench.sh — same method-selection knobs (SCORER /
-# LEVEL / RESUME) and engine setup, but drives benchmark_ruler.py over RULER's
+# SCOPE / RESUME) and engine setup, but drives benchmark_ruler.py over RULER's
 # synthetic long-context tasks instead of SCBench. RULER adds a context-LENGTH
 # sweep axis (4096 / 8192 / 16384); each (length, ratio) is one model load.
 #
@@ -12,18 +12,15 @@
 #   * per-task length      — output budget from the dataset's max_new_tokens
 #   * string-match metric  — recall (retrieval/tracking/extraction) or any-match (QA)
 #
-# ratio=1.0 is the uncompressed reference; uniform vs non-uniform differ only
-# at ratio<1.0.
+# ratio=0 (evict nothing) is the uncompressed reference; uniform vs
+# non-uniform differ only at ratio>0.
 #
 # Select the method with two knobs:
 #   SCORER  = fastkvzip | snapkv | keydiff | streamingllm | tova | expected_attention
-#   LEVEL   = crosslayer_head (cross-layer global threshold, head-calibrated; default)
-#           | perlayer_head (per-layer threshold, AdaKV-style, head-calibrated;
-#             the validated pairing for SCORER=expected_attention)
-#           | crosslayer_cluster (cross-layer threshold, cluster-calibrated;
-#             exact budget, needs a global cluster map)
-#           | perlayer_cluster (per-layer threshold, cluster-calibrated;
-#             exact per-layer budget, needs a per-layer cluster map)
+#   SCOPE   = layer (per-layer budget, pooled across its head groups; default,
+#             needs a per-layer cluster map)
+#           | global (one budget pooled across all layers and head groups;
+#             needs a global cluster map)
 #           | uniform (same kept count per (layer, group))
 #   RESUME  = 1 (skip already-saved (length,task,ratio) cells) | 0 (recompute all)
 # Results land in results_ruler/<scorer>_<selection>/ so methods stay separate.
@@ -53,20 +50,51 @@ PYTHON=${PYTHON:-python3}
 
 # ---- Method --------------------------------------------------------------
 SCORER=${SCORER:-snapkv}
-# Selection level (axis 1): crosslayer_head | perlayer_head | crosslayer_cluster
-# | perlayer_cluster | uniform.
-LEVEL=${LEVEL:-crosslayer_head}
+# Budget scope (axis 1): uniform | layer | global.
+SCOPE=${SCOPE:-layer}
 
 # ---- Sweep ---------------------------------------------------------------
 LENGTHS=${LENGTHS:-"8192 4096 16384"}   # 8K -> 4K -> 16K completion order
-RATIOS=${RATIOS:-"1.0 0.7 0.5 0.3"}
+# ``${VAR-default}`` (not ``:-``) so an explicitly EMPTY value means "none":
+# RATIOS="" BUDGETS="4096 2048" sweeps budgets only.
+RATIOS=${RATIOS-"0.0 0.3 0.5 0.7"}
+# Fixed KV budgets in tokens per (layer, head group), swept alongside RATIOS.
+# Empty (default) = ratio-only sweep. A budget run is a DIFFERENT retention
+# target, not a ratio: nothing is evicted until the cache would exceed the
+# budget, and it is then cut back to it. Compare a budget against the ratio that
+# keeps the same amount, i.e. budget ~= (1 - ratio) * length.
+BUDGETS=${BUDGETS:-}
+# 1 = let the chunk just written compete for eviction, protecting only the
+# always-kept recent window; 0 (default) = protect the whole fresh chunk, which
+# is the more accurate setting in our measurements. Budget runs only.
+EVICT_CURRENT_CHUNK=${EVICT_CURRENT_CHUNK:-0}
+# Where a cached position's score comes from when it competes again under a
+# budget: auto (default) = whatever the scorer specifies; persist = keep the
+# score each position's own chunk produced. Budget runs only.
+#
+# Set it to "persist" with SCORER=keydiff to separate the two things a
+# ratio->budget comparison changes at once: the retention target (lock-in and
+# the candidate set) and the score itself (KeyDiff's anchor becomes the whole
+# cache instead of the chunk). A "budget + persist" run keeps the score a ratio
+# run would rank, so the remaining difference is the target alone. Not a serving
+# setting — the engine warns when it overrides a rescoring scorer.
+SLOT_SCORE_SOURCE=${SLOT_SCORE_SOURCE:-auto}
+# Settings the selected SCORER declares, as key=value,key=value. Empty = the
+# scorer's own defaults. Applies to ratio AND budget runs (unlike the two knobs
+# above, a scorer setting is not regime-specific).
+#
+# The one that changes what KeyDiff computes:
+#   SCORER_OPTIONS=anchor=normalized  -> Eq. (8) as written, mu(K-hat)
+#   (default, unset)                  -> mu(K), the paper's experimental setting
+SCORER_OPTIONS=${SCORER_OPTIONS:-}
 TASKS=${TASKS:-}            # empty = all 13 RULER tasks
 NUM=${NUM:-50}             # samples PER TASK (RULER ships 500/task)
 MAX_NUM_SEQS=${MAX_NUM_SEQS:-16}
 
 # ---- Method-specific args ------------------------------------------------
-METHOD_ARGS=(--compression-scorer "${SCORER}" --compression-level "${LEVEL}")
-SELECTION="${LEVEL}"
+METHOD_ARGS=(--compression-scorer "${SCORER}"
+             --compression-budget-scope "${SCOPE}")
+SELECTION="${SCOPE}"
 
 # RESUME=1 skips (length, task, ratio) cells already saved under OUTPUT_DIR, so
 # an interrupted sweep continues with the same command (fully-done lengths skip
@@ -85,6 +113,11 @@ if [ "${LOG_STATS:-0}" = "1" ]; then
     METHOD_ARGS+=(--enable-log-stats)
 fi
 
+# Fixed KV cache size in blocks. Small values force preemption.
+if [ -n "${NUM_GPU_BLOCKS:-}" ]; then
+    METHOD_ARGS+=(--num-gpu-blocks-override "${NUM_GPU_BLOCKS}")
+fi
+
 # Compression keep-geometry overrides (the engine/bench defaults are tuned for
 # SCBench's long contexts: window 4096 / floor 512). For RULER's short contexts
 # those floors swamp the ratio, so set them small (e.g. WINDOW_SIZE=32 FLOOR_MIN=0)
@@ -95,6 +128,43 @@ fi
 if [ -n "${FLOOR_MIN:-}" ]; then
     METHOD_ARGS+=(--compression-floor-min "${FLOOR_MIN}")
 fi
+# Prefix sink tokens kept regardless of score. Set N_SINK=0 to reproduce a
+# reference that protects no prefix (KeyDiff's, for one), where a sink would
+# otherwise hold tokens the method under comparison is free to evict.
+if [ -n "${N_SINK:-}" ]; then
+    METHOD_ARGS+=(--compression-n-sink-tokens "${N_SINK}")
+fi
+# Compression chunk size. Under a fixed budget this also bounds the budget from
+# below (the fresh chunk is kept unconditionally unless EVICT_CURRENT_CHUNK=1),
+# so a small budget needs a small chunk.
+if [ -n "${CHUNK_SIZE:-}" ]; then
+    METHOD_ARGS+=(--compression-chunk-size "${CHUNK_SIZE}")
+fi
+# Scorer settings. Tagged into the result filename with the '=' dropped, since a
+# different setting is a different algorithm and must not overwrite a result.
+SCORER_OPTION_TAG=""
+if [ -n "${SCORER_OPTIONS}" ]; then
+    METHOD_ARGS+=(--compression-scorer-options "${SCORER_OPTIONS}")
+    SCORER_OPTION_TAG=$(echo "${SCORER_OPTIONS}" | tr '=,' '-_')
+fi
+
+# Budget-run extras. The tag keeps runs that differ only in eviction policy in
+# separate result files so one sweep does not overwrite another; each part is
+# spelled out because it ends up in result filenames a reader has to interpret.
+BUDGET_ARGS=()
+BUDGET_TAG_PARTS=()
+if [ -n "${SCORER_OPTION_TAG}" ]; then
+    BUDGET_TAG_PARTS+=("${SCORER_OPTION_TAG}")
+fi
+if [ "${EVICT_CURRENT_CHUNK}" = "1" ]; then
+    BUDGET_ARGS+=(--compression-evict-current-chunk)
+    BUDGET_TAG_PARTS+=("evict-current-chunk")
+fi
+if [ "${SLOT_SCORE_SOURCE}" != "auto" ]; then
+    BUDGET_ARGS+=(--compression-slot-score-source "${SLOT_SCORE_SOURCE}")
+    BUDGET_TAG_PARTS+=("${SLOT_SCORE_SOURCE}-scores")
+fi
+BUDGET_TAG=$(IFS=- ; echo "${BUDGET_TAG_PARTS[*]}")
 
 case "${SCORER}" in
     fastkvzip)
@@ -107,8 +177,8 @@ case "${SCORER}" in
         ;;
     snapkv)
         DEFAULT_PG=4
-        METHOD_ARGS+=(--compression-snap-window "${SNAP_WINDOW:-32}"
-                      --compression-snap-kernel "${SNAP_KERNEL:-7}")
+        # SnapKV knobs travel through the generic scorer-option channel:
+        # SCORER_OPTIONS="window=32,kernel=7".
         ;;
     keydiff|streamingllm|tova|expected_attention)
         DEFAULT_PG=4
@@ -141,21 +211,36 @@ fi
 # ---- Run -----------------------------------------------------------------
 # Outer loop over context lengths so each length's full ratio sweep completes
 # before the next (the all-task average is valid after every length).
+run_one() {
+    # $@ = the setting-specific args (a ratio, or a budget).
+    CUDA_VISIBLE_DEVICES="${GPU_ID}" "$PYTHON" "${SCRIPT_DIR}/benchmark_ruler.py" \
+        -l "${LENGTH}" \
+        --num "${NUM}" \
+        --max-num-seqs "${MAX_NUM_SEQS}" \
+        --gpu-memory-utilization "${GPU_MEM_UTIL}" \
+        --page-group-size "${PAGE_GROUP_SIZE}" \
+        "${TP_ARGS[@]}" \
+        "${METHOD_ARGS[@]}" \
+        "$@" \
+        -m "${MODEL}" \
+        --max-model-len "${MAX_LEN}" \
+        --output-dir "${OUTPUT_DIR}"
+}
+
 for LENGTH in ${LENGTHS}; do
     for RATIO in ${RATIOS}; do
-        echo "===== ${SCORER} ${SELECTION}  length=${LENGTH}  ratio=${RATIO}  tp=${TP} ====="
-        CUDA_VISIBLE_DEVICES="${GPU_ID}" "$PYTHON" "${SCRIPT_DIR}/benchmark_ruler.py" \
-            -l "${LENGTH}" \
-            --num "${NUM}" \
-            --ratio "${RATIO}" \
-            --max-num-seqs "${MAX_NUM_SEQS}" \
-            --gpu-memory-utilization "${GPU_MEM_UTIL}" \
-            --page-group-size "${PAGE_GROUP_SIZE}" \
-            "${TP_ARGS[@]}" \
-            "${METHOD_ARGS[@]}" \
-            -m "${MODEL}" \
-            --max-model-len "${MAX_LEN}" \
-            --output-dir "${OUTPUT_DIR}"
+        echo "===== ${SCORER} ${SELECTION}  length=${LENGTH}  ratio=${RATIO}" \
+             "options=${SCORER_OPTIONS:-<defaults>}  tp=${TP} ====="
+        run_one --compression-ratio "${RATIO}" \
+                ${SCORER_OPTION_TAG:+--tag "${SCORER_OPTION_TAG}"}
+    done
+    for BUDGET in ${BUDGETS}; do
+        echo "===== ${SCORER} ${SELECTION}  length=${LENGTH}  budget=${BUDGET}" \
+             "evict_current_chunk=${EVICT_CURRENT_CHUNK}" \
+             "slot_score_source=${SLOT_SCORE_SOURCE}" \
+             "options=${SCORER_OPTIONS:-<defaults>}  tp=${TP} ====="
+        run_one --compression-budget-tokens "${BUDGET}" \
+                ${BUDGET_TAG:+--tag "${BUDGET_TAG}"} "${BUDGET_ARGS[@]}"
     done
 done
 
@@ -177,19 +262,40 @@ for dp, _, files in os.walk(root):
         length, task, r = d.get("length"), d.get("task"), d.get("ratio")
         if length is None or task is None or r is None:
             continue
-        rows.setdefault((str(length), task), {})[r] = d.get("avg_score")
-        ratios.add(r)
+        # Every knob that makes a run a different experiment belongs in the
+        # label; two experiments sharing a column silently overwrite each other.
+        budget = d.get("budget_tokens")
+        setting = f"ratio{r}" if budget is None else f"budget{budget}"
+        if d.get("evict_current_chunk"):
+            setting += "+evict-current-chunk"
+        source = d.get("slot_score_source")
+        if source and source != "auto":
+            setting += f"+{source}"
+        if d.get("scorer_options"):
+            setting += f"+{d['scorer_options']}"
+        rows.setdefault((str(length), task), {})[setting] = d.get("avg_score")
+        ratios.add(setting)
 if not rows:
     print("(no results found under", root, ")")
     sys.exit(0)
-ratios = sorted(ratios, reverse=True)
+def _setting_key(label: str) -> tuple[int, float]:
+    """Sort ratio settings first (ascending evicted fraction, baseline 0
+    leading), then budgets (descending). The two are different retention
+    targets and are not comparable by label alone."""
+    head = label.split("+")[0]
+    if head.startswith("ratio"):
+        return (0, float(head[len("ratio"):]))
+    return (1, -float(head[len("budget"):]))
+
+ratios = sorted(ratios, key=_setting_key)
 keyw = max(len(f"{ln}/{tk}") for ln, tk in rows)
-hdr = "  ".join(f"r{r:<6}" for r in ratios)
+width = max(len(r) for r in ratios) + 1
+hdr = "  ".join(f"{r:<{width}}" for r in ratios)
 print(f"{'length/task':<{keyw}}  {hdr}")
 for ln, tk in sorted(rows):
     cells = "  ".join(
-        (f"{rows[(ln, tk)][r]*100:5.1f}%" if rows[(ln, tk)].get(r) is not None
-         else "   -- ")
+        (f"{rows[(ln, tk)][r]*100:>{width}.1f}"
+         if rows[(ln, tk)].get(r) is not None else f"{'--':>{width}}")
         for r in ratios
     )
     print(f"{ln + '/' + tk:<{keyw}}  {cells}")

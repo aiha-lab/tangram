@@ -12,8 +12,8 @@ tokens plus the most recent tokens, evict the middle. tangram's shared
 machinery already protects the sink (``n_sink_tokens``) and the recent window
 (``window_size``) unconditionally, so this scorer only has to rank the
 *eval region* (between sink and window) by recency — the most recent eval
-tokens are kept first, extending the recent block. With the uniform selection
-level this reproduces StreamingLLM exactly.
+tokens are kept first, extending the recent block. With the uniform budget
+scope this reproduces StreamingLLM exactly.
 
 The score MUST be monotonic in the token's GLOBAL sequence position, not its
 chunk-local position: the keep decision ranks the current chunk's body against
@@ -49,7 +49,16 @@ class StreamingLLMScorer(QKScorer):
     consumes = "qk"
     name = "streamingllm"
 
-    def __init__(self, num_kv_heads: int) -> None:
+    def __init__(
+        self,
+        num_kv_heads: int,
+        head_size: int = 0,
+        num_q_per_kv: int = 1,
+    ) -> None:
+        # ``head_size`` / ``num_q_per_kv`` are part of the shared
+        # construction contract every scorer is built with; a purely
+        # positional score needs neither.
+        del head_size, num_q_per_kv
         super().__init__()
         self.num_kv_heads = num_kv_heads
 

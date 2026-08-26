@@ -9,18 +9,15 @@
 #   * fixed --max-tokens   — so decode work is identical across ratios/methods
 #
 # This isolates the engine cost (prefill + decode + compression overhead) from
-# answer-length variance. ratio=1.0 is the uncompressed reference; uniform vs
-# non-uniform differ only at ratio<1.0.
+# answer-length variance. ratio=0 (evict nothing) is the uncompressed
+# reference; uniform vs non-uniform differ only at ratio>0.
 #
 # Select the method with two knobs:
 #   SCORER  = fastkvzip | snapkv | keydiff | streamingllm | tova | expected_attention
-#   LEVEL   = crosslayer_head (cross-layer global threshold, head-calibrated; default)
-#           | perlayer_head (per-layer threshold, AdaKV-style, head-calibrated;
-#             the validated pairing for SCORER=expected_attention)
-#           | crosslayer_cluster (cross-layer threshold, cluster-calibrated;
-#             exact budget, needs a global cluster map)
-#           | perlayer_cluster (per-layer threshold, cluster-calibrated;
-#             exact per-layer budget, needs a per-layer cluster map)
+#   SCOPE   = layer (per-layer budget, pooled across its head groups; default,
+#             needs a per-layer cluster map)
+#           | global (one budget pooled across all layers and head groups;
+#             needs a global cluster map)
 #           | uniform (same kept count per (layer, group))
 # Results land in performance_results/<scorer>_<selection>/ so methods stay
 # separate, mirroring results_accuracy/.
@@ -42,24 +39,28 @@ PYTHON=${PYTHON:-python3}
 
 # ---- Method --------------------------------------------------------------
 SCORER=${SCORER:-snapkv}
-# Selection level (axis 1): crosslayer_head | perlayer_head | crosslayer_cluster
-# | perlayer_cluster | uniform.
-LEVEL=${LEVEL:-crosslayer_head}
+# Budget scope (axis 1): uniform | layer | global.
+SCOPE=${SCOPE:-layer}
 
 # ---- Sweep ---------------------------------------------------------------
 DATASET=${DATASET:-scbench_repoqa}
-RATIOS=${RATIOS:-"1.0 0.3"}
+RATIOS=${RATIOS:-"0.0 0.7"}
 NUM=${NUM:-10}
 MAX_NUM_SEQS=${MAX_NUM_SEQS:-16}
 MAX_TOKENS=${MAX_TOKENS:-512}
+# Fraction of GPU memory the engine may claim; the leftover after weights is the
+# KV pool. Raise it when a long-context model cannot fit one full-length request
+# (e.g. gemma-3-12b at 124k needs ~46 GiB of KV, just over what 0.90 leaves).
+GPU_MEM_UTIL=${GPU_MEM_UTIL:-0.90}
 
 # Page-group size is 4 for every method; PAGE_GROUP_SIZE overrides it (the
 # fastkvzip cluster map below must then match the chosen page group).
 PAGE_GROUP_SIZE=${PAGE_GROUP_SIZE:-4}
 
 # ---- Method-specific args ------------------------------------------------
-METHOD_ARGS=(--compression-scorer "${SCORER}" --compression-level "${LEVEL}")
-SELECTION="${LEVEL}"
+METHOD_ARGS=(--compression-scorer "${SCORER}"
+             --compression-budget-scope "${SCOPE}")
+SELECTION="${SCOPE}"
 
 case "${SCORER}" in
     fastkvzip)
@@ -68,9 +69,8 @@ case "${SCORER}" in
         :
         ;;
     snapkv)
-        # Gate-free observation-window attention; tunable window / pool kernel.
-        METHOD_ARGS+=(--compression-snap-window "${SNAP_WINDOW:-32}"
-                      --compression-snap-kernel "${SNAP_KERNEL:-7}")
+        # Gate-free observation-window attention. SnapKV knobs travel through
+        # the generic channel: SCORER_OPTIONS="window=32,kernel=7".
         ;;
     keydiff|streamingllm|tova|expected_attention)
         # Gate-free, identity adjacency, no extra arguments (the scorer reads
@@ -81,6 +81,11 @@ case "${SCORER}" in
         exit 1
         ;;
 esac
+
+# Scorer-declared settings as key=value,key=value (see the scorer's OPTIONS).
+if [ -n "${SCORER_OPTIONS:-}" ]; then
+    METHOD_ARGS+=(--compression-scorer-options "${SCORER_OPTIONS}")
+fi
 
 # Head-group cluster map (applies to ANY scorer). The runner resolves a
 # per-scorer map and exports HEAD_GROUP_CLUSTER_MAP; a missing/sentinel path
@@ -96,8 +101,9 @@ for RATIO in ${RATIOS}; do
     CUDA_VISIBLE_DEVICES="${GPU_ID}" "$PYTHON" "${SCRIPT_DIR}/benchmark_scbench.py" \
         -d "${DATASET}" \
         --num "${NUM}" \
-        --ratio "${RATIO}" \
+        --compression-ratio "${RATIO}" \
         --max-num-seqs "${MAX_NUM_SEQS}" \
+        --gpu-memory-utilization "${GPU_MEM_UTIL}" \
         --page-group-size "${PAGE_GROUP_SIZE}" \
         --max-tokens "${MAX_TOKENS}" \
         --single-turn \
@@ -136,7 +142,7 @@ for dp, _, files in os.walk(root):
 if not rows:
     print("(no results found under", root, ")")
     sys.exit(0)
-ratios = sorted(ratios, reverse=True)
+ratios = sorted(ratios)
 w = max(len(d) for d in rows)
 hdr = "  ".join(f"r{r:<14}" for r in ratios)
 print(f"{'dataset':<{w}}  {hdr}")

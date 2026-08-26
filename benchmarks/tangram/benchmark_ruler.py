@@ -15,7 +15,7 @@ assembly, and scoring are provided self-contained by ``ruler_local`` (the
 preprocessed ``simonjegou/ruler`` parquets; no external RULER checkout required).
 
 Example:
-    python benchmark_ruler.py --length 4096 --num 50 --ratio 0.3 \\
+    python benchmark_ruler.py --length 4096 --num 50 --compression-ratio 0.7 \\
         -m Qwen/Qwen3-4B-Instruct-2507 --max-model-len 40960
 """
 
@@ -36,6 +36,7 @@ from bench_common import (  # noqa: E402
     add_engine_args,
     build_benchmark_report,
     build_llm,
+    effective_ratio,
     extract_request_timing,
 )
 from ruler_local import (  # noqa: E402
@@ -221,11 +222,20 @@ def run_task(
         "task": task,
         "model": args.model_path,
         "compression_algo": args.compression_scorer,
-        "compression_level": args.compression_level,
-        # ExpectedAttention epsilon as requested; None = unset, so the engine's
-        # CacheConfig.compression_ea_epsilon default (1e-2) applied.
-        "compression_ea_epsilon": args.compression_ea_epsilon,
-        "ratio": args.ratio,
+        "compression_budget_scope": args.compression_budget_scope,
+        "ratio": args.compression_ratio,
+        # The evicted-fraction convention; result files predating the ratio
+        # inversion lack this field and read "ratio" as the kept fraction.
+        "ratio_semantics": "evicted",
+        "budget_tokens": args.compression_budget_tokens,
+        "evict_current_chunk": args.compression_evict_current_chunk,
+        # Which score the eviction ranked. Recorded because a forced source is
+        # a different experiment, not a different run of the same one.
+        "slot_score_source": args.compression_slot_score_source,
+        # Scorer settings in force; a different anchor is a different algorithm,
+        # so a result file that omitted them could not be compared later.
+        "scorer_options": args.compression_scorer_options,
+        "compression_chunk_size": args.compression_chunk_size,
         "page_group_size": args.page_group_size,
         "max_tokens": max_tokens,
         "metric": metric_name(task),
@@ -310,8 +320,12 @@ def main() -> None:
     def save_path_for(task: str) -> str:
         return os.path.join(
             args.output_dir, f"len{args.length}", task,
-            f"{model_basename}_r{args.ratio}_pg{args.page_group_size}"
-            f"{tag_suffix}.json",
+            # A budget run keeps its ratio tag (0.0) plus the _b suffix,
+            # so it never shares a result file with a ratio run.
+            f"{model_basename}_r{args.compression_ratio}"
+            + (f"_b{args.compression_budget_tokens}"
+               if args.compression_budget_tokens is not None else "")
+            + f"_pg{args.page_group_size}{tag_suffix}.json",
         )
 
     dataset = load_ruler(args.length, n_data=args.num, tasks=tasks)
@@ -325,11 +339,11 @@ def main() -> None:
     if args.skip_existing:
         done = [t for t in task_names if os.path.exists(save_path_for(t))]
         if done:
-            print(f"[resume] length={args.length} ratio={args.ratio}: skipping "
+            print(f"[resume] length={args.length} ratio={args.compression_ratio}: skipping "
                   f"{len(done)} existing ({', '.join(done)})")
         task_names = [t for t in task_names if not os.path.exists(save_path_for(t))]
         if not task_names:
-            print(f"[resume] length={args.length} ratio={args.ratio}: all tasks "
+            print(f"[resume] length={args.length} ratio={args.compression_ratio}: all tasks "
                   "done; skipping model load.")
             return
 

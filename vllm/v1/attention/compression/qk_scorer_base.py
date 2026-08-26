@@ -18,9 +18,12 @@ TOVA, ExpectedAttention) implement this base.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 
 import torch
 from torch import nn
+
+from vllm.v1.attention.compression.scorer_options import ScorerOption
 
 
 class QKScorer(nn.Module, ABC):
@@ -37,6 +40,12 @@ class QKScorer(nn.Module, ABC):
     name: str
     #: Forward tensors the scorer reads; ``"qk"`` for every gate-free scorer.
     consumes: str = "qk"
+    #: Settings only this scorer understands, declared rather than wired
+    #: through configuration (see scorer_options.py). The declaration owns each
+    #: setting's default, accepted values and help text; the factory resolves
+    #: them and passes them to ``__init__`` as keyword arguments of the declared
+    #: name. A scorer with no settings leaves this empty.
+    OPTIONS: tuple[ScorerOption, ...] = ()
 
     @abstractmethod
     def forward(
@@ -52,3 +61,80 @@ class QKScorer(nn.Module, ABC):
         more important. ``value`` / ``module`` / ``position_offset`` are part of
         the shared contract — a scorer that does not need them ``del``s them."""
         ...
+
+    # --- Optional: scoring the whole cache, not just the fresh chunk ---------
+    #
+    # ``forward`` scores one chunk as it is written; under a fixed budget an old
+    # position competes again and must be scorable now. A scorer whose score is
+    # a function of the cached keys sets ``rescores_cache`` and implements
+    # ``score_cached``; where every other scorer's score comes from is
+    # ``slot_scores.py``.
+
+    #: Whether the scorer can rescore already-cached positions (``score_cached``
+    #: implemented). Read by ``slot_scores`` to pick the score source under a
+    #: fixed budget.
+    rescores_cache: bool = False
+    #: What ``score_cached`` needs materialised from the cache, as a subset of
+    #: ``RESCORE_INPUTS``. The runner builds exactly these and nothing else, so
+    #: a key-only method (KeyDiff) pays for one read while a method that also
+    #: needs values or positions can be added WITHOUT changing this contract
+    #: again. Empty unless ``rescores_cache`` is set.
+    rescore_inputs: tuple[str, ...] = ()
+
+    def score_cached(self, cached: "CachedPositions") -> torch.Tensor:
+        """Score every live position of ONE head group from the cache.
+
+        Args:
+            cached: the inputs this scorer declared in ``rescore_inputs``,
+                covering one head group's live slots in slot order.
+
+        Returns:
+            ``[page_group_size, num_positions]`` float32 scores, higher = more
+            important, on the same device as the inputs.
+
+        Only called when ``rescores_cache`` is set; the base raises so a scorer
+        that advertises the capability without implementing it fails loudly.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} sets rescores_cache but does not implement "
+            "score_cached.")
+
+
+#: Everything a rescoring scorer may ask the runner to materialise. Names are
+#: declared here rather than as bare strings at each site so a scorer, the
+#: runner that builds them and the tests agree on one vocabulary.
+RESCORE_KEYS = "keys"
+RESCORE_VALUES = "values"
+RESCORE_INPUTS: tuple[str, ...] = (RESCORE_KEYS, RESCORE_VALUES)
+
+
+@dataclass(frozen=True)
+class CachedPositions:
+    """One head group's live cache slots, as a rescoring scorer sees them.
+
+    Only the fields the scorer declared in ``rescore_inputs`` are populated;
+    the rest are ``None``, so reading an undeclared field is a mistake that
+    surfaces immediately rather than a silently wrong score.
+
+    Slot order, not sequence order: eviction compacts survivors towards the
+    front, so slot ``i`` holds whatever token survived into it, and a slot's
+    global sequence position cannot be inferred from its index.
+    """
+    #: ``[page_group_size, num_positions, head_size]`` post-RoPE keys, one row
+    #: per KV head (cluster column).
+    keys: torch.Tensor | None = None
+    #: ``[page_group_size, num_positions, head_size]`` values, same layout.
+    values: torch.Tensor | None = None
+    #: Live slots in this group; the trailing dimension of every field above.
+    num_positions: int = 0
+
+    def require(self, field: str) -> torch.Tensor:
+        """Return an input the scorer declared, or say which declaration is
+        missing. Scorers use this instead of asserting on ``None`` so the error
+        names the fix (``rescore_inputs``) rather than the symptom."""
+        value = getattr(self, field)
+        if value is None:
+            raise RuntimeError(
+                f"cached {field} were not materialised; a scorer that reads "
+                f"them must list {field!r} in rescore_inputs.")
+        return value

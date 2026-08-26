@@ -6,15 +6,11 @@ from vllm.v1.attention.compression.executor import (
     CompressionExecutor,
     CompressionMetadata,
 )
-from vllm.v1.attention.compression.gate import (
-    CompressionGate,
-    load_gates,
-)
+from vllm.v1.attention.compression.eviction_regime import ChunkParams
 
 __all__ = [
     "KVCompressor",
     "CompressionExecutor",
     "CompressionMetadata",
-    "CompressionGate",
-    "load_gates",
+    "ChunkParams",
 ]
