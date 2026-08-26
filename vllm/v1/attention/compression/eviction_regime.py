@@ -404,8 +404,8 @@ class _SlotScoreStore(RegimeScoreStore):
 class EvictionRegime(ABC):
     """Axis-3 rule: eval region + surviving fraction + score lifetime.
 
-    Stateless — one shared instance per compressor, exactly like a selection
-    level. Everything per-request lives in the store the regime creates.
+    Stateless — one shared instance per compressor, exactly like a budget
+    scope. Everything per-request lives in the store the regime creates.
     """
 
     #: Stable identifier for logging / introspection.
@@ -568,8 +568,8 @@ class BudgetRegime(EvictionRegime):
       more important tokens. Its score must therefore still be available, which
       is what :class:`_SlotScoreStore` and its score source provide.
 
-    ``budget_tokens`` is the per-(layer, head-group) length; the selection
-    level decides the scope it is shared over, exactly as it does for
+    ``budget_tokens`` is the per-(layer, head-group) length; the budget
+    scope decides the range it is shared over, exactly as it does for
     ``compression_ratio``. See ``CacheConfig.compression_budget_tokens`` and
     ``CacheConfig.compression_evict_current_chunk`` for the user-facing terms.
     """

@@ -629,6 +629,10 @@ class CacheConfig:
                 "cache at a fixed token count — and leave compression_ratio "
                 "unset when using a budget."
             )
+        # Validated outside the compression gate: these knobs name budget-only
+        # ablations, and one that is set but silently inert would make a
+        # baseline run look like the ablation.
+        self._validate_slot_score_source()
         if self.compression_enabled:
             if self.page_group_size is None:
                 raise ValueError(
@@ -662,7 +666,6 @@ class CacheConfig:
                     f"({self.compression_window_size})."
                 )
             self._validate_budget_target()
-            self._validate_slot_score_source()
             # Axis 1 — budget scope. Validated against the registry that
             # ``make_budget_scope`` dispatches on (single source of truth);
             # the local import keeps the torch-backed runtime module out of the
@@ -768,8 +771,8 @@ class CacheConfig:
             f"Model architecture '{architecture}' does not support Tangram "
             f"{feature} (ragged paged attention). Supported "
             f"architectures: {supported}. To run this model, disable the "
-            f"feature with --page-group-size=None (and --compression-ratio=1.0 "
-            f"for no compression)."
+            f"feature with --page-group-size=None (and leave "
+            f"--compression-ratio unset for no compression)."
         )
 
     def verify_with_parallel_config(

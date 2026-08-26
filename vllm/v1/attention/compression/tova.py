@@ -16,8 +16,8 @@ Two properties define TOVA and separate it from SnapKV:
   recent query attends to it (SnapKV averages a trailing observation window).
 * **Head-uniform** — the per-position attention is averaged across ALL query
   heads into one score, then shared by every KV head, so every head keeps the
-  same positions (SnapKV keeps per-head positions). With the uniform selection
-  level this reproduces TOVA's single global KV policy.
+  same positions (SnapKV keeps per-head positions). With the uniform budget
+  scope this reproduces TOVA's single global KV policy.
 
 Like tangram's SnapKV scorer, the attention is computed from the chunk's
 post-RoPE query/key the scorer receives (the reference recomputes the

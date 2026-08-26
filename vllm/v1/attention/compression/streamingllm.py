@@ -12,8 +12,8 @@ tokens plus the most recent tokens, evict the middle. tangram's shared
 machinery already protects the sink (``n_sink_tokens``) and the recent window
 (``window_size``) unconditionally, so this scorer only has to rank the
 *eval region* (between sink and window) by recency — the most recent eval
-tokens are kept first, extending the recent block. With the uniform selection
-level this reproduces StreamingLLM exactly.
+tokens are kept first, extending the recent block. With the uniform budget
+scope this reproduces StreamingLLM exactly.
 
 The score MUST be monotonic in the token's GLOBAL sequence position, not its
 chunk-local position: the keep decision ranks the current chunk's body against
