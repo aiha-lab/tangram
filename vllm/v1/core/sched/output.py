@@ -167,10 +167,10 @@ class CompressionRequestMetadata:
     """
     req_id: str
     # Keep fraction of the re-eval region per chunk
-    # (``CacheConfig.compression_ratio``). Per-chunk K_new is
-    # ``floor(ratio * re_eval_size)``. 0 < ratio <= 1. Left at 1.0 when a
+    # (``CacheConfig.compression_keep_ratio``). Per-chunk K_new is
+    # ``floor(keep_ratio * re_eval_size)``. 0 < keep_ratio <= 1; 1.0 when a
     # budget is the retention target instead.
-    compression_ratio: float
+    compression_keep_ratio: float
     window_size: int
     n_sink_tokens: int
     # Absolute per-(layer, group) ``kept_lengths`` floor; 0 disables it.

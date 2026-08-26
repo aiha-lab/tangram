@@ -68,9 +68,9 @@ def build_clusters(
       optionally caps how many heads of one layer may share a cluster.
     * ``"per_layer"``: cluster *within each layer independently*. A layer's heads
       are sorted by score and chunked into ``num_kv_heads // page_group_size``
-      clusters, so every cluster's members come from one layer. Use this when the
-      selection level thresholds per layer (``perlayer_head`` or
-      ``perlayer_cluster``): a cross-layer cluster would force the keep decision
+      clusters, so every cluster's members come from one layer. Use this with
+      the ``layer`` budget scope, which thresholds per layer: a cross-layer
+      cluster would force the keep decision
       to pool scores/lengths across layers whose score scales differ by orders
       of magnitude, reintroducing the very disparity per-layer thresholding
       removes. Cluster

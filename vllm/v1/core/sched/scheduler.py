@@ -873,7 +873,8 @@ class Scheduler(SchedulerInterface):
             compression_chunk_len = int(num_new_tokens)
         compression_metadata[request.request_id] = CompressionRequestMetadata(
             req_id=request.request_id,
-            compression_ratio=float(self.cache_config.compression_ratio),
+            compression_keep_ratio=float(
+                self.cache_config.compression_keep_ratio),
             window_size=int(self.cache_config.compression_window_size or 0),
             n_sink_tokens=int(self.cache_config.compression_n_sink_tokens or 0),
             floor_min=int(self.cache_config.compression_floor_min or 0),

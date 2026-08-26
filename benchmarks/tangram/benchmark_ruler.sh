@@ -2,7 +2,7 @@
 # RULER accuracy across compression ratios for one method.
 #
 # Sibling of benchmark_scbench.sh — same method-selection knobs (SCORER /
-# LEVEL / RESUME) and engine setup, but drives benchmark_ruler.py over RULER's
+# SCOPE / RESUME) and engine setup, but drives benchmark_ruler.py over RULER's
 # synthetic long-context tasks instead of SCBench. RULER adds a context-LENGTH
 # sweep axis (4096 / 8192 / 16384); each (length, ratio) is one model load.
 #
@@ -12,18 +12,15 @@
 #   * per-task length      — output budget from the dataset's max_new_tokens
 #   * string-match metric  — recall (retrieval/tracking/extraction) or any-match (QA)
 #
-# ratio=1.0 is the uncompressed reference; uniform vs non-uniform differ only
-# at ratio<1.0.
+# ratio=0 (evict nothing) is the uncompressed reference; uniform vs
+# non-uniform differ only at ratio>0.
 #
 # Select the method with two knobs:
 #   SCORER  = fastkvzip | snapkv | keydiff | streamingllm | tova | expected_attention
-#   LEVEL   = crosslayer_head (cross-layer global threshold, head-calibrated; default)
-#           | perlayer_head (per-layer threshold, AdaKV-style, head-calibrated;
-#             the validated pairing for SCORER=expected_attention)
-#           | crosslayer_cluster (cross-layer threshold, cluster-calibrated;
-#             exact budget, needs a global cluster map)
-#           | perlayer_cluster (per-layer threshold, cluster-calibrated;
-#             exact per-layer budget, needs a per-layer cluster map)
+#   SCOPE   = layer (per-layer budget, pooled across its head groups; default,
+#             needs a per-layer cluster map)
+#           | global (one budget pooled across all layers and head groups;
+#             needs a global cluster map)
 #           | uniform (same kept count per (layer, group))
 #   RESUME  = 1 (skip already-saved (length,task,ratio) cells) | 0 (recompute all)
 # Results land in results_ruler/<scorer>_<selection>/ so methods stay separate.
@@ -53,20 +50,19 @@ PYTHON=${PYTHON:-python3}
 
 # ---- Method --------------------------------------------------------------
 SCORER=${SCORER:-snapkv}
-# Selection level (axis 1): crosslayer_head | perlayer_head | crosslayer_cluster
-# | perlayer_cluster | uniform.
-LEVEL=${LEVEL:-crosslayer_head}
+# Budget scope (axis 1): uniform | layer | global.
+SCOPE=${SCOPE:-layer}
 
 # ---- Sweep ---------------------------------------------------------------
 LENGTHS=${LENGTHS:-"8192 4096 16384"}   # 8K -> 4K -> 16K completion order
 # ``${VAR-default}`` (not ``:-``) so an explicitly EMPTY value means "none":
 # RATIOS="" BUDGETS="4096 2048" sweeps budgets only.
-RATIOS=${RATIOS-"1.0 0.7 0.5 0.3"}
+RATIOS=${RATIOS-"0.0 0.3 0.5 0.7"}
 # Fixed KV budgets in tokens per (layer, head group), swept alongside RATIOS.
 # Empty (default) = ratio-only sweep. A budget run is a DIFFERENT retention
 # target, not a ratio: nothing is evicted until the cache would exceed the
 # budget, and it is then cut back to it. Compare a budget against the ratio that
-# keeps the same amount, i.e. budget ~= ratio * length.
+# keeps the same amount, i.e. budget ~= (1 - ratio) * length.
 BUDGETS=${BUDGETS:-}
 # 1 = let the chunk just written compete for eviction, protecting only the
 # always-kept recent window; 0 (default) = protect the whole fresh chunk, which
@@ -96,8 +92,9 @@ NUM=${NUM:-50}             # samples PER TASK (RULER ships 500/task)
 MAX_NUM_SEQS=${MAX_NUM_SEQS:-16}
 
 # ---- Method-specific args ------------------------------------------------
-METHOD_ARGS=(--compression-scorer "${SCORER}" --compression-level "${LEVEL}")
-SELECTION="${LEVEL}"
+METHOD_ARGS=(--compression-scorer "${SCORER}"
+             --compression-budget-scope "${SCOPE}")
+SELECTION="${SCOPE}"
 
 # RESUME=1 skips (length, task, ratio) cells already saved under OUTPUT_DIR, so
 # an interrupted sweep continues with the same command (fully-done lengths skip
@@ -180,8 +177,8 @@ case "${SCORER}" in
         ;;
     snapkv)
         DEFAULT_PG=4
-        METHOD_ARGS+=(--compression-snap-window "${SNAP_WINDOW:-32}"
-                      --compression-snap-kernel "${SNAP_KERNEL:-7}")
+        # SnapKV knobs travel through the generic scorer-option channel:
+        # SCORER_OPTIONS="window=32,kernel=7".
         ;;
     keydiff|streamingllm|tova|expected_attention)
         DEFAULT_PG=4
@@ -234,7 +231,7 @@ for LENGTH in ${LENGTHS}; do
     for RATIO in ${RATIOS}; do
         echo "===== ${SCORER} ${SELECTION}  length=${LENGTH}  ratio=${RATIO}" \
              "options=${SCORER_OPTIONS:-<defaults>}  tp=${TP} ====="
-        run_one --ratio "${RATIO}" \
+        run_one --compression-ratio "${RATIO}" \
                 ${SCORER_OPTION_TAG:+--tag "${SCORER_OPTION_TAG}"}
     done
     for BUDGET in ${BUDGETS}; do
@@ -242,7 +239,7 @@ for LENGTH in ${LENGTHS}; do
              "evict_current_chunk=${EVICT_CURRENT_CHUNK}" \
              "slot_score_source=${SLOT_SCORE_SOURCE}" \
              "options=${SCORER_OPTIONS:-<defaults>}  tp=${TP} ====="
-        run_one --ratio 1.0 --compression-budget-tokens "${BUDGET}" \
+        run_one --compression-budget-tokens "${BUDGET}" \
                 ${BUDGET_TAG:+--tag "${BUDGET_TAG}"} "${BUDGET_ARGS[@]}"
     done
 done
@@ -282,11 +279,12 @@ if not rows:
     print("(no results found under", root, ")")
     sys.exit(0)
 def _setting_key(label: str) -> tuple[int, float]:
-    """Sort ratio settings first (descending), then budgets (descending). The two
-    are different retention targets and are not comparable by label alone."""
+    """Sort ratio settings first (ascending evicted fraction, baseline 0
+    leading), then budgets (descending). The two are different retention
+    targets and are not comparable by label alone."""
     head = label.split("+")[0]
     if head.startswith("ratio"):
-        return (0, -float(head[len("ratio"):]))
+        return (0, float(head[len("ratio"):]))
     return (1, -float(head[len("budget"):]))
 
 ratios = sorted(ratios, key=_setting_key)

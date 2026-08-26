@@ -364,25 +364,6 @@ def test_scorer_options_are_declared_by_the_scorer():
                                {"anchor": "mean"})
 
 
-def test_legacy_scorer_flags_agree_with_the_declared_defaults():
-    """The pre-existing per-scorer config fields are aliases into the option
-    channel, so their defaults must equal what the scorer declares — otherwise
-    removing the aliases later would silently change behaviour."""
-    from vllm.config.cache import CacheConfig
-    from vllm.v1.attention.compression.scorer import get_scorer_options
-
-    for scorer, aliases in CacheConfig._LEGACY_SCORER_OPTION_FIELDS.items():
-        declared = {opt.name: opt for opt in get_scorer_options(scorer)}
-        for option_name, field_name in aliases.items():
-            assert option_name in declared, (
-                f"{field_name} aliases {scorer}.{option_name}, which the "
-                "scorer does not declare")
-            assert getattr(CacheConfig, field_name) == \
-                declared[option_name].default, (
-                    f"{field_name} default disagrees with "
-                    f"{scorer}.{option_name}")
-
-
 def test_keydiff_anchor_option_selects_the_published_formula():
     """Both entry points must use the SAME anchor: a scorer that ranked the
     fresh chunk by one definition and the cache by another would be neither."""

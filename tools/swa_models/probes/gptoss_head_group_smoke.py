@@ -72,11 +72,12 @@ def main() -> None:
         action="store_true",
         help="Activate FastKVZip compression (requires page-group-size).",
     )
-    parser.add_argument("--compression-ratio", type=float, default=1.0)
+    parser.add_argument("--compression-ratio", type=float, default=0.0,
+                        help="Fraction of the KV cache to evict; 0 = off.")
     parser.add_argument(
         "--head-group-cluster-map",
         default=None,
-        help="Path to a head-group cluster-map .npz. At ratio 1.0 it only "
+        help="Path to a head-group cluster-map .npz. At ratio 0 it only "
         "changes physical KV placement, so output must stay token-identical "
         "to a no-map run (the cluster-map correctness gate).",
     )

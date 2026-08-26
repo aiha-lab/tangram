@@ -4,15 +4,15 @@
 #
 # Regenerate every head-group retention profile from the live vLLM engine
 # (build_profile.py), 8 GPUs in parallel. Each profile is one (model, scorer,
-# selection level); maps are then built from these by build_cluster_map.py.
+# threshold scope); maps are then built from these by build_cluster_map.py.
 #
-# Matrix: 4 TP=1 models x 4 scorers x 2 selection levels = 32 profiles.
+# Matrix: 4 TP=1 models x 4 scorers x 2 threshold scopes = 32 profiles.
 #   models : qwen3-4b, llama-3.1-8b, gemma-3-12b, gpt-oss-20b
 #            (qwen3-30b is excluded: it runs TP=2 at serving time, so its
 #             per-rank head layout needs a TP-aware profile -- separate work.)
 #   scorers: fastkvzip, keydiff, snapkv, expected_attention
-#   levels : crosslayer_head -> profile.npz          (pairs cross-layer maps)
-#            perlayer_head    -> profile_perlayer.npz (pairs per-layer maps)
+#   scopes : global    -> profile.npz          (pairs cross-layer maps)
+#            per_layer -> profile_perlayer.npz (pairs per-layer maps)
 #
 # All scorers use ONE unified measurement regime: effectively one-shot. The
 # context fits in a single compression chunk (prefill_chunk 32768 >= max input
@@ -44,7 +44,7 @@ declare -A HF=(
 )
 MODELS=(qwen3-4b-instruct-2507 llama-3.1-8b-instruct gemma-3-12b-it gpt-oss-20b)
 SCORERS=(fastkvzip keydiff snapkv expected_attention)
-LEVELS=(crosslayer_head perlayer_head)
+SCOPES=(global per_layer)
 
 # fastkvzip gate-path override (only used by --scorer fastkvzip). The gate
 # auto-resolver derives the hmkim97/tangram-gate subfolder from the HF model id
@@ -61,30 +61,29 @@ COMMON_ARGS=(--base-ratios 0.3
              --dataset-mix "scbench_kv_short:16,scbench_many_shot:12"
              --prefill-chunk 32768 --window-size 4096 --max-ctx-len 30000)
 
-# Build the job list scorer->level->model so consecutive jobs hit different
+# Build the job list scorer->scope->model so consecutive jobs hit different
 # models: each 8-wide wave then mixes models (at most ~2 gpt-oss builds compile
 # their MoE kernels at once).
 JOBS=()
 for s in "${SCORERS[@]}"; do
-  for lv in "${LEVELS[@]}"; do
+  for sp in "${SCOPES[@]}"; do
     for m in "${MODELS[@]}"; do
-      JOBS+=("$s|$m|$lv")
+      JOBS+=("$s|$m|$sp")
     done
   done
 done
 
 run_job() {
   local spec="$1" gpu="$2"
-  local scorer model level
-  IFS='|' read -r scorer model level <<< "$spec"
+  local scorer model scope
+  IFS='|' read -r scorer model scope <<< "$spec"
   local hf="${HF[$model]}"
   local mdir="$scorer"; [ "$scorer" = "expected_attention" ] && mdir="ea"
-  # Output filename suffix follows the clustering SCOPE (per-layer profile), not
-  # the level string; the per-layer-threshold level (perlayer_head) is profiled
-  # into the within-layer profile that the per_layer-scope map is built from.
-  local suffix=""; [ "$level" = "perlayer_head" ] && suffix="_perlayer"
+  # Output filename suffix follows the clustering scope: the per_layer profile
+  # feeds the within-layer map, the global profile the cross-layer map.
+  local suffix=""; [ "$scope" = "per_layer" ] && suffix="_perlayer"
   local out="$CMAPS/$mdir/$model/profile${suffix}.npz"
-  local log="$LOGDIR/${mdir}__${model}__${level}.log"
+  local log="$LOGDIR/${mdir}__${model}__${scope}.log"
   local jc="$CACHE_ROOT/gpu$gpu"
   mkdir -p "$jc"
   # fastkvzip: apply the per-model gate override when one is set (else auto).
@@ -97,7 +96,7 @@ run_job() {
     TORCHINDUCTOR_CACHE_DIR="$jc/inductor" TRITON_CACHE_DIR="$jc/triton" \
     PYTHONPATH="$ROOT" \
     python -m tools.head_group_clustering.build_profile \
-      --model "$hf" --scorer "$scorer" --level "$level" \
+      --model "$hf" --scorer "$scorer" --scope "$scope" \
       "${gate_args[@]}" "${COMMON_ARGS[@]}" --out "$out" > "$log" 2>&1
 }
 

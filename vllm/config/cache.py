@@ -171,20 +171,22 @@ class CacheConfig:
     built by ``tools/head_group_clustering``) clustering KV heads by retention
     similarity, possibly across layers. Only physical KV placement changes, so
     at no compression the output matches the identity map. Three forms: ``None``
-    (default) auto-resolves the bundled map for this model / ``compression_scorer``
-    / ``page_group_size`` / ``compression_level``, falling back to identity when
+    (default) auto-resolves the bundled map for this model /
+    ``compression_scorer`` / ``page_group_size`` /
+    ``compression_budget_scope``, falling back to identity when
     none matches; an explicit path loads strictly; ``"identity"`` forces the
     identity (adjacent-head) map. Requires ``page_group_size`` set."""
 
-    # KV cache compression. Generalized over two orthogonal axes: selection
-    # level (``compression_level``) and score producer (``compression_scorer``).
-    compression_ratio: float = 1.0
-    """Fraction of tokens kept per chunk (``floor(ratio * re_eval_size)``), and
-    one of the two compression on/off switches: ``1.0`` (default) keeps
-    everything (no compression), ``< 1.0`` enables compression (requires
-    ``page_group_size``). Must satisfy ``0 < compression_ratio <= 1``; see
-    ``compression_enabled``. Mutually exclusive with
-    ``compression_budget_tokens`` — a run has ONE retention target."""
+    # KV cache compression. Generalized over two orthogonal axes: budget
+    # scope (``compression_budget_scope``) and score producer
+    # (``compression_scorer``).
+    compression_ratio: float | None = None
+    """Fraction of the KV cache to EVICT (KVpress convention: higher is more
+    aggressive), and one of the two compression on/off switches: unset
+    (default) or ``0.0`` means no compression; ``0 < r < 1`` enables it
+    (requires ``page_group_size``); ``>= 1.0`` is rejected. Mutually exclusive
+    with ``compression_budget_tokens`` — a run has ONE retention target. All
+    internal math uses the kept fraction, ``compression_keep_ratio``."""
     compression_budget_tokens: int | None = None
     """Fixed KV cache budget in tokens per (layer, head group), and the second
     compression on/off switch (``None`` = off).
@@ -200,10 +202,10 @@ class CacheConfig:
     competes again every chunk, which is what lets a bounded cache admit later,
     more important tokens.
 
-    As with ``compression_ratio``, ``compression_level`` decides the SCOPE the
-    budget is shared over: ``"uniform"`` gives every (layer, head group) exactly
-    this length, while the per-layer / cross-layer levels pool it so strong
-    groups keep more than weak ones at the same total. The budget applies to
+    As with ``compression_ratio``, ``compression_budget_scope`` decides the
+    SCOPE the budget is shared over: ``"uniform"`` gives every (layer, head
+    group) exactly this length, while ``"layer"`` / ``"global"`` pool it so
+    strong groups keep more than weak ones at the same total. The budget applies to
     prompt processing; during decode the cache grows past it again (eviction
     runs once, over the prefill).
 
@@ -253,40 +255,25 @@ class CacheConfig:
     The default ``"fastkvzip"`` sentinel triggers a HuggingFace Hub download
     from ``hmkim97/tangram-gate``; a local path is also accepted."""
 
-    # --- Compression: two orthogonal axes (selection level + scorer) ---
-    compression_level: str = "perlayer_cluster"
-    """Axis 1 — selection level (the rule turning eval scores into a per-(layer,
-    group) kept count). Named ``{scope}_{granularity}`` over two orthogonal axes:
-    threshold scope (``crosslayer`` global vs ``perlayer``) and calibration
-    granularity (``head`` -> max-pool inflates the budget; ``cluster`` -> exact
-    budget). The cluster-calibrated levels are TP=1 only; under TP>1 they are
-    downgraded to their head-calibrated counterpart of the same scope (see
-    ``verify_with_parallel_config``). One of:
+    # --- Compression: two orthogonal axes (budget scope + scorer) ---
+    compression_budget_scope: str = "layer"
+    """Axis 1 — the scope the retention budget is balanced over (the rule
+    turning eval scores into a per-(layer, group) kept count). One of:
 
-    * ``"crosslayer_head"`` — a single CROSS-layer global threshold,
-      head-calibrated (reference ``pair``). Each (layer, group) keeps a divergent
-      count: strong clusters keep more, weak ones less. Sensitive to cross-layer
+    * ``"layer"`` (default) — each layer gets an equal share of the budget,
+      pooled across the head groups within it: strong groups keep more, weak
+      ones less. Immune to cross-layer score-scale disparity. Needs a
+      within-layer cluster map; TP=1 only.
+    * ``"global"`` — one budget pooled across ALL layers and head groups, so
+      important groups in any layer can keep more. Sensitive to cross-layer
       score-scale disparity (a layer with systematically larger scores
-      monopolises budget). Tangram's historical default.
-    * ``"perlayer_head"`` — a SEPARATE threshold per layer (AdaKV-style),
-      head-calibrated, so every layer keeps its own top ``compression_ratio``
-      fraction while heads within a layer still diverge. Immune to cross-layer
-      scale disparity; the validated pairing for ``compression_scorer ==
-      "expected_attention"`` (its kvpress reference uses AdaKV per-layer budgets).
-    * ``"crosslayer_cluster"`` — cross-layer global threshold,
-      cluster-calibrated (the exact-budget counterpart of ``"crosslayer_head"``:
-      cross-layer block sharing without max-pool inflation). Needs a cross-layer
-      (global) cluster map; shares ``"crosslayer_head"``'s scale-disparity
-      sensitivity; TP=1 only.
-    * ``"perlayer_cluster"`` (default) — per-layer threshold,
-      cluster-calibrated: the budget is decided at the cluster (shared-block)
-      granularity so the physical KV is exactly ``compression_ratio`` (no
-      max-pool inflation). Needs a within-layer cluster map; TP=1 only.
-    * ``"uniform"`` — a uniform count ``floor(compression_ratio * eval_len)`` per
-      (layer, group) (reference ``pair-head``). Positions still differ per head;
-      only the kept *count* is uniform.
+      monopolises budget). Needs a cross-layer (global) cluster map; TP=1 only.
+    * ``"uniform"`` — every (layer, group) keeps the same count
+      ``floor(compression_keep_ratio * eval_len)``. Positions still differ per
+      head; only the kept *count* is uniform. The only scope available under
+      TP>1.
 
-    The accepted set is owned by ``selection_level.SELECTION_LEVELS``."""
+    The accepted set is owned by ``budget_scope.BUDGET_SCOPES``."""
     compression_scorer: str = "snapkv"
     """Axis 2 — score producer, defaulting to ``"snapkv"``. The gate-free
     scorers need no checkpoint: SnapKV scores from observation-window attention
@@ -314,39 +301,7 @@ class CacheConfig:
 
         --compression-scorer keydiff --compression-scorer-options anchor=normalized
 
-    The per-scorer fields below (``compression_snap_*``, ``compression_ea_*``)
-    are aliases into this channel; the scorer's ``OPTIONS`` own the defaults."""
-    compression_snap_window: int = 32
-    """SnapKV observation window: number of trailing queries used to score a
-    chunk. Distinct from ``compression_window_size`` (the always-kept recent
-    region). Auto-shrinks to 16 for short chunks (< 1000), matching the
-    reference. Only used when ``compression_scorer == "snapkv"``."""
-    compression_snap_kernel: int = 7
-    """SnapKV max-pool1d smoothing kernel size (odd). Only used when
-    ``compression_scorer == "snapkv"``."""
-    compression_ea_use_covariance: bool = True
-    """ExpectedAttention: add the query covariance term to the expected
-    attention logit (kvpress default True). Only used when
-    ``compression_scorer == "expected_attention"``."""
-    compression_ea_use_vnorm: bool = True
-    """ExpectedAttention: reweight the expected attention by the value norm
-    (kvpress default True). Only used when
-    ``compression_scorer == "expected_attention"``."""
-    compression_ea_n_future_positions: int = 512
-    """ExpectedAttention: number of future decode positions whose RoPE rotation
-    is averaged to anticipate where future queries attend (kvpress default
-    512). Only used when ``compression_scorer == "expected_attention"``."""
-    compression_ea_epsilon: float = 1e-2
-    """ExpectedAttention: constant added before the value-norm reweighting;
-    score is ``(prob + epsilon) * ||value||`` (kvpress reference default 1e-2).
-    The epsilon floor lets the low-probability tail of keys fall back to
-    value-norm ranking instead of being ordered by near-zero softmax noise; on
-    RULER this is what keeps NIAH recall from collapsing. It is only beneficial
-    paired with a per-layer budget (``compression_level ==
-    "perlayer_head"``): under the cross-layer global threshold the
-    uneven per-layer value-norm scale that epsilon introduces biases the budget
-    toward high-norm layers. Only used when ``compression_scorer ==
-    "expected_attention"``."""
+    The scorer's ``OPTIONS`` own the defaults for any key not given here."""
 
     compression_retention_dump: str | None = None
     """Offline profiling only. When set to a directory path, the engine attaches
@@ -424,15 +379,9 @@ class CacheConfig:
             "compression_window_size",
             "compression_n_sink_tokens",
             "compression_gate_path",
-            "compression_level",
+            "compression_budget_scope",
             "compression_scorer",
             "compression_scorer_options",
-            "compression_snap_window",
-            "compression_snap_kernel",
-            "compression_ea_use_covariance",
-            "compression_ea_use_vnorm",
-            "compression_ea_n_future_positions",
-            "compression_ea_epsilon",
             "compression_retention_dump",
             # Cluster map relabels physical KV placement only; it does not
             # change the compiled graph shape or kernel selection.
@@ -493,53 +442,35 @@ class CacheConfig:
     #: Alias fields into ``compression_scorer_options``, as
     #: ``{scorer: {option name: field name}}``. The scorer's ``OPTIONS`` hold the
     #: real defaults; a test pins the two in agreement so they cannot drift.
-    _LEGACY_SCORER_OPTION_FIELDS: ClassVar[dict[str, dict[str, str]]] = {
-        "snapkv": {
-            "window": "compression_snap_window",
-            "kernel": "compression_snap_kernel",
-        },
-        "expected_attention": {
-            "use_covariance": "compression_ea_use_covariance",
-            "use_vnorm": "compression_ea_use_vnorm",
-            "n_future_positions": "compression_ea_n_future_positions",
-            "epsilon": "compression_ea_epsilon",
-        },
-    }
-
     @property
     def resolved_scorer_options(self) -> dict[str, str]:
-        """The active scorer's settings as raw strings: legacy alias fields
-        first, then ``compression_scorer_options`` on top.
-
-        Explicit options win, so a user migrating to the generic channel can
-        override a legacy flag without having to unset it. Aliases for other
-        scorers are never included — a SnapKV field must not reach KeyDiff.
-        """
-        options = {
-            option: str(getattr(self, field_name))
-            for option, field_name in self._LEGACY_SCORER_OPTION_FIELDS.get(
-                self.compression_scorer, {}).items()
-        }
-        options.update(
-            {key: str(value)
-             for key, value in self.compression_scorer_options.items()})
-        return options
+        """``compression_scorer_options`` with every value normalized to the
+        raw string the scorer's option declarations parse."""
+        return {key: str(value)
+                for key, value in self.compression_scorer_options.items()}
 
     @property
     def compression_enabled(self) -> bool:
         """Whether KV cache compression runs — either retention target being
-        set turns it on: ``compression_ratio < 1.0`` (``1.0`` keeps every token,
-        the no-op baseline) or ``compression_budget_tokens`` not None. Single
-        source of truth for the gate — consumers read this rather than
+        set turns it on: ``compression_ratio > 0`` (unset or ``0.0`` evicts
+        nothing, the no-op baseline) or ``compression_budget_tokens`` not None.
+        Single source of truth for the gate — consumers read this rather than
         re-deriving the test."""
         return CacheConfig.is_compression_enabled(
             self.compression_ratio, self.compression_budget_tokens)
 
     @staticmethod
-    def is_compression_enabled(ratio: float,
+    def is_compression_enabled(ratio: float | None,
                                budget_tokens: int | None) -> bool:
         """The gate, for callers holding the raw values rather than a config."""
-        return ratio < 1.0 or budget_tokens is not None
+        return bool(ratio) or budget_tokens is not None
+
+    @property
+    def compression_keep_ratio(self) -> float:
+        """Fraction that SURVIVES eviction (``1 - compression_ratio``; ``1.0``
+        when unset). The single point converting the public evicted-fraction
+        knob into the kept fraction the eviction math is formulated in."""
+        return 1.0 - (self.compression_ratio or 0.0)
 
     @property
     def compression_regime(self) -> str:
@@ -673,26 +604,30 @@ class CacheConfig:
                     "ragged paging / compression)."
                 )
 
-        # Compression. The ratio is the on/off gate, so validate its range
+        # Compression. The ratio is an on/off gate, so validate its range
         # unconditionally (an out-of-range value must error, not read as "off").
-        if not (0.0 < self.compression_ratio <= 1.0):
+        # Rejecting >= 1.0 also fails fast for callers still passing the old
+        # kept-fraction 1.0 as the no-compression baseline.
+        if self.compression_ratio is not None and not (
+                0.0 <= self.compression_ratio < 1.0):
             raise ValueError(
-                f"compression_ratio must satisfy 0 < r <= 1, got "
-                f"{self.compression_ratio}."
+                "compression_ratio is the fraction of the KV cache to evict "
+                f"and must satisfy 0 <= r < 1, got {self.compression_ratio}. "
+                "Leave it unset (or 0.0) to disable compression."
             )
         # The two retention targets are alternative answers to the same
         # question ("how much KV survives"), and they disagree by construction:
         # a ratio scales with the prompt, a budget does not. Reject rather than
         # silently ranking one over the other.
         if (self.compression_budget_tokens is not None
-                and self.compression_ratio < 1.0):
+                and self.compression_ratio is not None):
             raise ValueError(
                 f"compression_ratio ({self.compression_ratio}) and "
                 f"compression_budget_tokens ({self.compression_budget_tokens}) "
-                "are mutually exclusive retention targets. Set a ratio to keep "
-                "a fraction of the prompt, or a budget to hold the cache at a "
-                "fixed token count — and leave compression_ratio at 1.0 when "
-                "using a budget."
+                "are mutually exclusive retention targets. Set a ratio to "
+                "evict a fraction of the prompt, or a budget to hold the "
+                "cache at a fixed token count — and leave compression_ratio "
+                "unset when using a budget."
             )
         if self.compression_enabled:
             if self.page_group_size is None:
@@ -728,17 +663,17 @@ class CacheConfig:
                 )
             self._validate_budget_target()
             self._validate_slot_score_source()
-            # Axis 1 — selection level. Validated against the registry that
-            # ``make_selection_level`` dispatches on (single source of truth);
+            # Axis 1 — budget scope. Validated against the registry that
+            # ``make_budget_scope`` dispatches on (single source of truth);
             # the local import keeps the torch-backed runtime module out of the
             # config module's import graph.
-            from vllm.v1.attention.compression.selection_level import (
-                SELECTION_LEVELS,
+            from vllm.v1.attention.compression.budget_scope import (
+                BUDGET_SCOPES,
             )
-            if self.compression_level not in SELECTION_LEVELS:
+            if self.compression_budget_scope not in BUDGET_SCOPES:
                 raise ValueError(
-                    f"compression_level must be one of {SELECTION_LEVELS}, "
-                    f"got {self.compression_level!r}."
+                    f"compression_budget_scope must be one of "
+                    f"{BUDGET_SCOPES}, got {self.compression_budget_scope!r}."
                 )
             # Axis 2 — score producer. Gate-free scorers are owned by the
             # ``scorer`` registry (single source of truth); ``"fastkvzip"`` is
@@ -858,34 +793,22 @@ class CacheConfig:
         elif cpu_memory_usage > 0.4 * total_cpu_memory:
             logger.warning("Possibly too large swap space. %s", msg)
 
-        # Cluster-calibrated levels need a cross-rank member-score gather not yet
-        # implemented, so under TP>1 downgrade to the same-scope head-calibrated
-        # level (which all-gathers and works under TP) rather than reject.
-        # TODO: implement the gather and run cluster levels under TP directly.
+        # The threshold scopes decide budgets at the cluster granularity and
+        # would need a cross-rank gather of sharded member scores under TP>1
+        # (not implemented) — reject at startup rather than crash at runtime.
         if self.compression_enabled and parallel_config.tensor_parallel_size > 1:
-            from vllm.v1.attention.compression.selection_level import (
-                TP1_ONLY_SELECTION_LEVELS,
-                TP_FALLBACK_LEVEL,
+            from vllm.v1.attention.compression.budget_scope import (
+                TP1_ONLY_BUDGET_SCOPES,
             )
 
-            # A TP1-only level with no registered fallback is a startup error,
-            # not a late runtime crash (guards drift between the two tables).
-            if self.compression_level in TP1_ONLY_SELECTION_LEVELS:
-                fallback = TP_FALLBACK_LEVEL.get(self.compression_level)
-                if fallback is None:
-                    raise ValueError(
-                        f"compression_level='{self.compression_level}' is TP=1 "
-                        f"only but has no TP>1 fallback registered in "
-                        f"TP_FALLBACK_LEVEL; add one or select a head-calibrated "
-                        f"level for tensor_parallel_size="
-                        f"{parallel_config.tensor_parallel_size}.")
-                logger.warning(
-                    "compression_level='%s' is TP=1 only (got "
-                    "tensor_parallel_size=%d); downgrading to '%s' (same "
-                    "threshold scope, head-calibrated) for this run.",
-                    self.compression_level,
-                    parallel_config.tensor_parallel_size, fallback)
-                self.compression_level = fallback
+            if self.compression_budget_scope in TP1_ONLY_BUDGET_SCOPES:
+                raise ValueError(
+                    f"compression_budget_scope="
+                    f"'{self.compression_budget_scope}' supports TP=1 only, "
+                    f"got tensor_parallel_size="
+                    f"{parallel_config.tensor_parallel_size}. Use "
+                    f"compression_budget_scope='uniform' under tensor "
+                    f"parallelism.")
 
     def resolve_head_group_cluster_map(
         self,
@@ -895,8 +818,8 @@ class CacheConfig:
         """Freeze ``head_group_cluster_map`` to a concrete path or ``None``
         (identity), once, so the compressor and the attention builder read the
         SAME map and placement can never disagree with scoring. Must run after
-        ``verify_with_parallel_config`` (which may downgrade ``compression_level``
-        under TP). Resolves the three field forms (see its docstring) to the two
+        ``verify_with_parallel_config`` (which rejects TP>1 with the threshold
+        scopes). Resolves the three field forms (see its docstring) to the two
         the consumers understand: a path or ``None``.
         """
         raw = self.head_group_cluster_map
@@ -912,16 +835,16 @@ class CacheConfig:
         from vllm.v1.attention.backends.cluster_map_resolver import (
             resolve_bundled_cluster_map,
         )
-        from vllm.v1.attention.compression.selection_level import (
-            CLUSTER_MAP_SCOPE_BY_LEVEL,
+        from vllm.v1.attention.compression.budget_scope import (
+            CLUSTER_MAP_SCOPE_BY_BUDGET_SCOPE,
         )
 
         self.head_group_cluster_map = resolve_bundled_cluster_map(
             scorer=self.compression_scorer,
             model_name=model_config.model,
             page_group_size=self.page_group_size,
-            cluster_map_scope=CLUSTER_MAP_SCOPE_BY_LEVEL.get(
-                self.compression_level),
+            cluster_map_scope=CLUSTER_MAP_SCOPE_BY_BUDGET_SCOPE.get(
+                self.compression_budget_scope),
             num_kv_heads=self.num_kv_heads,
             tp_world_size=parallel_config.tensor_parallel_size,
         )

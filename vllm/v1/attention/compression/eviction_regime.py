@@ -6,8 +6,8 @@ An eviction regime answers three questions for one chunked-prefill step, and
 nothing else:
 
 1. **Which cached positions may be evicted this chunk** (the *eval region*)?
-2. **How much of that region survives** (the fraction handed to the selection
-   level)?
+2. **How much of that region survives** (the fraction handed to the budget
+   scope)?
 3. **Where do the per-position scores live** between chunks?
 
 The two shipped regimes answer them in opposite ways, which is exactly why they
@@ -17,8 +17,8 @@ are separate classes rather than flags on one code path:
   FastKVzip behaviour. The eval region is CHUNK-LOCAL: only the previous chunk's
   window plus the fresh chunk are re-ranked, and every position promoted to
   "kept" by an earlier chunk is *locked in* (never evicted again). The surviving
-  fraction comes from the whole-prompt ratio, so the final cache is
-  ``ratio * prompt``, which is only known once the prompt length is. Scores of
+  fraction comes from the whole-prompt keep ratio, so the final cache is
+  ``keep_ratio * prompt``, which is only known once the prompt length is. Scores of
   locked positions are never needed again, so the score memory is a small
   chunk-sized workspace.
 * :class:`BudgetRegime` (``compression_budget_tokens`` set) — a fixed KV cache
@@ -33,7 +33,7 @@ are separate classes rather than flags on one code path:
   compacted alongside the KV on every eviction.
 
 Both regimes emit the same :class:`ChunkGeometry` + eval-score tensor, so
-everything downstream (selection level, position ranking, writeback) is shared
+everything downstream (budget scope, position ranking, writeback) is shared
 and regime-agnostic.
 
 Terminology used throughout:
@@ -73,8 +73,9 @@ class ChunkParams:
     scheduler) plus the request's own prompt length; a regime reads only the
     fields its formulation needs.
     """
-    #: Surviving fraction of the prompt (ratio regime). ``1.0`` means keep all.
-    ratio: float
+    #: Surviving fraction of the prompt (ratio regime): ``1 -
+    #: CacheConfig.compression_ratio``. ``1.0`` means keep all.
+    keep_ratio: float
     #: Fixed per-(layer, head-group) KV token budget (budget regime), or None.
     budget_tokens: int | None
     #: Trailing positions never evicted while they are the most recent ones.
@@ -118,7 +119,7 @@ class ChunkGeometry:
     #: ``[num_layers, num_groups]`` genuine eval width per (layer, group); the
     #: selected count is clamped to it so padding is never selected.
     real_eval_len: np.ndarray
-    #: Fraction of the eval region to keep, handed to the selection level.
+    #: Fraction of the eval region to keep, handed to the budget scope.
     #: ``>= 1.0`` is the no-eviction fast path, ``<= 0.0`` keeps only the
     #: sink / locked / tail regions.
     adjusted_ratio: float
@@ -468,13 +469,13 @@ class RatioRegime(EvictionRegime):
     The eval region is the previous chunk's window plus the fresh chunk minus
     its own new window; everything a previous chunk promoted is locked in and
     is not re-ranked. The cache therefore only grows, converging on
-    ``ratio * prompt`` — which is why the target is derived from the whole
+    ``keep_ratio * prompt`` — which is why the target is derived from the whole
     prompt length rather than from what is currently cached.
 
     ``adjusted_ratio`` reproduces baseline FastKVzip's window correction: the
     always-kept window is subtracted from both the numerator and the
     denominator, so the fraction applies to the genuinely evictable region and
-    the end-to-end retention still lands on ``ratio``.
+    the end-to-end retention still lands on ``keep_ratio``.
     """
 
     name = "ratio"
@@ -541,14 +542,14 @@ class RatioRegime(EvictionRegime):
         """Baseline FastKVzip's window-corrected fraction. ``win_size`` is held
         fixed (the reference's window-shrink branch instead drops the fraction
         to zero), and the sink is excluded from the prompt it applies to."""
-        ratio = params.ratio
+        keep = params.keep_ratio
         eff_prompt = max(0, int(params.total_prompt_tokens) - sink_size)
-        if ratio >= 1.0 or eff_prompt <= win_size:
+        if keep >= 1.0 or eff_prompt <= win_size:
             return 1.0
-        if ratio * eff_prompt < win_size:
+        if keep * eff_prompt < win_size:
             return 0.0
         return max(0.0, min(1.0,
-            (ratio * eff_prompt - win_size) / (eff_prompt - win_size)))
+            (keep * eff_prompt - win_size) / (eff_prompt - win_size)))
 
 
 class BudgetRegime(EvictionRegime):
@@ -627,10 +628,10 @@ class BudgetRegime(EvictionRegime):
 
         # How much of the eval region may survive. ``budget - sink - tail`` is
         # what the budget leaves for it; expressing that as a fraction of the
-        # (rectangular) eval width is what lets every selection level enforce a
-        # budget without knowing about budgets: a level keeps that fraction of
-        # its scope's cells, which is exactly ``budget - sink - tail`` positions
-        # per (layer, group) on average, pooled over whatever scope the level
+        # (rectangular) eval width is what lets every budget scope enforce a
+        # budget without knowing about budgets: a scope keeps that fraction of
+        # its cells, which is exactly ``budget - sink - tail`` positions per
+        # (layer, group) on average, pooled over whatever range the scope
         # spans. Padding cells hold -inf and so are never among them.
         selectable = budget - sink_size - tail_size
         if eval_len <= 0 or selectable >= eval_len:
@@ -663,7 +664,7 @@ _REGIMES: dict[str, type[EvictionRegime]] = {
 def make_eviction_regime(regime: str) -> EvictionRegime:
     """Axis-3 dispatch — the ONE place the regime is chosen.
 
-    * ``"ratio"`` — keep ``compression_ratio`` of the prompt, with lock-in.
+    * ``"ratio"`` — evict ``compression_ratio`` of the prompt, with lock-in.
     * ``"budget"`` — hold the cache at ``compression_budget_tokens``, no lock-in.
     """
     try:

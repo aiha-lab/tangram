@@ -20,7 +20,7 @@ and **query-independent** (it never reads queries, so chunked prefill carries no
 state across chunks).
 
 The `[num_kv_heads, chunk_len]` score it returns is the contract every Tangram scorer
-shares, so `compression_level` stays an orthogonal knob.
+shares, so `compression_budget_scope` stays an orthogonal knob.
 
 ### The anchor has two published spellings
 
@@ -51,14 +51,14 @@ Speedup:
 
 ```bash
 cd benchmarks/tangram/speedup
-SCORERS=keydiff RATIOS="1.0 0.5 0.25 0.1" ./run_speedup.sh
+SCORERS=keydiff RATIOS="0.0 0.5 0.75 0.9" ./run_speedup.sh
 ```
 
 SCBench accuracy:
 
 ```bash
 cd benchmarks/tangram
-SCORER=keydiff LEVEL=perlayer_cluster DATASET=mid RATIOS="1.0 0.5 0.25 0.1" \
+SCORER=keydiff SCOPE=layer DATASET=mid RATIOS="0.0 0.5 0.75 0.9" \
 bash benchmark_scbench.sh
 ```
 
@@ -71,20 +71,19 @@ Override `MODEL=` for another model, and `DATASET=` for another task group
 scorer, and **it must be `keydiff` for anything on this page to apply** — the scripts
 otherwise default to `snapkv`, and `run_speedup.sh` to `snapkv fastkvzip`.
 
-`LEVEL` is the *selection level*: the scope a KV budget is shared over, which decides
+`SCOPE` is the *budget scope*: the range a KV budget is shared over, which decides
 whether heads may keep different numbers of tokens.
 
-| `LEVEL` | Budget scope |
+| `SCOPE` | Budget scope |
 | ------- | ------------ |
 | `uniform` | Every (layer, head group) keeps the same token count; only *which* tokens are kept differs. Needs no cluster map. |
-| `perlayer_cluster` | Each layer gets an equal budget, spread non-uniformly across the heads in that layer. Needs the `_perlayer` cluster map. |
-| `crosslayer_cluster` | One global budget spread across all layers and heads, so an important head in any layer can keep more. Needs the cross-layer cluster map. |
+| `layer` | Each layer gets an equal budget, spread non-uniformly across the heads in that layer. Needs the `_perlayer` cluster map. |
+| `global` | One global budget spread across all layers and heads, so an important head in any layer can keep more. Needs the cross-layer cluster map. |
 
-The scripts also accept `perlayer_head` and `crosslayer_head`, which apply the same two
-scopes with a head-calibrated threshold instead of a cluster-calibrated one. KeyDiff
+KeyDiff
 cluster maps for every verified model already ship under
 [`tools/head_group_clustering/cluster_maps/keydiff/`](../../tools/head_group_clustering/cluster_maps/keydiff),
-so the cluster levels work with no extra step.
+so the `layer` / `global` scopes work with no extra step.
 
 ## Speedup
 
@@ -99,7 +98,7 @@ across its `short`, `mid`, `long` and `multi` task groups — not a single task 
 group. The `DATASET=mid` command above runs one group, so reproducing a bar means
 sweeping all four and averaging over the datasets they cover.
 
-Five models, KeyDiff scorer, w/ against w/o Tangram at each retention ratio. The dashed
+Five models, KeyDiff scorer, w/ against w/o Tangram at each compression ratio. The dashed
 line is the full-KV reference (itself per-method, since a scorer's observation window
 applies even at full budget) and the violet series is the gap between the two bars, as a
 percentage of the w/o-Tangram score, on the right axis.

@@ -4,7 +4,7 @@
 #
 # Baseline FastKVzip-gpt-oss avg_score (100 samples, chunk8k/w4096, scored by
 # FastKVzip-gpt-oss/prefill/results/parse.py -d scbench_kv_short --task qa):
-#   ratio 1.0 = 85.40 | 0.7 = 86.70 | 0.5 = 86.40 | 0.3 = 44.30
+#   (retention) 1.0 = 85.40 | 0.7 = 86.70 | 0.5 = 86.40 | 0.3 = 44.30
 #
 # Baseline-equivalent config: chunk=8192, window=4096, n_sink=32, floor_min=0
 # (floor disabled = baseline-faithful). Compression applies only to the 12
@@ -35,7 +35,7 @@ MODEL=/raid/LLM/gpt-oss-20b
 GATE=/workspace/tangram_impl/FastKVzip-gpt-oss/result_gate/gpt-oss-20b/q8_dim16_sink16.pt
 DATASET=scbench_kv_short
 NUM=${NUM:-100}
-read -r -a RATIOS <<< "${RATIOS:-0.3 0.5 0.7 1.0}"
+read -r -a RATIOS <<< "${RATIOS:-0.7 0.5 0.3 0.0}"
 
 # Optional head-group cluster map (same-memory comparison vs identity grouping).
 # Unset = identity adjacent-head grouping (over-allocates but needs no map).
@@ -51,7 +51,7 @@ for RATIO in "${RATIOS[@]}"; do
     python3 "$PY" \
         -d "$DATASET" \
         --num "$NUM" \
-        --ratio "$RATIO" \
+        --compression-ratio "$RATIO" \
         --page-group-size 2 \
         --compression-chunk-size 8192 \
         --compression-window-size 4096 \

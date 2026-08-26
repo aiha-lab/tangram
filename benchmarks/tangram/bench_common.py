@@ -255,30 +255,32 @@ def add_engine_args(parser: argparse.ArgumentParser) -> None:
     )
 
 
-def effective_ratio(args: argparse.Namespace) -> float:
-    """The ratio the engine runs with. The two retention targets are mutually
-    exclusive, and a budget is the more specific request, so it wins."""
-    return 1.0 if args.compression_budget_tokens is not None else args.ratio
+def effective_ratio(args: argparse.Namespace) -> float | None:
+    """The evicted fraction the engine runs with (``compression_ratio``);
+    ``None`` when a budget is the retention target or no ratio is set."""
+    if args.compression_budget_tokens is not None or not args.compression_ratio:
+        return None
+    return args.compression_ratio
 
 
 def add_compression_args(parser: argparse.ArgumentParser) -> None:
     """Add the Tangram compression (FastKVZip prefill-with-eviction) arguments
     shared by every accuracy driver. ``build_llm`` consumes exactly these."""
     parser.add_argument(
-        "--ratio", type=float, default=0.3,
+        "--compression-ratio", type=float, default=0.0,
         help=(
-            "KV cache budget as a ratio of the full cache, in (0, 1]. "
-            "ratio == 1.0 disables compression and runs the baseline."
+            "Fraction of the KV cache to evict, in [0, 1). "
+            "0 (default) disables compression and runs the baseline."
         ),
     )
     parser.add_argument(
         "--compression-budget-tokens", type=int, default=None,
         help=(
             "Fixed KV cache budget in tokens per (layer, head group). "
-            "Mutually exclusive with --ratio < 1.0: setting it selects the "
+            "Mutually exclusive with --compression-ratio: setting it selects the "
             "budget eviction regime, where nothing is evicted until the cache "
-            "would exceed the budget and it is then cut back to it. --ratio is "
-            "ignored and forced to 1.0 when a budget is given."
+            "would exceed the budget and it is then cut back to it. "
+            "--compression-ratio is ignored when a budget is given."
         ),
     )
     parser.add_argument(
@@ -334,7 +336,7 @@ def add_compression_args(parser: argparse.ArgumentParser) -> None:
         "--compression-floor-min", type=int, default=512,
         help="Per-(layer, group) kept-length floor in tokens; 0 disables.",
     )
-    # Two orthogonal axes (selection level + scorer).
+    # Two orthogonal axes (budget scope + scorer).
     parser.add_argument(
         "--compression-scorer", type=str, default="fastkvzip",
         choices=["fastkvzip", "snapkv", "keydiff", "streamingllm", "tova",
@@ -348,55 +350,14 @@ def add_compression_args(parser: argparse.ArgumentParser) -> None:
              "queries with optional covariance + value-norm).",
     )
     parser.add_argument(
-        "--compression-level", default="crosslayer_head",
-        choices=("crosslayer_head", "perlayer_head",
-                 "crosslayer_cluster", "perlayer_cluster", "uniform"),
-        help="Selection level (axis 1), named {scope}_{granularity}. "
-             "'crosslayer_head' (default): cross-layer global threshold, "
-             "head-calibrated (divergent count per (layer, group)). "
-             "'perlayer_head': per-layer threshold (AdaKV-style; each layer "
-             "keeps its own top-ratio fraction) — the validated pairing for "
-             "--compression-scorer expected_attention. 'crosslayer_cluster': "
-             "cluster-calibrated cross-layer global threshold (exact budget "
-             "with cross-layer block sharing; needs a global cluster map). "
-             "'perlayer_cluster': cluster-calibrated per-layer threshold (exact "
-             "per-layer budget; needs a per-layer cluster map). 'uniform': "
-             "every (layer, group) keeps the same floor(ratio * eval_len) "
-             "count.",
-    )
-    parser.add_argument(
-        "--compression-snap-window", type=int, default=32,
-        help="SnapKV observation window: trailing queries used to score a "
-             "chunk (distinct from --compression-window-size).",
-    )
-    parser.add_argument(
-        "--compression-snap-kernel", type=int, default=7,
-        help="SnapKV max-pool1d smoothing kernel size (odd).",
-    )
-    parser.add_argument(
-        "--compression-ea-use-covariance",
-        action=argparse.BooleanOptionalAction, default=True,
-        help="ExpectedAttention: add the query-covariance term (default on).",
-    )
-    parser.add_argument(
-        "--compression-ea-use-vnorm",
-        action=argparse.BooleanOptionalAction, default=True,
-        help="ExpectedAttention: reweight by the value norm (default on).",
-    )
-    parser.add_argument(
-        "--compression-ea-n-future-positions", type=int, default=512,
-        help="ExpectedAttention: #future positions whose RoPE rotation is "
-             "averaged to anticipate future queries.",
-    )
-    parser.add_argument(
-        "--compression-ea-epsilon", type=float, default=None,
-        help="ExpectedAttention: constant added before value-norm reweighting. "
-             "Left unset (None), the engine's default applies "
-             "(CacheConfig.compression_ea_epsilon = 1e-2, matching the kvpress "
-             "reference AdaKVPress(ExpectedAttentionPress(epsilon=1e-2))). The "
-             "epsilon lets the low-probability tail fall back to value-norm "
-             "ranking, which the per-layer selection level needs. Set "
-             "explicitly only to override for ablations.",
+        "--compression-budget-scope", default="layer",
+        choices=("uniform", "layer", "global"),
+        help="Scope the retention budget is balanced over (axis 1). "
+             "'layer' (default): each layer gets an equal budget, pooled "
+             "non-uniformly across its head groups (needs a per-layer cluster "
+             "map). 'global': one budget pooled across all layers and head "
+             "groups (needs a global cluster map). 'uniform': every "
+             "(layer, group) keeps the same count.",
     )
 
 
@@ -410,9 +371,11 @@ def build_llm(args: argparse.Namespace) -> LLM:
     Reads only attributes added by ``add_engine_args`` / ``add_compression_args``
     (plus optional ``args.multi_turn``), so any driver including both groups can
     call this unchanged."""
-    if not (0.0 < args.ratio <= 1.0):
+    if not (0.0 <= args.compression_ratio < 1.0):
         raise ValueError(
-            f"--ratio must satisfy 0 < ratio <= 1, got {args.ratio}."
+            "--compression-ratio is the fraction of the KV cache to evict "
+            "and must "
+            f"satisfy 0 <= ratio < 1, got {args.compression_ratio}."
         )
 
     # LLM defaults disable_log_stats=True, leaving RequestOutput.metrics None;
@@ -451,11 +414,12 @@ def build_llm(args: argparse.Namespace) -> LLM:
     # stays cold so we get a true reference point against the swept settings.
     budget_tokens = args.compression_budget_tokens
     ratio = effective_ratio(args)
-    if budget_tokens is not None and args.ratio < 1.0:
-        print(f"  [budget] ignoring --ratio {args.ratio}: "
+    if budget_tokens is not None and args.compression_ratio:
+        print(f"  [budget] ignoring --compression-ratio "
+              f"{args.compression_ratio}: "
               f"--compression-budget-tokens {budget_tokens} is the "
               "retention target.")
-    if ratio < 1.0 or budget_tokens is not None:
+    if ratio is not None or budget_tokens is not None:
         llm_kwargs.update(
             compression_ratio=ratio,
             compression_budget_tokens=budget_tokens,
@@ -469,17 +433,8 @@ def build_llm(args: argparse.Namespace) -> LLM:
             compression_floor_min=args.compression_floor_min,
             compression_gate_path=args.compression_gate_path,
             compression_scorer=args.compression_scorer,
-            compression_level=args.compression_level,
-            compression_snap_window=args.compression_snap_window,
-            compression_snap_kernel=args.compression_snap_kernel,
-            compression_ea_use_covariance=args.compression_ea_use_covariance,
-            compression_ea_use_vnorm=args.compression_ea_use_vnorm,
-            compression_ea_n_future_positions=(
-                args.compression_ea_n_future_positions),
+            compression_budget_scope=args.compression_budget_scope,
         )
-        # Only override the engine's validated default (1e-2) when given.
-        if args.compression_ea_epsilon is not None:
-            llm_kwargs["compression_ea_epsilon"] = args.compression_ea_epsilon
 
     print(f"\nLoading model from {args.model_path} ...")
     return LLM(**llm_kwargs)

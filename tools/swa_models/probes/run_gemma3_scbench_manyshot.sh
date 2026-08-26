@@ -28,14 +28,14 @@ export VLLM_WORKER_MULTIPROC_METHOD="${VLLM_WORKER_MULTIPROC_METHOD:-spawn}"
 MODEL=/raid/LLM/gemma-3-12b-it
 DATASET=scbench_many_shot
 NUM=${NUM:-54}
-RATIOS=(1.0 0.3 0.5)
+RATIOS=(0.0 0.7 0.5)
 
 for RATIO in "${RATIOS[@]}"; do
     echo "===== gemma-3 ${DATASET} ratio=${RATIO} ====="
     python3 "$PY" \
         -d "$DATASET" \
         --num "$NUM" \
-        --ratio "$RATIO" \
+        --compression-ratio "$RATIO" \
         --page-group-size 2 \
         --compression-chunk-size 8192 \
         --compression-window-size 4096 \

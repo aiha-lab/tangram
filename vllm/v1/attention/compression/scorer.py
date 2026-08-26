@@ -3,7 +3,7 @@
 """Gate-free query/key scorer factory (compression axis 2).
 
 The single dispatch point mapping a ``compression_scorer`` name to its
-gate-free scorer module (SnapKV, KeyDiff, …). Mirrors ``make_selection_level``
+gate-free scorer module (SnapKV, KeyDiff, …). Mirrors ``make_budget_scope``
 for axis 1: adding a scorer = one new module + one entry here, with no scorer
 branching leaking elsewhere (the runner and compressor stay scorer-agnostic).
 
@@ -38,7 +38,7 @@ logger = init_logger(__name__)
 #: keyed off each class's ``name`` so the accepted set has one source of truth.
 #: Config validation imports ``QK_SCORERS`` and ``build_qk_scorer`` constructs
 #: from it, rather than either re-listing the names. Mirrors
-#: ``selection_level._LEVELS`` for axis 1. FastKVZip is intentionally absent —
+#: ``budget_scope._SCOPES`` for axis 1. FastKVZip is intentionally absent —
 #: it is the checkpoint-backed hidden_states gate, selected on a separate path.
 _QK_SCORERS: dict[str, type[QKScorer]] = {
     cls.name: cls

@@ -15,7 +15,7 @@ assembly, and scoring are provided self-contained by ``ruler_local`` (the
 preprocessed ``simonjegou/ruler`` parquets; no external RULER checkout required).
 
 Example:
-    python benchmark_ruler.py --length 4096 --num 50 --ratio 0.3 \\
+    python benchmark_ruler.py --length 4096 --num 50 --compression-ratio 0.7 \\
         -m Qwen/Qwen3-4B-Instruct-2507 --max-model-len 40960
 """
 
@@ -222,8 +222,11 @@ def run_task(
         "task": task,
         "model": args.model_path,
         "compression_algo": args.compression_scorer,
-        "compression_level": args.compression_level,
-        "ratio": effective_ratio(args),
+        "compression_budget_scope": args.compression_budget_scope,
+        "ratio": args.compression_ratio,
+        # The evicted-fraction convention; result files predating the ratio
+        # inversion lack this field and read "ratio" as the kept fraction.
+        "ratio_semantics": "evicted",
         "budget_tokens": args.compression_budget_tokens,
         "evict_current_chunk": args.compression_evict_current_chunk,
         # Which score the eviction ranked. Recorded because a forced source is
@@ -317,9 +320,9 @@ def main() -> None:
     def save_path_for(task: str) -> str:
         return os.path.join(
             args.output_dir, f"len{args.length}", task,
-            # A budget run and a ratio run are different settings, so they
-            # must not share a result file even though both have ratio 1.0.
-            f"{model_basename}_r{effective_ratio(args)}"
+            # A budget run keeps its ratio tag (0.0) plus the _b suffix,
+            # so it never shares a result file with a ratio run.
+            f"{model_basename}_r{args.compression_ratio}"
             + (f"_b{args.compression_budget_tokens}"
                if args.compression_budget_tokens is not None else "")
             + f"_pg{args.page_group_size}{tag_suffix}.json",
@@ -336,11 +339,11 @@ def main() -> None:
     if args.skip_existing:
         done = [t for t in task_names if os.path.exists(save_path_for(t))]
         if done:
-            print(f"[resume] length={args.length} ratio={args.ratio}: skipping "
+            print(f"[resume] length={args.length} ratio={args.compression_ratio}: skipping "
                   f"{len(done)} existing ({', '.join(done)})")
         task_names = [t for t in task_names if not os.path.exists(save_path_for(t))]
         if not task_names:
-            print(f"[resume] length={args.length} ratio={args.ratio}: all tasks "
+            print(f"[resume] length={args.length} ratio={args.compression_ratio}: all tasks "
                   "done; skipping model load.")
             return
 

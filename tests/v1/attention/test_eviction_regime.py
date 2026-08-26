@@ -24,7 +24,7 @@ from vllm.v1.attention.compression.workspace import (
 
 @pytest.fixture(scope="module", autouse=True)
 def single_rank_parallel_state():
-    """The selection levels query the tensor-parallel world size to decide
+    """The budget scopes query the tensor-parallel world size to decide
     whether to all-gather. Stand up a one-process gloo group so they can run on
     the CPU; the gather branch is never taken at world size 1."""
     from vllm.distributed.parallel_state import (
@@ -51,7 +51,7 @@ HIDDEN_DIM = 32
 
 def make_compressor(
     regime: str,
-    level: str = "uniform",
+    budget_scope: str = "uniform",
     *,
     chunk_size: int = 32,
     budget: int | None = 96,
@@ -86,7 +86,7 @@ def make_compressor(
         dtype=torch.float32,
         device="cpu",
         workspace=workspace,
-        level=level,
+        budget_scope=budget_scope,
         regime=regime,
     )
     compressor.set_cluster_map(None)
@@ -152,7 +152,7 @@ def budget_params(
     total_prompt_tokens: int = 0,
 ) -> ChunkParams:
     return ChunkParams(
-        ratio=1.0,
+        keep_ratio=1.0,
         budget_tokens=budget,
         window_size=window_size,
         n_sink_tokens=n_sink_tokens,
@@ -254,7 +254,7 @@ def test_ratio_regime_keeps_lock_in_and_grows():
     generator = torch.Generator().manual_seed(4)
     compressor.begin_request("r0")
     params = ChunkParams(
-        ratio=0.5, budget_tokens=None, window_size=8, n_sink_tokens=4,
+        keep_ratio=0.5, budget_tokens=None, window_size=8, n_sink_tokens=4,
         evict_current_chunk=False, total_prompt_tokens=128)
 
     prev = np.zeros((NUM_LAYERS, NUM_GROUPS), dtype=np.int64)
@@ -282,7 +282,7 @@ def test_budget_regime_rejects_missing_budget():
             prev_locked=torch.zeros(NUM_LAYERS, NUM_GROUPS, dtype=torch.long),
             is_first_chunk=True,
             params=ChunkParams(
-                ratio=1.0, budget_tokens=None, window_size=8,
+                keep_ratio=1.0, budget_tokens=None, window_size=8,
                 n_sink_tokens=4, evict_current_chunk=False,
                 total_prompt_tokens=0),
             device=torch.device("cpu"),
@@ -293,7 +293,7 @@ def test_ratio_regime_adjusted_ratio_matches_baseline_formula():
     """The ratio regime's window correction is the reference's
     ``(ratio * clen - window) / (clen - window)`` on the sink-excluded prompt."""
     params = ChunkParams(
-        ratio=0.3, budget_tokens=None, window_size=32, n_sink_tokens=4,
+        keep_ratio=0.3, budget_tokens=None, window_size=32, n_sink_tokens=4,
         evict_current_chunk=False, total_prompt_tokens=1024)
     got = RatioRegime._adjusted_ratio(params, sink_size=4, win_size=32)
     clen = 1024 - 4
@@ -348,7 +348,7 @@ def test_ratio_regime_store_needs_no_compaction():
     generator = torch.Generator().manual_seed(6)
     compressor.begin_request("r0")
     params = ChunkParams(
-        ratio=0.5, budget_tokens=None, window_size=8, n_sink_tokens=4,
+        keep_ratio=0.5, budget_tokens=None, window_size=8, n_sink_tokens=4,
         evict_current_chunk=False, total_prompt_tokens=128)
     run_chunk(compressor, "r0", np.zeros((NUM_LAYERS, NUM_GROUPS),
                                          dtype=np.int64), 32, params,
@@ -357,22 +357,20 @@ def test_ratio_regime_store_needs_no_compaction():
         "r0", 0, 0, torch.zeros(PAGE_GROUP_SIZE, 4, dtype=torch.long), 4)
 
 
-@pytest.mark.parametrize(
-    "level", ["uniform", "perlayer_cluster", "crosslayer_cluster",
-              "perlayer_head", "crosslayer_head"])
-def test_budget_is_respected_for_every_selection_level(level):
-    """The budget is enforced whatever scope the level shares it over. The
-    cluster-calibrated levels land on it directly; the head-calibrated ones
-    would overshoot through their max-pool, so the hard cap must catch them."""
+@pytest.mark.parametrize("scope", ["uniform", "layer", "global"])
+def test_budget_is_respected_for_every_budget_scope(scope):
+    """The budget is enforced whatever range the scope shares it over: the
+    threshold scopes land on it directly, and the block-aligned hard cap is the
+    backstop for rounding and for ``uniform``."""
     budget, chunk_len = 96, 32
-    compressor = make_compressor("budget", level=level)
+    compressor = make_compressor("budget", budget_scope=scope)
     generator = torch.Generator().manual_seed(7)
     compressor.begin_request("r0")
     prev = np.zeros((NUM_LAYERS, NUM_GROUPS), dtype=np.int64)
     for _ in range(6):
         prev = run_chunk(compressor, "r0", prev.astype(np.int64), chunk_len,
                          budget_params(budget), generator).astype(np.int64)
-        assert np.all(prev <= budget), f"{level} exceeded budget: {prev}"
+        assert np.all(prev <= budget), f"{scope} exceeded budget: {prev}"
 
 
 def test_budget_floor_min_cannot_exceed_the_budget():

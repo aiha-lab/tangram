@@ -206,7 +206,7 @@ class CompressionWorkspace:
         self.staging = torch.empty(
             num_layers, num_kv_heads, spec.window_size + spec.chunk_size,
             dtype=dtype, device=device)
-        # Scores of the eval region in MEMBER order — what the selection level
+        # Scores of the eval region in MEMBER order — what the budget scope
         # consumes (it maps members to clusters itself).
         self.eval_scores = torch.empty(
             num_layers, num_kv_heads, spec.eval_capacity,

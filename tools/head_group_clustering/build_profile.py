@@ -84,38 +84,37 @@ def parse_args() -> argparse.Namespace:
                         "--snap-window/--snap-kernel), or 'expected_attention' "
                         "(gate-free, anticipated attention; see the --ea-* "
                         "options). The engine computes the chosen scorer's "
-                        "per-head retention under the threshold set by --level, "
+                        "per-head retention under the threshold set by --scope, "
                         "so the profile matches the engine's selection for this "
                         "scorer. Name the output under the matching "
                         "<method>/<model> tree.")
-    p.add_argument("--level", choices=["crosslayer_head", "perlayer_head"],
-                   default="crosslayer_head",
-                   help="threshold SCOPE whose per-head retention is profiled "
-                        "(only the head-calibrated levels are profiled: the "
-                        "profile is the per-head retention ranking that DRIVES "
-                        "clustering, so it is measured before clusters exist; "
-                        "the cluster-calibrated levels reuse these head-level "
-                        "profiles via the scope-matched map). 'crosslayer_head' "
-                        "(default): a single CROSS-layer global threshold "
-                        "(strong layers keep more). 'perlayer_head': a SEPARATE "
-                        "threshold per layer (AdaKV-style; every layer keeps its "
-                        "own top-ratio fraction). The two produce different "
-                        "per-head retention rankings, hence different cluster "
-                        "maps -- name the output under the matching "
-                        "<method>/<model> tree accordingly.")
+    p.add_argument("--scope", choices=["global", "per_layer"],
+                   default="global",
+                   help="threshold scope whose per-head retention is profiled. "
+                        "The engine runs with page_group_size=1, where every "
+                        "head is its own cluster, so the 'global' / 'layer' "
+                        "budget scopes measure exactly the per-head retention "
+                        "ranking that DRIVES clustering. 'global' (default): "
+                        "one cross-layer threshold (strong layers keep more) "
+                        "-- pairs with global-scope maps. 'per_layer': a "
+                        "separate threshold per layer (every layer keeps its "
+                        "own top fraction) -- pairs with per-layer maps. The "
+                        "two produce different retention rankings, hence "
+                        "different cluster maps -- name the output under the "
+                        "matching <method>/<model> tree accordingly.")
     p.add_argument("--snap-window", type=int, default=32,
                    help="SnapKV observation window (trailing queries); matches "
-                        "the engine's --compression-snap-window default. "
+                        "the engine scorer's 'window' option default. "
                         "Used only when --scorer snapkv.")
     p.add_argument("--snap-kernel", type=int, default=7,
                    help="SnapKV max-pool smoothing kernel; matches the engine's "
-                        "--compression-snap-kernel default. Used only when "
+                        "the engine scorer's 'kernel' option default. Used only when "
                         "--scorer snapkv.")
     # ExpectedAttention hyperparameters (used only when --scorer
     # expected_attention); defaults mirror the engine / kvpress reference.
     p.add_argument("--ea-epsilon", type=float, default=1e-2,
                    help="ExpectedAttention value-norm floor (engine/kvpress "
-                        "default 1e-2). Matches CacheConfig.compression_ea_epsilon.")
+                        "default 1e-2). Matches the scorer's 'epsilon' default.")
     p.add_argument("--ea-no-covariance", dest="ea_use_covariance",
                    action="store_false",
                    help="Disable the query-covariance term (default: on).")
@@ -309,6 +308,19 @@ def release_engine(llm, *, timeout_s: float = 180.0) -> None:
               f"{timeout_s:.0f}s; the next engine may fail to size its cache.")
 
 
+def scorer_options(args) -> dict[str, str]:
+    """The profiling CLI knobs as the engine's generic scorer-option channel,
+    restricted to the selected scorer (an off-scorer key would be rejected)."""
+    if args.scorer == "snapkv":
+        return {"window": str(args.snap_window), "kernel": str(args.snap_kernel)}
+    if args.scorer == "expected_attention":
+        return {"epsilon": str(args.ea_epsilon),
+                "use_covariance": str(args.ea_use_covariance),
+                "use_vnorm": str(args.ea_use_vnorm),
+                "n_future_positions": str(args.ea_n_future_positions)}
+    return {}
+
+
 def out_dump_dir(out_path, ratio):
     """Per-ratio scratch dir for engine retention dumps, beside the output."""
     return Path(str(out_path) + f".dump_r{ratio}")
@@ -370,19 +382,17 @@ def measure_all(args, tokenizer, mix, base_ratios):
             max_model_len=max_model_len,
             enable_prefix_caching=False, max_num_seqs=8,
             page_group_size=1,
-            compression_ratio=ratio, compression_scorer=args.scorer,
-            compression_level=args.level,
+            # Engine knob is the EVICTED fraction; base ratios stay
+            # retention fractions (the profile schema on disk).
+            compression_ratio=1.0 - ratio, compression_scorer=args.scorer,
+            compression_budget_scope=(
+                "layer" if args.scope == "per_layer" else "global"),
             compression_window_size=args.window_size,
             compression_n_sink_tokens=_PROFILE_SINK_TOKENS,
             compression_floor_min=0,
             compression_chunk_size=args.prefill_chunk,
             compression_gate_path=args.gate_path,
-            compression_snap_window=args.snap_window,
-            compression_snap_kernel=args.snap_kernel,
-            compression_ea_epsilon=args.ea_epsilon,
-            compression_ea_use_covariance=args.ea_use_covariance,
-            compression_ea_use_vnorm=args.ea_use_vnorm,
-            compression_ea_n_future_positions=args.ea_n_future_positions,
+            compression_scorer_options=scorer_options(args),
             compression_retention_dump=dump_dir,
             **({"limit_mm_per_prompt": {"image": 0}}
                if args.no_mm_profiling else {}),
@@ -505,7 +515,7 @@ def aggregate_and_write(out_path, raw_ratio, raw_kept, sample_meta, samples,
         "window_size": args.window_size,
         "prefill_chunk": args.prefill_chunk,
         "scorer": args.scorer,
-        "level": args.level,
+        "scope": args.scope,
         "snap_window": args.snap_window if args.scorer == "snapkv" else None,
         "snap_kernel": args.snap_kernel if args.scorer == "snapkv" else None,
         "fastkvzip_gate_name": args.gate_path if args.scorer == "fastkvzip"
@@ -556,7 +566,7 @@ def main() -> int:
 
     if args.dry_run:
         print(f"[dry-run] model={args.model} scorer={args.scorer} "
-              f"level={args.level} gate={args.gate_path} "
+              f"scope={args.scope} gate={args.gate_path} "
               f"base_ratios={base_ratios} mix={mix} out={out_path}")
         return 0
 

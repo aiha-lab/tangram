@@ -5,7 +5,7 @@
 Owns the keep decision and delegates every policy choice to one of three
 orthogonal, pluggable axes:
 
-* axis 1 — selection level (``selection_level.py``): eval scores -> per-(layer,
+* axis 1 — budget scope (``budget_scope.py``): eval scores -> per-(layer,
   group) kept COUNT;
 * axis 2 — scorer (``scorer.py`` / ``gate.py``): what a position's score means;
 * axis 3 — eviction regime (``eviction_regime.py``): which positions may be
@@ -38,9 +38,9 @@ from vllm.v1.attention.compression.gate import load_gates
 from vllm.v1.attention.compression.gate_capture import (
     _wrap_forward_with_gate_capture,
 )
-from vllm.v1.attention.compression.selection_level import (
-    SelectionLevel,
-    make_selection_level,
+from vllm.v1.attention.compression.budget_scope import (
+    BudgetScope,
+    make_budget_scope,
 )
 from vllm.v1.attention.compression.slot_scores import (
     SLOT_SCORE_SOURCE_AUTO,
@@ -95,8 +95,8 @@ class KeepDecision:
     ``sink_size + locked``; the sink, the locked prefix and the trailing
     ``tail_size`` slots are kept regardless of score. The kept COUNT and
     POSITION live in the per-(layer, group) caches (``cached_k_new_cpu`` /
-    ``borrowed_sorted_indices``), not here — the level-specific threshold is an
-    internal of ``SelectionLevel`` and never reaches downstream consumers.
+    ``borrowed_sorted_indices``), not here — the scope-specific threshold is an
+    internal of ``BudgetScope`` and never reaches downstream consumers.
     """
     sink_size: int
     #: Trailing always-kept slots: the recent window under the ratio regime,
@@ -161,7 +161,7 @@ class KVCompressor:
         dtype: torch.dtype,
         device: torch.device | str,
         workspace: CompressionWorkspace,
-        level: str = "crosslayer_head",
+        budget_scope: str = "layer",
         regime: str = "ratio",
         slot_score_source: str = SLOT_SCORE_SOURCE_AUTO,
     ) -> None:
@@ -169,17 +169,17 @@ class KVCompressor:
             f"num_kv_heads ({num_kv_heads}) must be divisible by "
             f"page_group_size ({page_group_size}).")
 
-        # Selection level (compression axis 1): the aggregation rule
-        # turning eval scores into a per-(layer, group) kept COUNT. ``level`` is
-        # ``cache_config.compression_level`` (see selection_level.py). Chosen
-        # once here; ``prepare_keep_decision`` calls ``self.level.compute_counts``
-        # and never branches on the level again.
-        self.level: SelectionLevel = make_selection_level(level)
+        # Budget scope (compression axis 1): the aggregation rule turning
+        # eval scores into a per-(layer, group) kept COUNT. ``budget_scope`` is
+        # ``cache_config.compression_budget_scope`` (see budget_scope.py).
+        # Chosen once here; ``prepare_keep_decision`` calls
+        # ``self.scope.compute_counts`` and never branches on the scope again.
+        self.scope: BudgetScope = make_budget_scope(budget_scope)
         # Eviction regime (compression axis 3): which cached positions may be
         # evicted this chunk, what fraction of them survives, and how long a
         # position's score lives (see eviction_regime.py). Selected by whether
-        # ``cache_config.compression_budget_tokens`` is set; like the level it is
-        # chosen once here and never branched on again.
+        # ``cache_config.compression_budget_tokens`` is set; like the scope it
+        # is chosen once here and never branched on again.
         self.regime: EvictionRegime = make_eviction_regime(regime)
         # Every tensor the keep decision touches lives here, allocated once at
         # startup so the memory-profiling run that follows sizes the KV cache
@@ -474,7 +474,7 @@ class KVCompressor:
         Three delegations, no policy of its own: the active eviction regime
         (axis 3) fixes the geometry — which slots may be evicted, what fraction
         survives — and supplies the eval-region scores from its own score
-        memory; the active selection level (axis 1) turns those scores into a
+        memory; the active budget scope (axis 1) turns those scores into a
         per-(layer, group) kept COUNT; and this method caches the per-(layer,
         group) POSITION ranking the executor gathers with.
 
@@ -485,10 +485,10 @@ class KVCompressor:
         if req_id not in self.req_state:
             raise RuntimeError(
                 f"prepare_keep_decision: '{req_id}' not begin_request'd.")
-        if not (0.0 < params.ratio <= 1.0):
+        if not (0.0 < params.keep_ratio <= 1.0):
             raise ValueError(
-                f"prepare_keep_decision: ratio must be in (0, 1], got "
-                f"{params.ratio}.")
+                f"prepare_keep_decision: keep_ratio must be in (0, 1], got "
+                f"{params.keep_ratio}.")
 
         req = self.req_state[req_id]
         num_layers = self.num_layers
@@ -569,7 +569,7 @@ class KVCompressor:
                 # (the budget regime, where kept lengths diverge) the score
                 # tensor is padded, and a count must never reach into padding.
                 req.cached_k_new_cpu = np.minimum(
-                    self.level.compute_counts(
+                    self.scope.compute_counts(
                         eval_scores, adjusted_ratio, self.member_to_cluster,
                         num_layers, num_kv_heads, num_groups),
                     geometry.real_eval_len)
@@ -601,7 +601,7 @@ class KVCompressor:
     ) -> torch.Tensor:
         """Per-member descending POSITION ranking, in the executor's
         ``[num_layers, num_groups, page_group_size, width]`` (cluster, column)
-        layout. Shared by every selection level — the kept COUNT differs between
+        layout. Shared by every budget scope — the kept COUNT differs between
         them, the POSITION ranking is the same.
 
         Each member ranks its OWN scores descending; the executor reads
@@ -721,10 +721,9 @@ class KVCompressor:
                         # keeps the kept span page-contiguous, so the cap is
                         # rounded DOWN to a block multiple rather than cutting
                         # mid-block: the kept length then never exceeds the
-                        # budget and stays block-aligned. Head-calibrated levels
-                        # (whose per-cluster length is a max over members) are
-                        # the case that actually needs this; the cluster-
-                        # calibrated levels already land on the budget.
+                        # budget and stays block-aligned. The threshold scopes
+                        # land on the budget by construction; the cap is the
+                        # backstop for rounding and for ``uniform``.
                         room = budget_tokens - sink_size - locked_count \
                             - tail_size
                         cap = max(0, (room // block_size) * block_size)

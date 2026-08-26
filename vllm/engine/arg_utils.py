@@ -573,7 +573,7 @@ class EngineArgs:
     # Ragged paging, compression, multi-turn.
     page_group_size: int | None = CacheConfig.page_group_size
     head_group_cluster_map: str | None = CacheConfig.head_group_cluster_map
-    compression_ratio: float = CacheConfig.compression_ratio
+    compression_ratio: float | None = CacheConfig.compression_ratio
     compression_budget_tokens: int | None = (
         CacheConfig.compression_budget_tokens)
     compression_evict_current_chunk: bool = (
@@ -587,16 +587,8 @@ class EngineArgs:
     compression_floor_min: int = CacheConfig.compression_floor_min
     compression_chunk_size: int = CacheConfig.compression_chunk_size
     compression_gate_path: str = CacheConfig.compression_gate_path
-    compression_level: str = CacheConfig.compression_level
+    compression_budget_scope: str = CacheConfig.compression_budget_scope
     compression_scorer: str = CacheConfig.compression_scorer
-    compression_snap_window: int = CacheConfig.compression_snap_window
-    compression_snap_kernel: int = CacheConfig.compression_snap_kernel
-    compression_ea_use_covariance: bool = \
-        CacheConfig.compression_ea_use_covariance
-    compression_ea_use_vnorm: bool = CacheConfig.compression_ea_use_vnorm
-    compression_ea_n_future_positions: int = \
-        CacheConfig.compression_ea_n_future_positions
-    compression_ea_epsilon: float = CacheConfig.compression_ea_epsilon
     compression_retention_dump: str | None = \
         CacheConfig.compression_retention_dump
     multi_turn: bool = CacheConfig.multi_turn
@@ -1051,34 +1043,11 @@ class EngineArgs:
             "--compression-gate-path", **cache_kwargs["compression_gate_path"]
         )
         cache_group.add_argument(
-            "--compression-level", **cache_kwargs["compression_level"]
+            "--compression-budget-scope",
+            **cache_kwargs["compression_budget_scope"],
         )
         cache_group.add_argument(
             "--compression-scorer", **cache_kwargs["compression_scorer"]
-        )
-        cache_group.add_argument(
-            "--compression-snap-window",
-            **cache_kwargs["compression_snap_window"],
-        )
-        cache_group.add_argument(
-            "--compression-snap-kernel",
-            **cache_kwargs["compression_snap_kernel"],
-        )
-        cache_group.add_argument(
-            "--compression-ea-use-covariance",
-            **cache_kwargs["compression_ea_use_covariance"],
-        )
-        cache_group.add_argument(
-            "--compression-ea-use-vnorm",
-            **cache_kwargs["compression_ea_use_vnorm"],
-        )
-        cache_group.add_argument(
-            "--compression-ea-n-future-positions",
-            **cache_kwargs["compression_ea_n_future_positions"],
-        )
-        cache_group.add_argument(
-            "--compression-ea-epsilon",
-            **cache_kwargs["compression_ea_epsilon"],
         )
         cache_group.add_argument(
             "--compression-retention-dump",
@@ -1613,15 +1582,8 @@ class EngineArgs:
             compression_floor_min=self.compression_floor_min,
             compression_chunk_size=self.compression_chunk_size,
             compression_gate_path=self.compression_gate_path,
-            compression_level=self.compression_level,
+            compression_budget_scope=self.compression_budget_scope,
             compression_scorer=self.compression_scorer,
-            compression_snap_window=self.compression_snap_window,
-            compression_snap_kernel=self.compression_snap_kernel,
-            compression_ea_use_covariance=self.compression_ea_use_covariance,
-            compression_ea_use_vnorm=self.compression_ea_use_vnorm,
-            compression_ea_n_future_positions=(
-                self.compression_ea_n_future_positions),
-            compression_ea_epsilon=self.compression_ea_epsilon,
             compression_retention_dump=self.compression_retention_dump,
             multi_turn=self.multi_turn,
         )
@@ -1876,7 +1838,7 @@ class EngineArgs:
                 != cache_config.compression_chunk_size
             ):
                 raise ValueError(
-                    "When compression is on (--compression-ratio < 1.0 or "
+                    "When compression is on (--compression-ratio or "
                     "--compression-budget-tokens set), "
                     "--max-num-batched-tokens must equal "
                     f"--compression-chunk-size. Got "

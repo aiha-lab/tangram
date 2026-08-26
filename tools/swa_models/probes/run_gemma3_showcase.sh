@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
 # Compression showcase: KV-capacity-limited concurrency on a long context.
 #
-# Picks a regime where the no-compression baseline (RATIO=1.0) cannot hold the
+# Picks a regime where the no-compression baseline (RATIO=0) cannot hold the
 # requested concurrency in KV and thrashes (preempt + full re-prefill), while
 # compression (RATIO<1.0, with sliding-window eviction) shrinks per-request KV
 # enough that all requests fit and run concurrently. The same config is used
-# for both ratios; only --ratio differs, so the wall-clock gap is attributable
+# for both ratios; only --compression-ratio differs, so the wall-clock gap is attributable
 # to compression.
 #
-# gemma-3-12b-it, scbench_repoqa (~85k context). At RATIO=1.0 each request holds
+# gemma-3-12b-it, scbench_repoqa (~85k context). At RATIO=0 each request holds
 # ~70% of the KV pool (no compression, no sliding-window eviction), so 2+ long
-# requests cannot coexist; at RATIO=0.3 each holds ~11%, so 4 fit. Single-turn +
+# requests cannot coexist; at RATIO=0.7 each holds ~11%, so 4 fit. Single-turn +
 # small --max-tokens keeps each sample fast.
 #
 # Invoke directly. GPU pinned to physical device 2 (override CUDA_VISIBLE_DEVICES).
@@ -31,7 +31,7 @@ CLUSTER_MAP="${CLUSTER_MAP:-$REPO/tools/head_group_clustering/cluster_maps/gemma
 DATASET="${DATASET:-scbench_repoqa}"
 NUM=${NUM:-4}
 MNS=${MNS:-4}
-RATIO=${RATIO:-0.3}
+RATIO=${RATIO:-0.7}
 MML=${MML:-98304}
 MAX_TOKENS=${MAX_TOKENS:-256}
 GPU_MEM=${GPU_MEM:-0.90}
@@ -41,7 +41,7 @@ max_tokens=${MAX_TOKENS} single-turn (pg4 cluster-map) ====="
 python3 "$PY" \
     -d "$DATASET" \
     --num "$NUM" \
-    --ratio "$RATIO" \
+    --compression-ratio "$RATIO" \
     --page-group-size 4 \
     --head-group-cluster-map "$CLUSTER_MAP" \
     --max-num-seqs "$MNS" \

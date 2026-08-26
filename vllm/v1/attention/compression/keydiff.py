@@ -4,7 +4,7 @@
 
 Produces the same ``[num_kv_heads, chunk_len]`` score contract every scorer
 does, from the model's post-RoPE keys of the current chunk. The shared chunk
-machinery (sink / window / lock-in / adjusted_ratio / selection level /
+machinery (sink / window / lock-in / adjusted_ratio / budget scope /
 executor) consumes the score identically.
 
 Ported from NVIDIA KVpress (``kvpress/presses/keydiff_press.py``); paper
@@ -17,7 +17,7 @@ are evicted first. The score is the NEGATED cosine similarity to that average
 direction — higher (less similar to the mean) means more distinctive, hence
 kept. KeyDiff is gate-free and query-independent (it only reads keys); like the
 reference it defaults to a uniform per-head budget (pair-head), but the
-selection level stays an orthogonal knob.
+budget scope stays an orthogonal knob.
 
 Two entry points, differing only in WHICH keys the average is taken over:
 ``forward`` scores the fresh chunk against the chunk's own mean (the

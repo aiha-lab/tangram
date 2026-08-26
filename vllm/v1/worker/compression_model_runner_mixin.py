@@ -215,7 +215,7 @@ class CompressionModelRunnerMixin:
             dtype=dtype,
             device=self.device,
             workspace=workspace,
-            level=cache_config.compression_level,
+            budget_scope=cache_config.compression_budget_scope,
             regime=cache_config.compression_regime,
             slot_score_source=cache_config.compression_slot_score_source,
         )
@@ -520,7 +520,7 @@ class CompressionModelRunnerMixin:
                 chunk_len=chunk_len,
                 cache_view=cache_view,
                 params=ChunkParams(
-                    ratio=req_md.compression_ratio,
+                    keep_ratio=req_md.compression_keep_ratio,
                     budget_tokens=req_md.budget_tokens,
                     window_size=req_md.window_size,
                     n_sink_tokens=req_md.n_sink_tokens,
@@ -645,7 +645,8 @@ class CompressionModelRunnerMixin:
         if active:
             assert self.compressor is not None, (
                 "scheduler emitted compression_metadata but the runner has "
-                "no KVCompressor; compression_ratio < 1.0 must be set."
+                "no KVCompressor; a retention target (compression_ratio or "
+                "compression_budget_tokens) must be set."
             )
             self._begin_compression_step(scheduler_output, compression_metadata)
         try:

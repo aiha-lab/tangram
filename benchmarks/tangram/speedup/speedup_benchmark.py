@@ -5,32 +5,33 @@
 Under a KV-pressured workload, compression shrinks each request's KV footprint
 so more requests fit at once; fewer requests queue/preempt and end-to-end time
 drops. This harness quantifies that speedup by running the same workload twice —
-an uncompressed baseline (ratio 1.0, full KV cache) and a compressed run
-(``--ratio`` < 1.0, prefill-with-eviction) — and printing a side-by-side
+an uncompressed baseline (ratio 0, full KV cache) and a compressed run
+(``--compression-ratio`` > 0, prefill-with-eviction) — and printing a
+side-by-side
 comparison of preemptions, end-to-end time, throughput, and the speedup.
 
 ``scheduler_reserve_full_isl`` is pinned ON for every run, so admission control
 is held constant and the only varied axis is the compression ratio.
 
-Compression defaults to the SnapKV scorer at the ``perlayer_cluster`` selection
-level (matching the shipping library defaults); both are configurable via
-``--compression-scorer`` / ``--compression-level``.
+Compression defaults to the SnapKV scorer at the ``layer`` budget scope
+(matching the shipping library defaults); both are configurable via
+``--compression-scorer`` / ``--compression-budget-scope``.
 
 Examples
 --------
-    # Baseline (ratio 1.0) vs SnapKV at a 30% KV budget.
-    CUDA_VISIBLE_DEVICES=0 python speedup_benchmark.py --ratio 0.3
+    # Baseline (ratio 0) vs SnapKV evicting 70% of the KV cache.
+    CUDA_VISIBLE_DEVICES=0 python speedup_benchmark.py --compression-ratio 0.7
 
     # Tighten the KV cache for more contention (larger speedup).
     CUDA_VISIBLE_DEVICES=0 python speedup_benchmark.py \\
-        --ratio 0.3 --gpu-memory-utilization 0.12 --num 32
+        --compression-ratio 0.7 --gpu-memory-utilization 0.12 --num 32
 
-    # Override the scorer or selection level.
+    # Override the scorer or budget scope.
     CUDA_VISIBLE_DEVICES=0 python speedup_benchmark.py \\
-        --ratio 0.3 --compression-scorer fastkvzip --compression-level perlayer_head
+        --compression-ratio 0.7 --compression-scorer fastkvzip --compression-budget-scope uniform
 
     # Run a single configuration only.
-    CUDA_VISIBLE_DEVICES=0 python speedup_benchmark.py --run-ratio 1.0
+    CUDA_VISIBLE_DEVICES=0 python speedup_benchmark.py --run-ratio 0.0
 """
 from __future__ import annotations
 
@@ -53,10 +54,9 @@ for _p in (_TANGRAM_DIR, _REPO_ROOT):
 
 # Head-group cluster maps ship under
 # tools/head_group_clustering/cluster_maps/<method>/<model-id>/pg<pg>_r<base>[_perlayer].npz
-# A cluster-granularity selection level (crosslayer_cluster / perlayer_cluster)
-# needs one; the head levels run fine on identity adjacency. We auto-resolve the
-# map from (scorer, model, pg, level) and fall back to identity (None) when no
-# map is on disk.
+# The threshold budget scopes ('layer' / 'global') need one; 'uniform' runs
+# fine on identity adjacency. We auto-resolve the map from (scorer, model, pg,
+# scope) and fall back to identity (None) when no map is on disk.
 _CMAP_DIR = os.path.join(_REPO_ROOT, "tools", "head_group_clustering",
                          "cluster_maps")
 _CMAP_BASE_RATIO = 0.3  # one base-ratio ranking map is valid across all ratios.
@@ -65,15 +65,15 @@ _SCORER_CMAP_METHOD = {
     "fastkvzip": "fastkvzip", "snapkv": "snapkv", "keydiff": "keydiff",
     "expected_attention": "ea",
 }
-# Only the per-layer-scope levels use the _perlayer map flavour.
-_LEVEL_CMAP_SUFFIX = {"perlayer_cluster": "_perlayer", "perlayer_head": "_perlayer"}
+# Only the 'layer' scope uses the _perlayer map flavour.
+_SCOPE_CMAP_SUFFIX = {"layer": "_perlayer"}
 
 
 def resolve_cluster_map(args: argparse.Namespace) -> str | None:
     """Resolve the head-group cluster map path for this run.
 
     An explicit ``--head-group-cluster-map`` always wins. Otherwise auto-resolve
-    from (scorer, model basename, page-group size, level); return None (identity
+    from (scorer, model basename, page-group size, scope); return None (identity
     adjacency) when the scorer has no map folder or the file is not on disk."""
     if args.head_group_cluster_map:
         return args.head_group_cluster_map
@@ -81,7 +81,7 @@ def resolve_cluster_map(args: argparse.Namespace) -> str | None:
     if method is None:
         return None
     model_id = os.path.basename(args.model.rstrip("/")).lower()
-    suffix = _LEVEL_CMAP_SUFFIX.get(args.compression_level, "")
+    suffix = _SCOPE_CMAP_SUFFIX.get(args.compression_budget_scope, "")
     path = os.path.join(_CMAP_DIR, method, model_id,
                         f"pg{args.page_group_size}_r{_CMAP_BASE_RATIO}{suffix}.npz")
     return path if os.path.exists(path) else None
@@ -142,18 +142,19 @@ def run_one(args: argparse.Namespace, run_ratio: float) -> dict:
         # Cluster-granularity levels need a cluster map; auto-resolved from
         # (scorer, model, pg, level). Only consulted for compressed runs below.
         head_group_cluster_map=(
-            resolve_cluster_map(args) if run_ratio < 1.0 else None),
+            resolve_cluster_map(args) if run_ratio > 0.0 else None),
     )
-    if run_ratio < 1.0:
+    if run_ratio > 0.0:
         cmap = llm_kwargs["head_group_cluster_map"]
         print(f"  cluster map: {cmap if cmap else 'identity (none on disk)'}")
-        if cmap is None and args.compression_level.endswith("_cluster"):
-            print(f"  WARNING: level={args.compression_level} needs a cluster "
-                  f"map but none was found; running on identity adjacency.")
-    # run_ratio == 1.0 is the no-compression baseline (machinery stays cold);
-    # run_ratio < 1.0 enables prefill-with-eviction KV compression.
-    if run_ratio < 1.0:
-        # Compression turns ON purely via compression_ratio < 1.0; there is no
+        if cmap is None and args.compression_budget_scope != "uniform":
+            print(f"  WARNING: budget_scope={args.compression_budget_scope} "
+                  f"needs a cluster map but none was found; running on "
+                  f"identity adjacency.")
+    # run_ratio == 0 is the no-compression baseline (machinery stays cold);
+    # run_ratio > 0 evicts that fraction via prefill-with-eviction compression.
+    if run_ratio > 0.0:
+        # Compression turns ON purely via compression_ratio > 0; there is no
         # separate enable flag on the LLM API / EngineArgs.
         llm_kwargs.update(
             compression_ratio=run_ratio,
@@ -163,16 +164,12 @@ def run_one(args: argparse.Namespace, run_ratio: float) -> dict:
             compression_floor_min=args.compression_floor_min,
             compression_gate_path=args.compression_gate_path,
             compression_scorer=args.compression_scorer,
-            compression_level=args.compression_level,
-            compression_snap_window=args.compression_snap_window,
-            compression_snap_kernel=args.compression_snap_kernel,
-            compression_ea_use_covariance=args.compression_ea_use_covariance,
-            compression_ea_use_vnorm=args.compression_ea_use_vnorm,
-            compression_ea_n_future_positions=(
-                args.compression_ea_n_future_positions),
+            compression_budget_scope=args.compression_budget_scope,
+            compression_scorer_options=dict(
+                kv.split("=", 1)
+                for kv in (args.compression_scorer_options or "").split(",")
+                if kv),
         )
-        if args.compression_ea_epsilon is not None:
-            llm_kwargs["compression_ea_epsilon"] = args.compression_ea_epsilon
     llm = LLM(**llm_kwargs)
     sp = SamplingParams(temperature=0.0, max_tokens=args.max_tokens,
                         min_tokens=args.max_tokens, ignore_eos=True)
@@ -228,7 +225,7 @@ def run_config_in_subprocess(args: argparse.Namespace, run_ratio: float) -> dict
         "--_args-path", args_path,
         "--_result-path", out_path,
     ]
-    label = ("baseline (ratio 1.0, no compression)" if run_ratio >= 1.0
+    label = ("baseline (ratio 0, no compression)" if run_ratio <= 0.0
              else f"compressed (ratio {run_ratio})")
     print(f"\n>>> {label} ...", flush=True)
     proc = subprocess.run(cmd, env=_child_env())
@@ -253,11 +250,12 @@ def print_comparison(args: argparse.Namespace, base: dict, comp: dict) -> None:
     print(f" admission  scheduler_reserve_full_isl=ON (held constant)")
     print(line)
     print(f" {'configuration':<30}{'preemptions':>11}{'end-to-end':>13}{'throughput':>15}")
-    print(f" {'baseline (ratio 1.0)':<30}{base['preemptions']:>11}"
+    print(f" {'baseline (ratio 0)':<30}{base['preemptions']:>11}"
           f"{str(base['e2e_s']) + ' s':>13}{str(base['throughput_tok_s']) + ' tok/s':>15}")
     print(f" {'compressed (ratio ' + str(comp['ratio']) + ')':<30}{comp['preemptions']:>11}"
           f"{str(comp['e2e_s']) + ' s':>13}{str(comp['throughput_tok_s']) + ' tok/s':>15}")
-    print(f" compression scorer={args.compression_scorer} level={args.compression_level}")
+    print(f" compression scorer={args.compression_scorer} "
+          f"budget_scope={args.compression_budget_scope}")
     print(line)
     speedup = (base["e2e_s"] / comp["e2e_s"]) if comp["e2e_s"] else float("nan")
     print(f" → compression at ratio {comp['ratio']} removed "
@@ -288,7 +286,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--run-ratio", type=float, default=None,
         help="Run a SINGLE config at this ratio instead of the comparison. "
-             "1.0 = uncompressed baseline; < 1.0 = compressed.")
+             "0 = uncompressed baseline; > 0 = evict that fraction.")
     _add_compression_args(p)
     # Internal: worker writes its result JSON here / reads shared args from here.
     p.add_argument("--_result-path", default=None, help=argparse.SUPPRESS)
@@ -301,10 +299,10 @@ def _add_compression_args(p: argparse.ArgumentParser) -> None:
     orchestrator stays free of the heavy vLLM import."""
     g = p.add_argument_group("compression (prefill-with-eviction KV compression)")
     g.add_argument(
-        "--ratio", type=float, default=0.3,
-        help="KV cache budget as a ratio of the full cache, in (0, 1). This is "
-             "the compressed configuration compared against the ratio-1.0 "
-             "baseline. (The baseline ratio is always 1.0 and not configurable.)")
+        "--compression-ratio", type=float, default=0.7,
+        help="Fraction of the KV cache to evict, in (0, 1). This is the "
+             "compressed configuration compared against the ratio-0 baseline. "
+             "(The baseline evicts nothing and is not configurable.)")
     g.add_argument("--page-group-size", type=int, default=4)
     g.add_argument(
         "--head-group-cluster-map", type=str, default=None,
@@ -322,25 +320,12 @@ def _add_compression_args(p: argparse.ArgumentParser) -> None:
                  "expected_attention"],
         help="Score producer (axis 2). All but 'fastkvzip' are gate-free.")
     g.add_argument(
-        "--compression-level", default="perlayer_cluster",
-        choices=("crosslayer_head", "perlayer_head", "crosslayer_cluster",
-                 "perlayer_cluster", "uniform"),
-        help="Selection level (axis 1), named {scope}_{granularity}.")
-    g.add_argument("--compression-snap-window", type=int, default=32,
-                   help="SnapKV observation window (trailing queries).")
-    g.add_argument("--compression-snap-kernel", type=int, default=7,
-                   help="SnapKV max-pool1d smoothing kernel size (odd).")
-    g.add_argument("--compression-ea-use-covariance",
-                   action=argparse.BooleanOptionalAction, default=True,
-                   help="ExpectedAttention: add the query-covariance term.")
-    g.add_argument("--compression-ea-use-vnorm",
-                   action=argparse.BooleanOptionalAction, default=True,
-                   help="ExpectedAttention: reweight by the value norm.")
-    g.add_argument("--compression-ea-n-future-positions", type=int, default=512,
-                   help="ExpectedAttention: #future positions averaged.")
-    g.add_argument("--compression-ea-epsilon", type=float, default=None,
-                   help="ExpectedAttention: constant before value-norm "
-                        "reweighting; unset uses the engine default (1e-2).")
+        "--compression-budget-scope", default="layer",
+        choices=("uniform", "layer", "global"),
+        help="Scope the retention budget is balanced over (axis 1).")
+    g.add_argument("--compression-scorer-options", type=str, default="",
+                   help="Settings the selected scorer declares, as "
+                        "key=value,key=value (see the scorer's OPTIONS).")
 
 
 def main() -> None:
@@ -353,16 +338,17 @@ def main() -> None:
             for k, v in json.load(f).items():
                 setattr(args, k, v)
 
-    if not (0.0 < args.ratio < 1.0):
+    if not (0.0 < args.compression_ratio < 1.0):
         raise SystemExit(
-            f"--ratio must satisfy 0 < ratio < 1 (the compressed config), "
-            f"got {args.ratio}. The baseline is always ratio 1.0.")
+            f"--compression-ratio must satisfy 0 < ratio < 1 (the "
+            f"compressed config), "
+            f"got {args.compression_ratio}. The baseline is always ratio 0.")
 
     # Single-config (worker) mode.
     if args.run_ratio is not None:
-        if not (0.0 < args.run_ratio <= 1.0):
+        if not (0.0 <= args.run_ratio < 1.0):
             raise SystemExit(
-                f"--run-ratio must satisfy 0 < ratio <= 1, got {args.run_ratio}.")
+                f"--run-ratio must satisfy 0 <= ratio < 1, got {args.run_ratio}.")
         res = run_one(args, run_ratio=args.run_ratio)
         print(f"  result: {json.dumps(res)}")
         if args._result_path:
@@ -370,10 +356,10 @@ def main() -> None:
                 json.dump(res, f)
         return
 
-    # Comparison mode: run baseline (1.0) then compressed (args.ratio) in fresh
+    # Comparison mode: run baseline (0) then compressed (args.compression_ratio) in fresh
     # processes, then tabulate the speedup.
-    base = run_config_in_subprocess(args, 1.0)
-    comp = run_config_in_subprocess(args, args.ratio)
+    base = run_config_in_subprocess(args, 0.0)
+    comp = run_config_in_subprocess(args, args.compression_ratio)
     print_comparison(args, base, comp)
 
 

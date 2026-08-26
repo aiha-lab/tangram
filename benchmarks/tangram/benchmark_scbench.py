@@ -14,7 +14,7 @@ and answer metrics are provided self-contained by ``scbench_local`` (a sibling
 module in this directory), so no external FastKVZip checkout is required.
 
 Example:
-    python benchmark_scbench.py -d scbench_kv --num 100 --ratio 0.3 \\
+    python benchmark_scbench.py -d scbench_kv --num 100 --compression-ratio 0.7 \\
         -m Qwen/Qwen2.5-7B-Instruct-1M --max-model-len 200000 \\
         --single-turn --force-exact-tokens --max-tokens 512
 """
@@ -415,8 +415,11 @@ def run_dataset(
         "dataset": dataset_name,
         "model": args.model_path,
         "compression_algo": args.compression_scorer,
-        "compression_level": args.compression_level,
-        "ratio": args.ratio,
+        "compression_budget_scope": args.compression_budget_scope,
+        "ratio": args.compression_ratio,
+        # The evicted-fraction convention; result files predating the ratio
+        # inversion lack this field and read "ratio" as the kept fraction.
+        "ratio_semantics": "evicted",
         "page_group_size": args.page_group_size,
         "max_tokens": max_tokens,
         "num_samples": len(per_sample),
@@ -509,7 +512,7 @@ def main() -> None:
     def save_path_for(dataset_name: str) -> str:
         return os.path.join(
             args.output_dir, dataset_name,
-            f"{model_basename}_r{args.ratio}_pg{args.page_group_size}"
+            f"{model_basename}_r{args.compression_ratio}_pg{args.page_group_size}"
             f"{tag_suffix}.json",
         )
 
@@ -519,12 +522,12 @@ def main() -> None:
     if args.skip_existing:
         done = [d for d in dataset_names if os.path.exists(save_path_for(d))]
         if done:
-            print(f"[resume] ratio={args.ratio}: skipping {len(done)} existing "
+            print(f"[resume] ratio={args.compression_ratio}: skipping {len(done)} existing "
                   f"({', '.join(done)})")
         dataset_names = [d for d in dataset_names
                          if not os.path.exists(save_path_for(d))]
         if not dataset_names:
-            print(f"[resume] ratio={args.ratio}: all datasets done; "
+            print(f"[resume] ratio={args.compression_ratio}: all datasets done; "
                   "skipping model load.")
             return
 

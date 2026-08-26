@@ -6,18 +6,15 @@
 #   * natural EOS          — stop at EOS (no --force-exact-tokens)
 #   * per-dataset length   — output length from scbench_local.set_gen_length
 #
-# ratio=1.0 is the uncompressed reference; uniform vs non-uniform differ only
-# at ratio<1.0.
+# ratio=0 (evict nothing) is the uncompressed reference; uniform vs
+# non-uniform differ only at ratio>0.
 #
 # Select the method with two knobs:
 #   SCORER  = fastkvzip | snapkv | keydiff | streamingllm | tova | expected_attention
-#   LEVEL   = crosslayer_head (cross-layer global threshold, head-calibrated; default)
-#           | perlayer_head (per-layer threshold, AdaKV-style, head-calibrated;
-#             the validated pairing for SCORER=expected_attention)
-#           | crosslayer_cluster (cross-layer threshold, cluster-calibrated;
-#             exact budget, needs a global cluster map)
-#           | perlayer_cluster (per-layer threshold, cluster-calibrated;
-#             exact per-layer budget, needs a per-layer cluster map)
+#   SCOPE   = layer (per-layer budget, pooled across its head groups; default,
+#             needs a per-layer cluster map)
+#           | global (one budget pooled across all layers and head groups;
+#             needs a global cluster map)
 #           | uniform (same kept count per (layer, group))
 #   RESUME  = 1 (skip already-saved (dataset,ratio) cells) | 0 (recompute all)
 # Results land in results_accuracy/<scorer>_<selection>/ so methods stay separate.
@@ -42,19 +39,19 @@ PYTHON=${PYTHON:-python3}
 
 # ---- Method --------------------------------------------------------------
 SCORER=${SCORER:-snapkv}
-# Selection level (axis 1): crosslayer_head | perlayer_head | crosslayer_cluster
-# | perlayer_cluster | uniform.
-LEVEL=${LEVEL:-crosslayer_head}
+# Budget scope (axis 1): uniform | layer | global.
+SCOPE=${SCOPE:-layer}
 
 # ---- Sweep ---------------------------------------------------------------
 DATASET=${DATASET:-mid}
-RATIOS=${RATIOS:-"1.0 0.7 0.5 0.3"}
+RATIOS=${RATIOS:-"0.0 0.3 0.5 0.7"}
 NUM=${NUM:-100}
 MAX_NUM_SEQS=${MAX_NUM_SEQS:-16}
 
 # ---- Method-specific args ------------------------------------------------
-METHOD_ARGS=(--compression-scorer "${SCORER}" --compression-level "${LEVEL}")
-SELECTION="${LEVEL}"
+METHOD_ARGS=(--compression-scorer "${SCORER}"
+             --compression-budget-scope "${SCOPE}")
+SELECTION="${SCOPE}"
 
 # RESUME=1 skips (dataset, ratio) cells already saved under OUTPUT_DIR, so an
 # interrupted sweep continues with the same command (fully-done ratios skip the
@@ -73,10 +70,9 @@ case "${SCORER}" in
         fi
         ;;
     snapkv)
-        # Gate-free; identity adjacency (no cluster map).
+        # Gate-free; identity adjacency (no cluster map). SnapKV knobs travel
+        # through the generic channel: SCORER_OPTIONS="window=32,kernel=7".
         DEFAULT_PG=4
-        METHOD_ARGS+=(--compression-snap-window "${SNAP_WINDOW:-32}"
-                      --compression-snap-kernel "${SNAP_KERNEL:-7}")
         ;;
     keydiff)
         # Gate-free; identity adjacency (no cluster map).
@@ -99,6 +95,11 @@ case "${SCORER}" in
         exit 1
         ;;
 esac
+
+# Scorer-declared settings as key=value,key=value (see the scorer's OPTIONS).
+if [ -n "${SCORER_OPTIONS:-}" ]; then
+    METHOD_ARGS+=(--compression-scorer-options "${SCORER_OPTIONS}")
+fi
 
 # Head-group cluster map (applies to ANY scorer). The runner resolves a
 # per-scorer map and exports HEAD_GROUP_CLUSTER_MAP; a missing/sentinel path
@@ -125,7 +126,7 @@ for RATIO in ${RATIOS}; do
     CUDA_VISIBLE_DEVICES="${GPU_ID}" "$PYTHON" "${SCRIPT_DIR}/benchmark_scbench.py" \
         -d "${DATASET}" \
         --num "${NUM}" \
-        --ratio "${RATIO}" \
+        --compression-ratio "${RATIO}" \
         --max-num-seqs "${MAX_NUM_SEQS}" \
         --gpu-memory-utilization "${GPU_MEM_UTIL}" \
         --page-group-size "${PAGE_GROUP_SIZE}" \
@@ -159,7 +160,7 @@ for dp, _, files in os.walk(root):
 if not rows:
     print("(no results found under", root, ")")
     sys.exit(0)
-ratios = sorted(ratios, reverse=True)
+ratios = sorted(ratios)
 w = max(len(d) for d in rows)
 hdr = "  ".join(f"r{r:<6}" for r in ratios)
 print(f"{'dataset':<{w}}  {hdr}")
