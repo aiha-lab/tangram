@@ -311,8 +311,24 @@ class _SlotScoreStore(RegimeScoreStore):
             raise RuntimeError(
                 "BudgetRegime needs the per-slot score buffer, but the "
                 "workspace was built without one (slot_capacity == 0).")
-        # [num_layers, num_kv_heads, slot_capacity] — this row's slice.
-        self.buffer = workspace.stat_buffer[row]
+        # The workspace sized the buffer from the configuration; if the source
+        # actually installed keeps history while only the shared row was
+        # reserved, concurrent requests would silently overwrite each other's
+        # scores. Both answers come from the same rule, so a mismatch means the
+        # two were built from different configurations.
+        if (source.slots_persist_across_steps
+                and workspace.spec.slot_rows <= 1):
+            raise RuntimeError(
+                f"slot score source '{source.name}' keeps a slot's score "
+                f"between steps, but the workspace reserved "
+                f"{workspace.spec.slot_rows} row(s) for "
+                f"{workspace.spec.max_num_reqs} concurrent requests. The "
+                "workspace and the compressor were configured from different "
+                "compression_scorer / compression_slot_score_source values.")
+        # [num_layers, num_kv_heads, slot_capacity] — this request's slice,
+        # which is shared with every other request in the step unless the source
+        # keeps a slot's score between steps.
+        self.buffer = workspace.stat_buffer_for(row)
         self.capacity = self.buffer.shape[-1]
         self.source = source
         num_layers, num_kv_heads, _ = self.buffer.shape

@@ -171,6 +171,14 @@ class SlotScoreSource(ABC):
     #: forward pass and its buffer write are skipped entirely.
     needs_chunk_scores: bool
 
+    #: Whether a slot's score has to survive between forward steps. A source
+    #: that rewrites every live slot at each eviction carries no history, so one
+    #: buffer serves every request in a step; one that keeps what an earlier
+    #: chunk wrote needs a buffer per concurrent request. ``WorkspaceSpec``
+    #: reads this to size the buffer, which is the difference between reserving
+    #: it once and reserving it ``max_num_seqs`` times (see workspace.py).
+    slots_persist_across_steps: bool
+
     @abstractmethod
     def describe(self) -> str:
         """One sentence naming what this source computes, for the startup log.
@@ -200,6 +208,9 @@ class PersistedChunkScores(SlotScoreSource):
 
     name = "persist"
     needs_chunk_scores = True
+    # An earlier chunk's scores are the whole point: ``fill`` writes only the
+    # fresh chunk's slots and leaves the rest as they are.
+    slots_persist_across_steps = True
 
     def __init__(self, forced_over_recompute: bool = False) -> None:
         # True only when the scorer COULD have rescored the cache and the user
@@ -248,6 +259,9 @@ class RecomputedCacheScores(SlotScoreSource):
 
     name = "recompute"
     needs_chunk_scores = False
+    # ``fill`` rewrites every live slot from the cached keys and blanks the rest,
+    # so nothing a previous step left behind is ever read.
+    slots_persist_across_steps = False
 
     def __init__(self, scorer: nn.Module) -> None:
         self.scorer = scorer
@@ -340,15 +354,13 @@ def make_slot_score_source(
 
     The caller logs ``describe()`` if the active regime consumes the source.
     """
-    if source == SLOT_SCORE_SOURCE_AUTO:
-        return (RecomputedCacheScores(scorer) if _supports_recompute(scorer)
-                else PersistedChunkScores())
-    if source not in SLOT_SCORE_SOURCES:
+    if source != SLOT_SCORE_SOURCE_AUTO and source not in SLOT_SCORE_SOURCES:
         raise ValueError(
             f"slot score source must be one of {SLOT_SCORE_SOURCE_CHOICES}, "
             f"got {source!r}.")
-    if source == RecomputedCacheScores.name:
-        if not _supports_recompute(scorer):
+    supports_recompute = _supports_recompute(scorer)
+    if _source_class(supports_recompute, source) is RecomputedCacheScores:
+        if not supports_recompute:
             scorer_name = (getattr(scorer, "name", type(scorer).__name__)
                            if scorer is not None else "none")
             raise ValueError(
@@ -358,7 +370,8 @@ def make_slot_score_source(
                 f"'{scorer_name}'. Use 'auto', or pick a scorer from "
                 "scorer.RESCORING_QK_SCORERS.")
         return RecomputedCacheScores(scorer)
-    forced_over_recompute = _supports_recompute(scorer)
+    forced_over_recompute = (supports_recompute
+                            and source != SLOT_SCORE_SOURCE_AUTO)
     if forced_over_recompute:
         logger.warning(
             "KV budget eviction: slot score source forced to 'persist' while "
@@ -367,3 +380,41 @@ def make_slot_score_source(
             "the scorer specifies — this setting is for ablations, not for "
             "serving. Unset --compression-slot-score-source to restore 'auto'.")
     return PersistedChunkScores(forced_over_recompute=forced_over_recompute)
+
+
+def _source_class(
+    supports_recompute: bool,
+    source: str,
+) -> type[SlotScoreSource]:
+    """The source-selection RULE, in one place: ``auto`` takes recompute exactly
+    when the scorer can rescore the cache, and an explicit name is taken as
+    given. Both entry points below go through it, so the choice cannot drift
+    between the one that builds the source and the one that sizes its memory."""
+    if source == SLOT_SCORE_SOURCE_AUTO:
+        return (RecomputedCacheScores if supports_recompute
+                else PersistedChunkScores)
+    return (RecomputedCacheScores if source == RecomputedCacheScores.name
+            else PersistedChunkScores)
+
+
+def slot_scores_persist_across_steps(scorer: str, source: str) -> bool:
+    """Whether the slot score buffer needs one row per concurrent request,
+    answered from the configuration alone.
+
+    The workspace is allocated inside ``load_model``, before any scorer is
+    installed, so the size cannot be asked of the source object. It does not
+    have to be: whether a scorer can rescore the cache is a property of its
+    CLASS (``QKScorer.rescores_cache``, published as
+    ``scorer.RESCORING_QK_SCORERS``), and the selection rule is shared with
+    :py:func:`make_slot_score_source` via ``_source_class``.
+
+    ``scorer`` is the ``compression_scorer`` value; the checkpoint-backed
+    ``"fastkvzip"`` gate is not a rescoring scorer, and neither is any name
+    outside the registry, so both answer True (persist).
+    """
+    # Imported here rather than at module scope: the registry pulls in every
+    # scorer implementation, while this module is also imported by config
+    # validation.
+    from vllm.v1.attention.compression.scorer import RESCORING_QK_SCORERS
+    cls = _source_class(scorer in RESCORING_QK_SCORERS, source)
+    return cls.slots_persist_across_steps

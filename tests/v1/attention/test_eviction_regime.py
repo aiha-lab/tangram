@@ -59,6 +59,8 @@ def make_compressor(
     n_sink_tokens: int = 4,
     evict_current_chunk: bool = False,
     max_num_reqs: int = 2,
+    scorer: str = "snapkv",
+    slot_score_source: str = "auto",
 ) -> KVCompressor:
     spec = WorkspaceSpec.from_config(
         num_layers=NUM_LAYERS,
@@ -73,7 +75,8 @@ def make_compressor(
         n_sink_tokens=n_sink_tokens,
         budget_tokens=budget if regime == "budget" else None,
         evict_current_chunk=evict_current_chunk,
-        scorer="snapkv",
+        scorer=scorer,
+        slot_score_source=slot_score_source,
     )
     workspace = CompressionWorkspace(spec, torch.device("cpu"))
     compressor = KVCompressor(
@@ -88,6 +91,7 @@ def make_compressor(
         workspace=workspace,
         budget_scope=budget_scope,
         regime=regime,
+        slot_score_source=slot_score_source,
     )
     compressor.set_cluster_map(None)
     return compressor

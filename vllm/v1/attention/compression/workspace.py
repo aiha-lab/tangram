@@ -45,6 +45,9 @@ import torch
 
 from vllm.logger import init_logger
 from vllm.v1.attention.compression.scorer import QK_SCORERS
+from vllm.v1.attention.compression.slot_scores import (
+    slot_scores_persist_across_steps,
+)
 
 if TYPE_CHECKING:
     from vllm.config.cache import CacheConfig
@@ -75,6 +78,11 @@ class WorkspaceSpec:
     #: Widest live cache length per (layer, group); 0 when the regime keeps no
     #: per-position statistics (the ratio regime).
     slot_capacity: int
+    #: Rows of per-position statistics to reserve: ``max_num_reqs`` when the
+    #: score source keeps a slot's score between steps, 1 when it rewrites every
+    #: live slot at each eviction (then one buffer serves the whole step, like
+    #: the shared tensors above), 0 when there are no statistics at all.
+    slot_rows: int
     #: dtype the active scorer produces. Held exactly, not coerced: the gate
     #: (FastKVZip) emits the model dtype while the query/key scorers emit
     #: float32, and rounding either way would change the keep decision.
@@ -104,6 +112,7 @@ class WorkspaceSpec:
             budget_tokens=cache_config.compression_budget_tokens,
             evict_current_chunk=cache_config.compression_evict_current_chunk,
             scorer=cache_config.compression_scorer,
+            slot_score_source=cache_config.compression_slot_score_source,
         )
 
     @staticmethod
@@ -121,6 +130,7 @@ class WorkspaceSpec:
         budget_tokens: int | None,
         evict_current_chunk: bool,
         scorer: str,
+        slot_score_source: str,
     ) -> "WorkspaceSpec":
         """Derive the shapes from the cache configuration.
 
@@ -145,6 +155,7 @@ class WorkspaceSpec:
         if budget_tokens is None:
             eval_capacity = chunk_size
             slot_capacity = 0
+            slot_rows = 0
         else:
             effective_budget = min(int(budget_tokens), int(max_model_len))
             slot_capacity = effective_budget + chunk_size
@@ -152,6 +163,15 @@ class WorkspaceSpec:
                              if evict_current_chunk
                              else effective_budget - n_sink_tokens)
             eval_capacity = max(eval_capacity, 0)
+            # A source that recomputes every live slot's score at each eviction
+            # holds nothing between steps, so it needs one buffer and not one
+            # per concurrent request — the difference is the largest term in the
+            # whole reservation. Decided from the two knobs because the scorer
+            # is installed after this runs (see slot_scores.py).
+            slot_rows = (max_num_reqs
+                         if slot_scores_persist_across_steps(
+                             scorer, slot_score_source)
+                         else 1)
         # Query/key scorers promote to float32 for a stable reduction; the
         # checkpoint-backed gate scores in the model dtype.
         score_dtype = (torch.float32
@@ -166,6 +186,7 @@ class WorkspaceSpec:
             window_size=window_size,
             eval_capacity=eval_capacity,
             slot_capacity=slot_capacity,
+            slot_rows=slot_rows,
             score_dtype=score_dtype,
         )
 
@@ -244,11 +265,28 @@ class CompressionWorkspace:
         self.valid_lengths = torch.zeros(
             num_rows, num_layers, num_groups, dtype=torch.long, device=device)
         # Per-position statistics in cache-slot coordinates (budget regime).
+        # ``slot_rows`` is ``num_rows`` only when the score source keeps a
+        # slot's score between steps; otherwise one buffer is shared, and
+        # ``stat_buffer_for`` hands every request the same row.
         self.stat_buffer: torch.Tensor | None = (
             torch.empty(
-                num_rows, num_layers, num_kv_heads, spec.slot_capacity,
+                spec.slot_rows, num_layers, num_kv_heads, spec.slot_capacity,
                 dtype=dtype, device=device)
-            if spec.slot_capacity > 0 else None)
+            if spec.slot_capacity > 0 and spec.slot_rows > 0 else None)
+
+    def stat_buffer_for(self, row: int) -> torch.Tensor:
+        """This request's slice of the per-position statistics.
+
+        A source that rewrites every live slot at each eviction shares one
+        slice with every other request in the step (the values never outlive the
+        request loop's iteration); one that keeps history gets its own row.
+        """
+        if self.stat_buffer is None:
+            raise RuntimeError(
+                "stat_buffer_for: the workspace was built without per-position "
+                "statistics (slot_capacity == 0), so no regime may ask for "
+                "them.")
+        return self.stat_buffer[row if self.spec.slot_rows > 1 else 0]
 
     # ------------------------------------------------------------------ rows
     def acquire_row(self) -> int:
@@ -273,15 +311,19 @@ class CompressionWorkspace:
     # ------------------------------------------------------------- reporting
     @property
     def shared_bytes(self) -> int:
-        return sum(t.numel() * t.element_size() for t in (
-            self.staging, self.eval_scores, self.rank_scores,
-            self.sorted_index))
+        tensors = [self.staging, self.eval_scores, self.rank_scores,
+                   self.sorted_index]
+        # The statistics are shared exactly when they hold nothing between
+        # steps, so they are reported under the lifetime they actually have.
+        if self.stat_buffer is not None and self.spec.slot_rows <= 1:
+            tensors.append(self.stat_buffer)
+        return sum(t.numel() * t.element_size() for t in tensors)
 
     @property
     def per_row_bytes(self) -> int:
         tensors = [self.pending_score, self.prior_window,
                    self.locked, self.valid_lengths]
-        if self.stat_buffer is not None:
+        if self.stat_buffer is not None and self.spec.slot_rows > 1:
             tensors.append(self.stat_buffer)
         return sum(t.numel() * t.element_size() for t in tensors)
 
@@ -297,13 +339,13 @@ class CompressionWorkspace:
         logger.info(
             "KV compression workspace reserved %.1f MiB "
             "(shared %.1f MiB, %d rows x %.1f MiB): eval_capacity=%d, "
-            "slot_capacity=%d, chunk=%d, score dtype=%s.",
+            "slot_capacity=%d (%d rows), chunk=%d, score dtype=%s.",
             self.reserved_bytes / _MIB,
             self.shared_bytes / _MIB,
             spec.max_num_reqs,
             self.per_row_bytes / max(spec.max_num_reqs, 1) / _MIB,
-            spec.eval_capacity, spec.slot_capacity, spec.chunk_size,
-            spec.score_dtype)
+            spec.eval_capacity, spec.slot_capacity, spec.slot_rows,
+            spec.chunk_size, spec.score_dtype)
         if self.reserved_bytes > 1024 * _MIB:
             logger.warning(
                 "The KV compression workspace reserves %.2f GiB, which is "
