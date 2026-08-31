@@ -216,23 +216,15 @@ def add_engine_args(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument(
         "--num-gpu-blocks-override", type=int, default=None,
-        help=(
-            "Fix the KV cache at this many blocks instead of profiling for it. "
-            "A pool too small to hold every admitted request forces the "
-            "scheduler to preempt, which is otherwise hard to reach under "
-            "compression because a budget caps each request's KV."
-        ),
+        help="Fix the KV cache at this many blocks instead of profiling for "
+             "it. A pool too small to hold every admitted request forces "
+             "preemption, otherwise hard to reach under compression.",
     )
     parser.add_argument(
         "--max-num-batched-tokens", type=int, default=None,
-        help=(
-            "Cap on prefill tokens batched into one forward step (vLLM "
-            "chunked-prefill knob). Leave unset for vLLM's default. Set it "
-            ">= the input length to force a SINGLE-SHOT prefill (no sub-"
-            "chunking), so the scorer sees the whole context at once -- "
-            "needed to match the kvpress one-shot reference for "
-            "ExpectedAttention."
-        ),
+        help="Prefill tokens per forward step. Set >= the input length for a "
+             "SINGLE-SHOT prefill, which is what matches the kvpress "
+             "one-shot reference.",
     )
     parser.add_argument(
         "--attention-backend", type=str, default="FLASH_ATTN",
@@ -275,55 +267,37 @@ def add_compression_args(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument(
         "--compression-budget-tokens", type=int, default=None,
-        help=(
-            "Fixed KV cache budget in tokens per (layer, head group). "
-            "Mutually exclusive with --compression-ratio: setting it selects the "
-            "budget eviction regime, where nothing is evicted until the cache "
-            "would exceed the budget and it is then cut back to it. "
-            "--compression-ratio is ignored when a budget is given."
-        ),
+        help="Fixed KV budget in tokens per (layer, head group), and the "
+             "budget regime: nothing is evicted until the cache would exceed "
+             "it. Takes precedence over --compression-ratio.",
     )
     parser.add_argument(
         "--compression-evict-current-chunk", action="store_true",
-        help=(
-            "Budget regime only: let the chunk just written compete for "
-            "eviction, protecting only the always-kept recent window. Off by "
-            "default, which protects the whole fresh chunk and is the more "
-            "accurate setting in our measurements."
-        ),
+        help="Budget regime only: let the chunk just written compete for "
+             "eviction. Off (protecting the whole fresh chunk) measured "
+             "better.",
     )
     parser.add_argument(
         "--compression-slot-score-source", type=str, default="auto",
         choices=("auto", "persist", "recompute"),
-        help=(
-            "Budget regime only: where a cached position's score comes from "
-            "when it competes again. 'auto' (default) takes what the scorer "
-            "specifies. Forcing 'persist' with a rescoring scorer (keydiff) is "
-            "the ablation that separates the retention target from the score: "
-            "it ranks the chunk-local scores a ratio run also ranks, so what "
-            "remains between a ratio and a budget run is the target alone."
-        ),
+        help="Budget regime only: where a cached position's score comes "
+             "from when it competes again. 'auto' takes what the scorer "
+             "specifies; forcing 'persist' holds the score a ratio run would "
+             "rank, which is the ablation separating target from score.",
     )
     parser.add_argument(
         "--compression-scorer-options", type=str, default="",
-        help=(
-            "Settings the selected --compression-scorer declares, as "
-            "key=value,key=value (see the scorer's OPTIONS). Example: "
-            "--compression-scorer keydiff --compression-scorer-options "
-            "anchor=normalized to rank by KeyDiff Eq. (8)'s normalized anchor "
-            "instead of the unnormalized mean its experiments use."
-        ),
+        help="Settings the selected scorer declares, key=value,key=value "
+             "(see its OPTIONS). Example: anchor=normalized for KeyDiff "
+             "Eq.(8) as written, instead of the mean its experiments use.",
     )
     parser.add_argument("--page-group-size", type=int, default=4)
     parser.add_argument(
         "--head-group-cluster-map", type=str, default=None,
-        help=(
-            "Path to a head-group cluster map .npz (see "
-            "tools/head_group_clustering). None = identity (adjacent-head) "
-            "grouping. A cross-layer map groups similar-budget heads so the "
-            "per-cluster max-pooled kept length approaches each member's need, "
-            "reducing KV memory."
-        ),
+        help="Cluster map .npz (tools/head_group_clustering); None = "
+             "identity (adjacent-head) grouping. Grouping similar-budget "
+             "heads brings the shared kept length closer to each member's "
+             "need.",
     )
     parser.add_argument("--compression-gate-path", type=str, default="fastkvzip")
     parser.add_argument("--compression-chunk-size", type=int, default=8192)
@@ -341,23 +315,16 @@ def add_compression_args(parser: argparse.ArgumentParser) -> None:
         "--compression-scorer", type=str, default="fastkvzip",
         choices=["fastkvzip", "snapkv", "keydiff", "streamingllm", "tova",
                  "expected_attention"],
-        help="Score producer (axis 2). All but 'fastkvzip' are gate-free (no "
-             "checkpoint); scores come from the model's post-RoPE query/key "
-             "per chunk (SnapKV: observation-window attention; KeyDiff: key "
-             "similarity to the chunk mean key; StreamingLLM: token recency / "
-             "global position; TOVA: last-query attention averaged across "
-             "heads; ExpectedAttention: analytic expected attention of future "
-             "queries with optional covariance + value-norm).",
+        help="Score producer (axis 2). All but 'fastkvzip' are gate-free "
+             "and score from the model's post-RoPE query/key per chunk.",
     )
     parser.add_argument(
         "--compression-budget-scope", default="layer",
         choices=("uniform", "layer", "global"),
         help="Scope the retention budget is balanced over (axis 1). "
-             "'layer' (default): each layer gets an equal budget, pooled "
-             "non-uniformly across its head groups (needs a per-layer cluster "
-             "map). 'global': one budget pooled across all layers and head "
-             "groups (needs a global cluster map). 'uniform': every "
-             "(layer, group) keeps the same count.",
+             "'layer' pools across the head groups within each layer, "
+             "'global' across every layer too (both need a matching cluster "
+             "map, TP=1 only); 'uniform' gives every group the same count.",
     )
 
 
@@ -378,19 +345,16 @@ def build_llm(args: argparse.Namespace) -> LLM:
             f"satisfy 0 <= ratio < 1, got {args.compression_ratio}."
         )
 
-    # LLM defaults disable_log_stats=True, leaving RequestOutput.metrics None;
-    # we derive throughput from elapsed time + token counts. --enable-log-stats
-    # turns the metrics back on.
+    # LLM defaults disable_log_stats=True, so RequestOutput.metrics is None
+    # and throughput comes from elapsed time + token counts.
     llm_kwargs: dict[str, Any] = {
         "model": args.model_path,
         "dtype": "auto",
         "tensor_parallel_size": args.tensor_parallel_size,
         "trust_remote_code": True,
         "gpu_memory_utilization": args.gpu_memory_utilization,
-        # TANGRAM_GRAPH=1 runs the engine in its compiled mode (VLLM_COMPILE
-        # + CUDA graphs; ragged runs are pinned to PIECEWISE at config
-        # time). Default stays eager so existing sweep results remain
-        # directly comparable.
+        # TANGRAM_GRAPH=1 runs the compiled mode. Default eager, so existing
+        # sweep results stay comparable.
         "enforce_eager": os.environ.get("TANGRAM_GRAPH", "0") != "1",
         "max_model_len": args.max_model_len,
         "enable_prefix_caching": args.enable_prefix_caching,
@@ -398,9 +362,8 @@ def build_llm(args: argparse.Namespace) -> LLM:
         "disable_custom_all_reduce": args.disable_custom_all_reduce,
         "page_group_size": args.page_group_size,
         "head_group_cluster_map": args.head_group_cluster_map,
-        # Multi-turn auto-advance is needed only by the SCBench driver; RULER is
-        # single-turn. The engine flag is harmless when no multi-turn token IDs
-        # are passed to generate(), so it defaults on for backward-compatibility.
+        # Only the SCBench driver needs it, and it is inert without
+        # multi-turn token IDs, so it defaults on.
         "multi_turn": getattr(args, "multi_turn", True),
     }
     if args.max_num_seqs is not None:

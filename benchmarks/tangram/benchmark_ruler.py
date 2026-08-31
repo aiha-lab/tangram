@@ -1,20 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""
-Offline RULER benchmark for Tangram on vLLM.
+"""Offline RULER benchmark for Tangram on vLLM — answer quality under
+compression, plus the SCBench driver's latency/throughput aggregates.
 
-Measures answer quality (and the same latency/throughput aggregates as the
-SCBench driver) on RULER synthetic long-context tasks while sweeping the
-FastKVZip compression ratio. RULER is single-turn: each sample is one
-context+question prompt scored against its gold items with RULER's string-match
-metric (recall for retrieval/tracking/extraction, any-match for QA).
+Single-turn: each sample is one context+question prompt, scored with RULER's
+string-match metric (recall for retrieval/tracking/extraction, any-match for
+QA). Engine construction and reporting are shared with benchmark_scbench.py via
+``bench_common``; data and scoring come from ``ruler_local`` (the preprocessed
+``simonjegou/ruler`` parquets).
 
-The engine construction, compression knobs, and latency/throughput reporting are
-shared with benchmark_scbench.py via ``bench_common``. RULER data loading, prompt
-assembly, and scoring are provided self-contained by ``ruler_local`` (the
-preprocessed ``simonjegou/ruler`` parquets; no external RULER checkout required).
-
-Example:
     python benchmark_ruler.py --length 4096 --num 50 --compression-ratio 0.7 \\
         -m Qwen/Qwen3-4B-Instruct-2507 --max-model-len 40960
 """
@@ -292,10 +286,9 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--tag", type=str, default="")
     parser.add_argument(
         "--skip-existing", action="store_true",
-        help="Resume mode: skip any task whose result JSON already exists for "
-             "this (length, ratio, page_group). If every task is already done, "
-             "the model is not loaded. Lets an interrupted sweep be re-run with "
-             "the same command to fill only the missing cells.",
+        help="Skip tasks whose result JSON already exists, so an interrupted "
+             "sweep re-run with the same command fills only the missing "
+             "cells. Nothing pending skips the model load too.",
     )
 
     return parser
