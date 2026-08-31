@@ -3584,8 +3584,20 @@ class GPUModelRunner(
         # Build compressor + executor and wire per-layer scorers before
         # cudagraph wrapping, so the gate scorer's forward override lands on
         # the plain ``nn.Module`` instances rather than the graph wrapper.
+        #
+        # What it allocates is added to ``model_memory_usage`` because that is
+        # the only way the KV cache pool can see it: the pool is sized from the
+        # weights plus the memory increase measured DURING the profile run
+        # (``GPUWorker.determine_available_memory``), and this allocation
+        # happens between the two — persistent, so not an increase, and after
+        # the weights were measured. Left out, the pool is sized as if the
+        # workspace were free and overshoots the utilization budget by its size.
+        # Measured rather than taken from the reservation figure so that a
+        # scorer's own weights (the FastKVZip gate checkpoint) count too.
         if self.cache_config.compression_enabled:
-            self._init_compression()
+            with DeviceMemoryProfiler() as compression_mem:
+                self._init_compression()
+            self.model_memory_usage += compression_mem.consumed_memory
 
         mm_config = self.model_config.multimodal_config
         self.is_multimodal_pruning_enabled = (

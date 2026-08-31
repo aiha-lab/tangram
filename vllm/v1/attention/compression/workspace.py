@@ -8,11 +8,13 @@ engine. Nothing in the compression path allocates a decision-sized tensor while
 requests are in flight. This matters for two reasons:
 
 * The worker profiles peak memory AFTER ``load_model`` and sizes the KV cache
-  pool with whatever is left (``GPUWorker.determine_available_memory``). This
-  workspace is built inside ``load_model``, so the profile SEES it and the pool
-  shrinks accordingly. A budget or concurrency too large for the device then
-  fails at startup, with the reservation printed, instead of surviving startup
-  and hitting an out-of-memory error mid-generation.
+  pool with whatever is left (``GPUWorker.determine_available_memory``). That
+  figure counts the weights plus the increase measured during the profile run,
+  so this workspace — allocated between the two — is added to the weights term
+  by its caller (``GPUModelRunner.load_model``) and the pool shrinks by it. A
+  budget or concurrency too large for the device then fails at startup, with the
+  reservation printed, instead of surviving startup and hitting an
+  out-of-memory error mid-generation.
 * Growing per-request buffers on demand would scale with how many requests
   happen to be mid-prefill — a quantity no startup check can bound. Splitting
   the memory into "shared, reused within a step" and "one row per concurrent
