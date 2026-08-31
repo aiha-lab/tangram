@@ -635,3 +635,54 @@ def test_sizing_and_construction_agree_on_the_source(scorer_name, source):
     built = make_slot_score_source(scorers[scorer_name], source)
     assert (slot_scores_persist_across_steps(scorer_name, source)
             is built.slots_persist_across_steps)
+
+
+def _slot_store(scorer: str, source: str):
+    """A budget-regime score store wired to the workspace it was sized for."""
+    from vllm.v1.attention.compression.eviction_regime import BudgetRegime
+    workspace = _workspace(scorer, source, max_num_reqs=2)
+    scorers = {
+        "keydiff": KeyDiffScorer(
+            num_kv_heads=NUM_KV_HEADS, head_size=HEAD_SIZE),
+        "snapkv": SnapKVScorer(
+            num_kv_heads=NUM_KV_HEADS, num_q_per_kv=2, head_size=HEAD_SIZE,
+            window=8, kernel=3),
+    }
+    member_to_cluster, cluster_members = identity_cluster_maps()
+    store = BudgetRegime().create_store(
+        workspace, 0, member_to_cluster,
+        torch.from_numpy(cluster_members),
+        make_slot_score_source(scorers[scorer], source))
+    return store
+
+
+def test_score_bookkeeping_is_skipped_when_nothing_is_remembered():
+    """``reset`` and ``compact_cluster`` exist to protect history. A recomputing
+    source has none - and its buffer is shared, so clearing it on one request's
+    arrival would blank what another is using."""
+    marker = 7.0
+
+    recomputing = _slot_store("keydiff", "auto")
+    recomputing.buffer.fill_(marker)
+    recomputing.reset()
+    assert torch.all(recomputing.buffer == marker), (
+        "a shared buffer must not be cleared per request")
+    recomputing.compact_cluster(
+        0, torch.zeros(PAGE_GROUP_SIZE, 4, dtype=torch.long), 4)
+    assert torch.all(recomputing.buffer == marker), (
+        "compaction of scores nothing will read is wasted work")
+
+    # The persisting source keeps history, so both still run.
+    persisting = _slot_store("snapkv", "auto")
+    persisting.buffer.fill_(marker)
+    persisting.reset()
+    assert torch.all(persisting.buffer == persisting.neg_inf), (
+        "a reused row must not start with the previous request's scores")
+    persisting.buffer[:, :, :4] = torch.tensor([1.0, 2.0, 3.0, 4.0])
+    persisting.compact_cluster(
+        0, torch.zeros(PAGE_GROUP_SIZE, 2, dtype=torch.long), 2)
+    members = identity_cluster_maps()[1][0]
+    flat = persisting.buffer.view(NUM_LAYERS * NUM_KV_HEADS, -1)
+    assert torch.all(flat[members, :2] == 1.0), "kept slots follow the KV"
+    assert torch.all(flat[members, 2:] == persisting.neg_inf), (
+        "an evicted position's score dies with its KV")

@@ -342,6 +342,12 @@ class _SlotScoreStore(RegimeScoreStore):
         self._num_groups = self._cluster_members_cpu.shape[0] // num_layers
 
     def reset(self) -> None:
+        # Only history has to be cleared. A source that rewrites every live slot
+        # at each eviction leaves no readable value behind, and the buffer it
+        # writes into is shared, so filling it here would blank what another
+        # request in this step is about to use.
+        if not self.source.slots_persist_across_steps:
+            return
         self.buffer.fill_(self.neg_inf)
 
     def build_eval_scores(
@@ -397,6 +403,12 @@ class _SlotScoreStore(RegimeScoreStore):
         keep_positions: torch.Tensor,
         kept_length: int,
     ) -> None:
+        # Following the KV only matters for a score that will be read again. A
+        # recomputing source rebuilds every live slot at the next eviction and
+        # blanks the rest, so gathering and blanking here would be undone
+        # before anything could read it.
+        if not self.source.slots_persist_across_steps:
+            return
         rows = self._cluster_members_cpu[cluster_id]
         if (rows < 0).any():
             if (rows < 0).all():
