@@ -423,6 +423,9 @@ def run_dataset(
         # so a result file that omitted them could not be compared later.
         "scorer_options": args.compression_scorer_options,
         "compression_chunk_size": args.compression_chunk_size,
+        "compression_window_size": args.compression_window_size,
+        "compression_floor_min": args.compression_floor_min,
+        "compression_n_sink_tokens": args.compression_n_sink_tokens,
         "page_group_size": args.page_group_size,
         "max_tokens": max_tokens,
         "num_samples": len(per_sample),
