@@ -46,6 +46,9 @@ import numpy as np
 import torch
 
 from vllm.logger import init_logger
+from vllm.v1.attention.compression.budget_scope import (
+    POOLED_BUDGET_SCOPES,
+)
 from vllm.v1.attention.compression.scorer import QK_SCORERS
 from vllm.v1.attention.compression.slot_scores import (
     slot_scores_persist_across_steps,
@@ -80,6 +83,19 @@ class WorkspaceSpec:
     #: Widest live cache length per (layer, group); 0 when the regime keeps no
     #: per-position statistics (the ratio regime).
     slot_capacity: int
+    #: Most a single (layer, group) may be left holding after a keep decision;
+    #: 0 under the ratio regime. Equals ``budget`` when the budget scope holds
+    #: every entry to it, and ``max_model_len`` when the scope pools the budget
+    #: over a span — one entry may then take the whole span, so only the
+    #: physical limit bounds it. The keep decision
+    #: reads it back as the per-entry ceiling, so the buffer width and the
+    #: decision cannot disagree.
+    per_group_capacity: int
+    #: Budget scope ``per_group_capacity`` was derived from. Held so the
+    #: compressor can refuse a scope the workspace was not sized for: pairing a
+    #: pooling scope with a ``uniform``-sized buffer does not raise, it just
+    #: silently caps every entry at ``budget`` again.
+    budget_scope: str
     #: Rows of per-position statistics to reserve: ``max_num_reqs`` when the
     #: score source keeps a slot's score between steps, 1 when it rewrites every
     #: live slot at each eviction (then one buffer serves the whole step, like
@@ -113,6 +129,7 @@ class WorkspaceSpec:
             n_sink_tokens=cache_config.compression_n_sink_tokens,
             budget_tokens=cache_config.compression_budget_tokens,
             evict_current_chunk=cache_config.compression_evict_current_chunk,
+            budget_scope=cache_config.compression_budget_scope,
             scorer=cache_config.compression_scorer,
             slot_score_source=cache_config.compression_slot_score_source,
         )
@@ -133,6 +150,7 @@ class WorkspaceSpec:
         evict_current_chunk: bool,
         scorer: str,
         slot_score_source: str,
+        budget_scope: str = "uniform",
     ) -> "WorkspaceSpec":
         """Derive the shapes from the cache configuration.
 
@@ -144,26 +162,47 @@ class WorkspaceSpec:
         fresh chunk, addressed in a ``window + chunk`` staging buffer, so it can
         never exceed one chunk. No per-position statistics are kept.
 
-        Budget regime — the keep decision caps every (layer, group) at
-        ``budget``, so the live length before the next eviction is at most
-        ``budget + chunk``. A budget at or above ``max_model_len`` can never
-        trigger eviction, so the live length is bounded by the model length
-        instead and the capacity is clamped to it. The eval region is the live
-        cache minus the sink and the protected tail: with the fresh chunk
-        protected the two chunk terms cancel and it is at most
-        ``budget - sink``; with only the recent window protected the chunk stays
-        in and it is at most ``budget + chunk - sink``.
+        Budget regime — the keep decision holds every (layer, group) to
+        ``per_group_capacity``, so the live length before the next eviction is
+        at most ``per_group_capacity + chunk``. That capacity is ``budget``
+        under a scope that caps each entry (``uniform``) and ``max_model_len``
+        under a scope that POOLS the budget over a span (``layer`` /
+        ``global``): there the threshold deliberately gives strong groups more
+        than ``budget`` and weak ones less, only the span's TOTAL is held, and
+        nothing stops one entry from taking the whole span — so the ceiling
+        is the physical one, the most positions the model can see. Sizing
+        for that is what keeps the reservation from deciding the outcome. Under
+        ``uniform`` a budget at or above ``max_model_len`` can never trigger
+        eviction, so the live length is bounded by the model length there too
+        and the capacity is clamped to it.
+
+        The eval region is the live cache minus the sink and the protected
+        tail: with the fresh chunk protected the two chunk terms
+        cancel and it is at most ``per_group_capacity - sink``; with only the
+        recent window protected the chunk stays in and it is at most
+        ``per_group_capacity + chunk - sink``.
         """
         if budget_tokens is None:
             eval_capacity = chunk_size
             slot_capacity = 0
             slot_rows = 0
+            per_group_capacity = 0
         else:
-            effective_budget = min(int(budget_tokens), int(max_model_len))
-            slot_capacity = effective_budget + chunk_size
+            # A pooling scope holds only its span's TOTAL, so nothing in the
+            # keep decision stops one entry from taking the whole span. The
+            # only ceiling that is not an arbitrary choice is the physical one
+            # — a (layer, group) can never hold more positions than the model
+            # can see — so the buffers are sized for that and the reservation
+            # never decides the outcome. ``uniform`` keeps the tight
+            # ``budget``: there every entry is held to it one by one.
+            per_group_capacity = int(max_model_len)
+            if budget_scope not in POOLED_BUDGET_SCOPES:
+                per_group_capacity = min(
+                    int(budget_tokens), per_group_capacity)
+            slot_capacity = per_group_capacity + chunk_size
             eval_capacity = (slot_capacity - n_sink_tokens
                              if evict_current_chunk
-                             else effective_budget - n_sink_tokens)
+                             else per_group_capacity - n_sink_tokens)
             eval_capacity = max(eval_capacity, 0)
             # A source that recomputes every live slot's score at each eviction
             # holds nothing between steps, so it needs one buffer and not one
@@ -188,6 +227,8 @@ class WorkspaceSpec:
             window_size=window_size,
             eval_capacity=eval_capacity,
             slot_capacity=slot_capacity,
+            per_group_capacity=per_group_capacity,
+            budget_scope=budget_scope,
             slot_rows=slot_rows,
             score_dtype=score_dtype,
         )

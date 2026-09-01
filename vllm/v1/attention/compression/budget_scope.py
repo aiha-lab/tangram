@@ -62,6 +62,16 @@ class BudgetScope(ABC):
     #: pairing the wrong map is silently incorrect.
     cluster_map_scope: str | None = None
 
+    #: Range the retention budget is POOLED over — the set of (layer, group)
+    #: entries that share ONE total: ``"layer"`` (the groups of one layer),
+    #: ``"global"`` (every group of every layer), or ``None`` (no pooling —
+    #: each entry holds its own budget). The scope owns this because it is the
+    #: same range its threshold spans; the keep decision reads it to know which
+    #: entries to apportion together, and a pooling scope may NOT have its
+    #: entries capped at ``budget`` one by one (that would forbid exactly the
+    #: imbalance the threshold exists to create).
+    pooled_span: str | None = None
+
     @abstractmethod
     def compute_counts(
         self,
@@ -163,6 +173,7 @@ class GlobalScope(_ClusterCalibratedScope):
 
     name = "global"
     cluster_map_scope = "global"
+    pooled_span = "global"
 
     def _counts_from_cluster_scores(
         self,
@@ -197,6 +208,7 @@ class LayerScope(_ClusterCalibratedScope):
 
     name = "layer"
     cluster_map_scope = "per_layer"
+    pooled_span = "layer"
 
     def _counts_from_cluster_scores(
         self,
@@ -221,7 +233,12 @@ class UniformScope(BudgetScope):
     same ``floor(adjusted_ratio * eval_len)``. The shared POSITION ranking still
     lets each head keep its OWN top-``k`` positions, so only the count is
     uniform. Because the count and the chunk geometry are shared, every
-    (layer, group)'s ``kept_lengths`` stays identical chunk after chunk."""
+    (layer, group)'s ``kept_lengths`` stays identical chunk after chunk.
+
+    ``pooled_span`` stays ``None``: every entry gets the same count, so
+    "each entry within ``budget``" and "the span's total within
+    ``groups x budget``" are the same constraint, and the cheaper per-entry
+    form is kept."""
 
     name = "uniform"
 
@@ -259,6 +276,14 @@ BUDGET_SCOPES: tuple[str, ...] = tuple(_SCOPES)
 TP1_ONLY_BUDGET_SCOPES: frozenset[str] = frozenset(
     name for name, cls in _SCOPES.items()
     if issubclass(cls, _ClusterCalibratedScope)
+)
+
+#: Scopes that pool the budget over more than one (layer, group). Read at
+#: startup by ``WorkspaceSpec`` — a pooled scope lets one entry outgrow
+#: ``budget`` (its span's TOTAL is what is held), so the score buffers must be
+#: sized for that, and by the keep decision to pick the apportionment.
+POOLED_BUDGET_SCOPES: frozenset[str] = frozenset(
+    name for name, cls in _SCOPES.items() if cls.pooled_span is not None
 )
 
 #: ``compression_budget_scope`` -> cluster-map scope it pairs with, derived
