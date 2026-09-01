@@ -359,9 +359,9 @@ class _SlotScoreStore(RegimeScoreStore):
         if needed > self.capacity:
             raise RuntimeError(
                 f"BudgetRegime: live cache length {needed} exceeds the reserved "
-                f"slot capacity {self.capacity}. The keep decision caps every "
-                "(layer, group) at the budget, so this means the cap was not "
-                "applied.")
+                f"slot capacity {self.capacity}. The keep decision holds "
+                "every (layer, group) to the workspace's per-group capacity, "
+                "so this means that ceiling was not applied.")
 
         self.source.fill(
             SlotFillTarget(

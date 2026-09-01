@@ -142,6 +142,84 @@ class _RequestCompressState:
     cached_kept_lengths_cpu: np.ndarray | None = None
 
 
+def _apportion_blocks(
+    want: np.ndarray,
+    base: np.ndarray,
+    remainder: np.ndarray,
+    total: int,
+    block_size: int,
+) -> np.ndarray:
+    """Share one pooled ``total`` over a span's (layer, group) entries.
+
+    A pooled budget scope hands out UNEVEN counts on purpose — that is the
+    whole point of ``layer`` / ``global`` — but the selection has to be block
+    quantized, and the span's total still has to hold. Capping each entry
+    separately does both and destroys the unevenness (a weak entry's unused
+    room cannot reach a strong one), so the two are separated here: the block
+    quantization is per entry, the budget is per span.
+
+    Largest-remainder apportionment. Every entry first takes the block FLOOR of
+    what it asked for, then the blocks that flooring left over go to the
+    entries it shortchanged most. Flooring rather than rounding up is what
+    makes ``sum <= total`` structural: rounding up first would need the same
+    amount taken back afterwards, with no principled rule for whom to take it
+    from. Ties break on the lower index, so a rerun of the same step decides
+    the same way.
+
+    ``want`` is the most an entry may take (its own block-rounded demand,
+    already clamped to its eval width and its physical ceiling); ``base`` its
+    block floor; ``remainder`` the demand those floors dropped, which is the
+    hand-out order. Example, one layer with two groups, block 16, total 3064:
+
+        want      [2044, 1024]   base [2032, 1008]   remainder [12, 11]
+        floors                   -> [2032, 1008] = 3040, one block spare
+        spare block to group 0   -> [2048, 1008]  but 2048 > want, skipped
+        spare block to group 1   -> [2032, 1024] = 3056
+        top-up from the 8 left   -> [2040, 1024] = 3064
+
+    A per-entry cap of 1520 would have returned [1520, 1024] = 2544 instead.
+    """
+    k = np.minimum(base, want).astype(np.int64)
+
+    # The floors alone can exceed the span's total when ``floor_min`` raised a
+    # weak entry's demand upstream. A floor is a request and the budget is a
+    # limit, so the budget wins; shave whole blocks off the largest holder
+    # first, where there is most to give.
+    while int(k.sum()) > total:
+        biggest = int(np.argmax(k))
+        if k[biggest] <= 0:
+            break
+        k[biggest] = max(0, int(k[biggest]) - block_size)
+
+    # Hand out the blocks the flooring left over, most-shortchanged entry
+    # first, and keep going while any entry can still take another one.
+    order = np.lexsort((np.arange(len(k)), -remainder))
+    spare = (total - int(k.sum())) // block_size
+    handed_out = True
+    while spare > 0 and handed_out:
+        handed_out = False
+        for entry in order:
+            if spare <= 0:
+                break
+            if k[entry] + block_size <= want[entry]:
+                k[entry] += block_size
+                spare -= 1
+                handed_out = True
+
+    # An entry whose eval region ends mid-block has a ``want`` that is not a
+    # block multiple, so the hand-out above can never reach it. Pay that
+    # remainder out of what is left, in the same order.
+    slack = total - int(k.sum())
+    for entry in order:
+        if slack <= 0:
+            break
+        owed = min(int(want[entry]) - int(k[entry]), slack)
+        if owed > 0:
+            k[entry] += owed
+            slack -= owed
+    return k
+
+
 class KVCompressor:
     """One instance per model; per-request state held in ``req_state``.
 
@@ -175,6 +253,21 @@ class KVCompressor:
         # Chosen once here; ``prepare_keep_decision`` calls
         # ``self.scope.compute_counts`` and never branches on the scope again.
         self.scope: BudgetScope = make_budget_scope(budget_scope)
+        # The per-entry ceiling the keep decision applies is the width the
+        # workspace reserved, and that width depends on the scope: a pooling
+        # scope needs room for one entry outgrowing ``budget``. Sized for the
+        # wrong scope the decision still runs — it just caps every entry at
+        # ``budget`` again and the pooling silently does nothing, which is the
+        # defect this pairing exists to prevent.
+        if (workspace.spec.slot_capacity > 0
+                and workspace.spec.budget_scope != budget_scope):
+            raise RuntimeError(
+                f"KVCompressor: budget scope '{budget_scope}' does not match "
+                f"the workspace, which was sized for "
+                f"'{workspace.spec.budget_scope}' "
+                f"(per_group_capacity={workspace.spec.per_group_capacity}). "
+                "Both come from compression_budget_scope, so they were built "
+                "from different configurations.")
         # Eviction regime (compression axis 3): which cached positions may be
         # evicted this chunk, what fraction of them survives, and how long a
         # position's score lives (see eviction_regime.py). Selected by whether
@@ -646,8 +739,15 @@ class KVCompressor:
         """Compute this chunk's per-(layer, group) post-evict kept_lengths.
 
         This is the single source of truth for how many token slots each
-        (layer, group) keeps. It touches no KV cache; the result is cached on
-        ``req.cached_kept_lengths_cpu`` and :py:meth:`CompressionExecutor.run_request`
+        (layer, group) keeps. It runs in three passes because a pooling budget
+        scope shares one total over a span of entries: pass 1 collects each
+        entry's block-rounded demand, pass 2 enforces the budget (per span
+        under ``layer`` / ``global``, per entry under ``uniform``), pass 3
+        turns the counts back into lengths.
+
+        It touches no KV cache; the result is cached on
+        ``req.cached_kept_lengths_cpu`` and
+        :py:meth:`CompressionExecutor.run_request`
         reads it back (deriving its top-k span from it via
         ``_new_region_from_kept_length``) rather than recomputing — so the two
         stay consistent by construction. Under TP the caller may cross-rank
@@ -688,50 +788,107 @@ class KVCompressor:
         # ratio regime; ragged under the budget regime.
         real_eval_len = req.real_eval_len_cpu
 
-        kept_lengths = np.zeros(
-            (num_layers, num_groups), dtype=np.int32)
+        # Under a budget the ceiling is the workspace's, not the raw budget:
+        # a pooling scope was sized for one entry outgrowing ``budget`` (see
+        # ``WorkspaceSpec.per_group_capacity``), and reading it back here is
+        # what keeps the reserved width and the decision from disagreeing.
+        # ``pooled_span`` is the scope's own declaration of which entries share
+        # one total; ``None`` (``uniform``, and every scope under the ratio
+        # regime, which has no absolute total to share) keeps the per-entry
+        # cap.
+        pooled_span = (self.scope.pooled_span
+                       if budget_tokens is not None else None)
+        per_group_capacity = (self.workspace.spec.per_group_capacity
+                              if budget_tokens is not None else 0)
+
+        # Pass 1 — per entry: how much it asks for (``want``, already block
+        # rounded and clamped), its block floor, and the demand that flooring
+        # dropped. Nothing is shared yet.
+        want = np.zeros((num_layers, num_groups), dtype=np.int64)
+        base = np.zeros((num_layers, num_groups), dtype=np.int64)
+        remainder = np.zeros((num_layers, num_groups), dtype=np.int64)
         for layer_idx in range(num_layers):
             for group_idx in range(num_groups):
                 total_seen_g = int(total_seen[layer_idx, group_idx])
                 locked_count = int(locked_cpu[layer_idx, group_idx])
                 eval_len_g = int(real_eval_len[layer_idx, group_idx])
-                if eval_len_g > 0:
-                    # adjusted_ratio == 0 ⇒ no sort cached, keep none.
-                    k_new = (int(k_new_cpu[layer_idx, group_idx])
-                             if k_new_cpu is not None else 0)
-                    kept_now = (
-                        sink_size + locked_count + k_new + tail_size)
-                    # The floor cannot ask for more than the cache holds, nor
-                    # (under a budget) for more than the budget allows.
-                    target_floor = min(floor_min_int, total_seen_g)
-                    if budget_tokens is not None:
-                        target_floor = min(target_floor, budget_tokens)
-                    if kept_now < target_floor:
-                        extra = min(
-                            target_floor - kept_now,
-                            eval_len_g - k_new)
-                        if extra > 0:
-                            k_new += extra
-                    k_aligned = (
-                        ((k_new + block_size - 1) // block_size)
-                        * block_size)
-                    k_aligned = min(k_aligned, eval_len_g)
-                    if budget_tokens is not None:
-                        # Hard cap. Rounding the selection UP to a block is what
-                        # keeps the kept span page-contiguous, so the cap is
-                        # rounded DOWN to a block multiple rather than cutting
-                        # mid-block: the kept length then never exceeds the
-                        # budget and stays block-aligned. The threshold scopes
-                        # land on the budget by construction; the cap is the
-                        # backstop for rounding and for ``uniform``.
-                        room = budget_tokens - sink_size - locked_count \
-                            - tail_size
-                        cap = max(0, (room // block_size) * block_size)
-                        k_aligned = min(k_aligned, cap)
-                else:
-                    k_aligned = 0
-                new_locked = locked_count + k_aligned
+                if eval_len_g <= 0:
+                    continue
+                # adjusted_ratio == 0 ⇒ no sort cached, keep none.
+                k_new = (int(k_new_cpu[layer_idx, group_idx])
+                         if k_new_cpu is not None else 0)
+                kept_now = (
+                    sink_size + locked_count + k_new + tail_size)
+                # The floor cannot ask for more than the cache holds, nor
+                # (under a budget) for more than the budget allows.
+                target_floor = min(floor_min_int, total_seen_g)
+                if budget_tokens is not None:
+                    target_floor = min(target_floor, budget_tokens)
+                if kept_now < target_floor:
+                    extra = min(
+                        target_floor - kept_now,
+                        eval_len_g - k_new)
+                    if extra > 0:
+                        k_new += extra
+                k_aligned = (
+                    ((k_new + block_size - 1) // block_size)
+                    * block_size)
+                k_aligned = min(k_aligned, eval_len_g)
+                if budget_tokens is not None:
+                    # Rounding the selection UP to a block is what keeps the
+                    # kept span page-contiguous, so the entry's own ceiling is
+                    # rounded DOWN to a block multiple rather than cutting
+                    # mid-block: the kept length then never exceeds the
+                    # capacity and stays block-aligned. Under ``uniform`` the
+                    # capacity IS the budget, so this is the whole constraint;
+                    # under a pooling scope it is only the physical ceiling and
+                    # the budget itself is enforced per span in pass 2.
+                    room_g = (per_group_capacity - sink_size - locked_count
+                              - tail_size)
+                    k_aligned = min(
+                        k_aligned, max(0, (room_g // block_size) * block_size))
+                want[layer_idx, group_idx] = k_aligned
+                base[layer_idx, group_idx] = min(
+                    (k_new // block_size) * block_size, k_aligned)
+                remainder[layer_idx, group_idx] = (
+                    k_new - base[layer_idx, group_idx])
+
+        # Pass 2 — per span: a pooling scope's entries share one total, so
+        # the budget is enforced over the span instead of entry by entry. The
+        # total is the sum of what the BUDGET (not the capacity) leaves each
+        # entry, which is where the pooling is: an entry that wants less than
+        # its share leaves the rest for the others.
+        if pooled_span is None:
+            keep_counts = want
+        else:
+            budget_room = np.maximum(
+                budget_tokens - sink_size - locked_cpu - tail_size, 0)
+            flat_shape = num_layers * num_groups
+            spans = (
+                [np.arange(flat_shape)] if pooled_span == "global"
+                else [np.arange(l * num_groups, (l + 1) * num_groups)
+                      for l in range(num_layers)])
+            flat_want = want.reshape(-1)
+            flat_base = base.reshape(-1)
+            flat_remainder = remainder.reshape(-1)
+            flat_room = budget_room.reshape(-1)
+            keep_counts = np.zeros(flat_shape, dtype=np.int64)
+            for members in spans:
+                keep_counts[members] = _apportion_blocks(
+                    flat_want[members], flat_base[members],
+                    flat_remainder[members],
+                    int(flat_room[members].sum()), block_size)
+            keep_counts = keep_counts.reshape(num_layers, num_groups)
+
+        # Pass 3 — per entry: counts back to lengths.
+        kept_lengths = np.zeros(
+            (num_layers, num_groups), dtype=np.int32)
+        for layer_idx in range(num_layers):
+            for group_idx in range(num_groups):
+                new_locked = (int(locked_cpu[layer_idx, group_idx])
+                              + int(keep_counts[layer_idx, group_idx]))
                 kept_length = sink_size + new_locked + tail_size
+                total_seen_g = int(total_seen[layer_idx, group_idx])
                 if kept_length > total_seen_g:
                     kept_length = total_seen_g
                 kept_lengths[layer_idx, group_idx] = kept_length
