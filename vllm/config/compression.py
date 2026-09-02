@@ -151,13 +151,6 @@ def validate_extended_fields(cfg: "CacheConfig") -> None:
                     f"num_kv_heads={cfg.num_kv_heads}, "
                     f"page_group_size={cfg.page_group_size}."
                 )
-        # Ragged paging is only implemented in the FLASH_ATTN
-        if not os.environ.get("VLLM_ATTENTION_BACKEND"):
-            os.environ["VLLM_ATTENTION_BACKEND"] = "FLASH_ATTN"
-            logger.info(
-                "Defaulting VLLM_ATTENTION_BACKEND=FLASH_ATTN (required by "
-                "ragged paging / compression)."
-            )
 
     # Compression. The ratio is an on/off gate, so validate its range
     # unconditionally (an out-of-range value must error, not read as "off").
@@ -334,4 +327,27 @@ def validate_model_support(
         f"architectures: {supported}. To run this model, disable the "
         f"feature with --page-group-size=None (and leave "
         f"--compression-ratio unset for no compression)."
+    )
+
+
+def default_attention_backend(cfg: "CacheConfig") -> None:
+    """Point the attention backend at FlashAttention, the only one that
+    implements ragged paging, unless the caller already named one.
+
+    This writes ``VLLM_ATTENTION_BACKEND``, which is process-global and is read
+    by every later backend selection, so it belongs to assembling one engine's
+    configuration -- not to constructing a ``CacheConfig``, which happens more
+    than once per process and at a point where nothing has decided what the run
+    uses. An explicit setting is left alone: the default exists for the case
+    where the user made no choice.
+    """
+    if cfg.page_group_size is None:
+        return
+    if os.environ.get("VLLM_ATTENTION_BACKEND"):
+        return
+
+    os.environ["VLLM_ATTENTION_BACKEND"] = "FLASH_ATTN"
+    logger.info(
+        "Defaulting VLLM_ATTENTION_BACKEND=FLASH_ATTN (required by "
+        "ragged paging / compression)."
     )
