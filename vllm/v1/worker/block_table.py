@@ -645,19 +645,15 @@ class MultiGroupBlockTable:
         ]
 
     def append_row(self, block_ids: tuple[list[int], ...], row_idx: int) -> None:
-        if self.ragged:
-            # Caller delivers ``num_head_groups × num_new`` ids in
-            # group-major order; a single ``BlockPool.get_new_blocks``
-            # call already covered every (layer, head-group) pair.
-            self.block_tables[0].append_row(block_ids[0], row_idx)
-            return
+        # Ragged paging holds exactly one table (it absorbs the layer axis into
+        # the flat group index), so the loop below already routes its single
+        # entry -- the caller's ``num_head_groups × num_new`` ids, group-major,
+        # from one ``BlockPool.get_new_blocks`` call covering every
+        # (layer, head-group) pair.
         for i, block_table in enumerate(self.block_tables):
             block_table.append_row(block_ids[i], row_idx)
 
     def add_row(self, block_ids: tuple[list[int], ...], row_idx: int) -> None:
-        if self.ragged:
-            self.block_tables[0].add_row(block_ids[0], row_idx)
-            return
         for i, block_table in enumerate(self.block_tables):
             block_table.add_row(block_ids[i], row_idx)
 
