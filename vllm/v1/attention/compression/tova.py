@@ -1,29 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""TOVA scorer — last-query attention importance score (compression axis 2).
+"""TOVA scorer — last-query attention importance score (axis 2).
 
-Produces the same ``[num_kv_heads, chunk_len]`` score contract every scorer
-does, from the model's post-RoPE query/key of the current chunk. The shared
-chunk machinery consumes the score identically.
-
-Ported from NVIDIA KVpress (``kvpress/presses/tova_press.py``); paper
-"Transformers are Multi-State RNNs" (Oren et al., https://arxiv.org/abs/2401.06104).
-The reference docstring: "Uses attention weights of the last token (averaged
-across heads) to estimate importance of previous key-value pairs."
-
-Two properties define TOVA and separate it from SnapKV:
-* **Last query only** — the importance of a key is how much the single most
-  recent query attends to it (SnapKV averages a trailing observation window).
-* **Head-uniform** — the per-position attention is averaged across ALL query
-  heads into one score, then shared by every KV head, so every head keeps the
-  same positions (SnapKV keeps per-head positions). With the uniform budget
-  scope this reproduces TOVA's single global KV policy.
-
-Like tangram's SnapKV scorer, the attention is computed from the chunk's
-post-RoPE query/key the scorer receives (the reference recomputes the
-query from hidden_states; tangram already has the post-RoPE query, so it skips
-that recomputation — same attention). "Last query" is the last query of the
-current chunk, the chunk-local analogue of the reference's last prompt token.
+Ported from NVIDIA KVpress (``tova_press.py``); paper "Transformers are
+Multi-State RNNs" (https://arxiv.org/abs/2401.06104). Two properties define it
+against SnapKV. LAST QUERY ONLY: a key's importance is how much the single most
+recent query attends to it, where SnapKV averages a trailing window; "last" is
+the last query of the current chunk, the chunk-local analogue of the
+reference's last prompt token. HEAD-UNIFORM: the per-position attention is
+averaged over ALL query heads into one score shared by every KV head, so every
+head keeps the same positions, and with the uniform budget scope that
+reproduces TOVA's single global KV policy.
 """
 from __future__ import annotations
 
@@ -35,14 +22,7 @@ from vllm.v1.attention.compression.qk_scorer_base import QKScorer
 
 
 class TOVAScorer(QKScorer):
-    """One (stateless) instance shared across all compressible layers.
-
-    Input:  ``query [T, num_kv_heads * num_q_per_kv * head_size]`` and
-            ``key   [T, num_kv_heads * head_size]`` (post-RoPE, token-major
-            flatten) for one request's chunk.
-    Output: scores ``[num_kv_heads, T]`` (float32), higher = more important;
-            identical across heads (TOVA is head-uniform).
-    """
+    """Scores are identical across heads: TOVA is head-uniform."""
 
     # Axis-2 dispatch: this scorer reads the inner ``Attention``'s q/k,
     # not the outer block's hidden_states.
@@ -71,9 +51,7 @@ class TOVAScorer(QKScorer):
         module: nn.Module | None = None,
         position_offset: int = 0,
     ) -> torch.Tensor:
-        # TOVA scores from the last query's attention only; ``value`` /
-        # ``module`` / ``position_offset`` are part of the shared qk contract
-        # but unused here.
+        # Last query's attention only; the rest is the shared contract.
         del value, module, position_offset
 
         num_kv_heads = self.num_kv_heads

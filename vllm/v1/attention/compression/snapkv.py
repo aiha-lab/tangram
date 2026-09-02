@@ -2,15 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """SnapKV scorer — chunk-local attention-based importance score (axis 2).
 
-Produces the same ``[num_kv_heads, chunk_len]`` score contract the gate does,
-but from the model's post-RoPE query/key of the current chunk instead of
-hidden_states. The shared chunk machinery (sink / window / lock-in /
-adjusted_ratio / executor) consumes the score identically.
-
-Ported from the reference ``baseline.py:SnapKV`` (KVzip). Because tangram is
-chunk-based, the ``key`` seen here is only the current chunk's keys, so the
-reference's sink-prepend collapses (``sink == 0``): the scorer emits raw
-chunk-position scores and the shared machinery protects sink/window.
+Ported from the KVzip reference ``baseline.py:SnapKV``. Because tangram is
+chunk-based the ``key`` seen here is only the current chunk's, so the
+reference's sink-prepend collapses to ``sink == 0``: this scorer emits raw
+chunk-position scores and the shared machinery protects the sink and window.
 """
 from __future__ import annotations
 
@@ -25,13 +20,8 @@ from vllm.v1.attention.compression.scorer_options import ScorerOption
 
 
 class SnapKVScorer(QKScorer):
-    """One (stateless) instance shared across all compressible layers.
-
-    Input:  ``query [T, num_kv_heads * num_q_per_kv * head_size]`` and
-            ``key   [T, num_kv_heads * head_size]`` (post-RoPE, token-major
-            flatten) for one request's chunk, or the equivalent 3-D views.
-    Output: scores ``[num_kv_heads, T]`` (float32), higher = more important.
-    """
+    """Accepts the token-major flattened query/key or the equivalent 3-D
+    views."""
 
     # Axis-2 dispatch: this scorer reads the inner ``Attention``'s q/k,
     # not the outer block's hidden_states.
@@ -81,9 +71,8 @@ class SnapKVScorer(QKScorer):
         module: nn.Module | None = None,
         position_offset: int = 0,
     ) -> torch.Tensor:
-        # SnapKV scores from the observation-window attention over query/key
-        # only; ``value`` / ``module`` / ``position_offset`` are part of the
-        # shared qk scorer contract but unused here.
+        # Observation-window attention over query/key only; the rest is the
+        # shared contract.
         del value, module, position_offset
         num_kv_heads = self.num_kv_heads
         num_q_per_kv = self.num_q_per_kv

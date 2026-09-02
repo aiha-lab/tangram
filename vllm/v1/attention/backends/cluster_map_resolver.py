@@ -2,19 +2,16 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Auto-resolution of bundled head-group cluster maps.
 
-Finds the ``.npz`` map shipped under
-``tools/head_group_clustering/cluster_maps/<scorer-dir>/<model-slug>/`` that
-matches the running model, scorer, ``page_group_size``, and budget scope, so
-the default config needs no explicit ``--head-group-cluster-map``. This only
-*locates and identity-checks* a file; ``ragged_layout.load_cluster_map``
-stays the authoritative loader/validator of the array contents. Run once at
-config finalization (``CacheConfig.resolve_head_group_cluster_map``) and frozen
-onto the config, so every consumer reads the same path.
+Finds the ``.npz`` under
+``tools/head_group_clustering/cluster_maps/<scorer-dir>/<model-slug>/`` matching
+the running model, scorer, ``page_group_size`` and budget scope, so the default
+config needs no explicit ``--head-group-cluster-map``. Convention
+``pg<page_group_size>_r<ratio>[_perlayer].npz``, the ratio globbed because the
+runtime ignores ``base_ratio``.
 
-Filename convention (see the cluster_maps README):
-``<scorer-dir>/<model-slug>/pg<page_group_size>_r<ratio>[_perlayer].npz``.
-The ratio is informational (the runtime ignores ``base_ratio``), so it is
-matched with a glob.
+Only locates and identity-checks; ``ragged_layout.load_cluster_map`` remains the
+authoritative validator of the contents. Runs once at config finalization and is
+frozen on, so every consumer reads one path.
 """
 from __future__ import annotations
 

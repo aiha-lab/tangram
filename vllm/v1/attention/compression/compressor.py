@@ -2,16 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Keep-decision logic for KV cache compression.
 
-Owns the keep decision and delegates every policy choice to one of three
-orthogonal, pluggable axes:
-
-* axis 1 — budget scope (``budget_scope.py``): eval scores -> per-(layer,
-  group) kept COUNT;
-* axis 2 — scorer (``scorer.py`` / ``gate.py``): what a position's score means;
-* axis 3 — eviction regime (``eviction_regime.py``): which positions may be
-  evicted, how much survives, and how long a score lives.
-
-KV writes and block-table updates live in the FlashAttention backend.
+Owns the keep decision and holds no policy of its own: the budget scope
+(axis 1), the scorer (axis 2) and the eviction regime (axis 3) supply all
+three. KV writes and block-table updates live in the FlashAttention backend.
 """
 from __future__ import annotations
 
@@ -57,21 +50,10 @@ logger = init_logger(__name__)
 
 
 class KeepDecisionObserver(Protocol):
-    """Contract for an object notified of each finalized per-request keep
-    decision. Implemented by offline tooling (not the engine) so the keep
-    decision can be observed without entangling the production path with what
-    the observer does. ``page_group_size = 1`` makes every ``(layer, group)``
-    a single head, so the arrays below are per-(layer, head).
-
-    Args of :meth:`record`:
-        req_id: the request whose keep decision this is.
-        kept_lengths: ``[num_layers, num_groups]`` int — KV positions retained
-            per (layer, group) after eviction (sink + window + selected).
-        total_seen: ``[num_layers, num_groups]`` int — full prefill length per
-            (layer, group) before eviction.
-        sink_size: leading positions kept unconditionally (the sink).
-        win_size: trailing recent positions kept unconditionally (the window).
-        eval_len: length of the evictable region the threshold ranked over.
+    """Notified of each finalized per-request keep decision, by offline
+    tooling only. With ``page_group_size = 1`` every entry is one head, so
+    :meth:`record` receives per-(layer, head) ``kept_lengths`` after eviction
+    and ``total_seen`` before it, plus the widths that decided the difference.
     """
 
     def record(
@@ -91,54 +73,44 @@ class KeepDecisionObserver(Protocol):
 class KeepDecision:
     """Per-chunk geometry the executor consumes, in cache-slot coordinates.
 
-    The eval region of a (layer, group) is the ``eval_len`` slots starting at
-    ``sink_size + locked``; the sink, the locked prefix and the trailing
-    ``tail_size`` slots are kept regardless of score. The kept COUNT and
-    POSITION live in the per-(layer, group) caches (``cached_k_new_cpu`` /
-    ``borrowed_sorted_indices``), not here — the scope-specific threshold is an
-    internal of ``BudgetScope`` and never reaches downstream consumers.
+    An entry's eval region is the ``eval_len`` slots at ``sink_size + locked``;
+    sink, locked prefix and trailing ``tail_size`` are kept regardless of score.
+    The kept count and positions live in the per-entry caches, not here: the
+    scope's threshold is a ``BudgetScope`` internal.
     """
     sink_size: int
-    #: Trailing always-kept slots: the recent window under the ratio regime,
-    #: the whole fresh chunk under the budget regime (unless the fresh chunk is
-    #: configured to be evictable).
+    #: Trailing always-kept slots: the recent window (ratio) or the whole
+    #: fresh chunk (budget, unless it is configured to be evictable).
     tail_size: int
     adjusted_ratio: float
     eval_len: int = 0
-    #: Per-(layer, group) hard cap on the post-evict kept length, or ``None``
-    #: when the regime sets no absolute cap (the ratio regime).
+    #: Per-entry hard cap on the kept length, ``None`` under the ratio regime.
     budget_tokens: int | None = None
 
 
 @dataclass
 class _RequestCompressState:
-    """Per-request bookkeeping. Every tensor lives in the preallocated
-    workspace; this holds the row that addresses it plus the small CPU-side
-    results the scheduler and the executor read back."""
-    #: Workspace row reserved for this request (see ``CompressionWorkspace``).
+    """Per-request bookkeeping: the workspace row that addresses this
+    request's tensors, plus the CPU-side results the scheduler and executor
+    read back."""
     row: int
-    #: Score memory owned by the active eviction regime (axis 3): a chunk-local
-    #: staging view under the ratio regime, a slot-aligned persistent statistics
-    #: buffer under the budget regime.
+    #: Regime-owned score memory: chunk-local staging (ratio) or a slot-aligned
+    #: persistent buffer (budget).
     score_store: RegimeScoreStore
     cross_layer_decision: KeepDecision | None = None
-    #: True once an eviction has committed a kept length for this request, so
-    #: the next chunk is no longer the first one.
+    #: Set once an eviction committed a length, so the next chunk is not first.
     has_committed: bool = False
-    #: [L, G, page_group_size, eval_len] view into the SHARED workspace ranking
-    #: buffer: each KV head's own descending score ranking, at its (cluster,
-    #: column). Borrowed, not owned — the next request to rank overwrites it, so
-    #: it is valid only between this request's ranking and its writeback, which
-    #: clears it.
+    #: [L, G, page_group_size, eval_len] view into the SHARED ranking buffer.
+    #: Borrowed: valid only between this request's ranking and its writeback,
+    #: which clears it, because the next request to rank overwrites it.
     borrowed_sorted_indices: torch.Tensor | None = None
     cached_k_new_cpu: np.ndarray | None = None           # [L, G]
     locked_count_cpu: np.ndarray | None = None           # [L, G]
-    #: [L, G] genuine eval width per (layer, group). Under the budget regime the
-    #: eval region is ragged (kept lengths diverge), so the rectangular score
-    #: tensor is padded and the selected count must be clamped to this.
+    #: [L, G] genuine eval width. Ragged under the budget regime, where the
+    #: score tensor is padded, so the selected count is clamped to this.
     real_eval_len_cpu: np.ndarray | None = None
-    #: [L, G] int32 post-evict kept_lengths. Under TP the runner cross-rank
-    #: MAX-reduces this for block-pool consistency.
+    #: [L, G] int32 post-evict kept_lengths, MAX-reduced across ranks under TP
+    #: for block-pool consistency.
     cached_kept_lengths_cpu: np.ndarray | None = None
 
 
@@ -151,48 +123,30 @@ def _apportion_blocks(
 ) -> np.ndarray:
     """Share one pooled ``total`` over a span's (layer, group) entries.
 
-    A pooled budget scope hands out UNEVEN counts on purpose — that is the
-    whole point of ``layer`` / ``global`` — but the selection has to be block
-    quantized, and the span's total still has to hold. Capping each entry
-    separately does both and destroys the unevenness (a weak entry's unused
-    room cannot reach a strong one), so the two are separated here: the block
-    quantization is per entry, the budget is per span.
+    A pooled scope hands out uneven counts on purpose, but the selection must
+    be block quantized and the span's total must hold. Capping each entry
+    separately satisfies both and destroys the unevenness, so quantization is
+    per entry and the budget per span.
 
-    Largest-remainder apportionment. Every entry first takes the block FLOOR of
-    what it asked for, then the blocks that flooring left over go to the
-    entries it shortchanged most. Flooring rather than rounding up is what
-    makes ``sum <= total`` structural: rounding up first would need the same
-    amount taken back afterwards, with no principled rule for whom to take it
-    from. Ties break on the lower index, so a rerun of the same step decides
+    Largest-remainder apportionment: each entry takes the block FLOOR of its
+    demand (``base``, from ``want``), then the leftover blocks go to whoever
+    flooring shortchanged most (``remainder``, which is the hand-out order).
+    Flooring rather than rounding up is what makes ``sum <= total``
+    structural -- rounding up needs the same amount taken back, with no rule
+    for whom to take it from. Ties break on the lower index, so a rerun decides
     the same way.
-
-    ``want`` is the most an entry may take (its own block-rounded demand,
-    already clamped to its eval width and its physical ceiling); ``base`` its
-    block floor; ``remainder`` the demand those floors dropped, which is the
-    hand-out order. Example, one layer with two groups, block 16, total 3064:
-
-        want      [2044, 1024]   base [2032, 1008]   remainder [12, 11]
-        floors                   -> [2032, 1008] = 3040, one block spare
-        spare block to group 0   -> [2048, 1008]  but 2048 > want, skipped
-        spare block to group 1   -> [2032, 1024] = 3056
-        top-up from the 8 left   -> [2040, 1024] = 3064
-
-    A per-entry cap of 1520 would have returned [1520, 1024] = 2544 instead.
     """
     k = np.minimum(base, want).astype(np.int64)
 
-    # The floors alone can exceed the span's total when ``floor_min`` raised a
-    # weak entry's demand upstream. A floor is a request and the budget is a
-    # limit, so the budget wins; shave whole blocks off the largest holder
-    # first, where there is most to give.
+    # ``floor_min`` upstream can push the floors past the total. A floor is a
+    # request and the budget a limit, so shave blocks off the largest holder.
     while int(k.sum()) > total:
         biggest = int(np.argmax(k))
         if k[biggest] <= 0:
             break
         k[biggest] = max(0, int(k[biggest]) - block_size)
 
-    # Hand out the blocks the flooring left over, most-shortchanged entry
-    # first, and keep going while any entry can still take another one.
+    # Leftover blocks go most-shortchanged entry first, while any can take one.
     order = np.lexsort((np.arange(len(k)), -remainder))
     spare = (total - int(k.sum())) // block_size
     handed_out = True
@@ -206,9 +160,7 @@ def _apportion_blocks(
                 spare -= 1
                 handed_out = True
 
-    # An entry whose eval region ends mid-block has a ``want`` that is not a
-    # block multiple, so the hand-out above can never reach it. Pay that
-    # remainder out of what is left, in the same order.
+    # A mid-block ``want`` is unreachable above; pay it in the same order.
     slack = total - int(k.sum())
     for entry in order:
         if slack <= 0:
@@ -224,8 +176,7 @@ class KVCompressor:
     """One instance per model; per-request state held in ``req_state``.
 
     ``compress_active`` is flipped by the ModelRunner around the compress
-    forward pass and read by the per-layer scorers (delivered through the
-    attention / gate-capture custom ops; see ``attach_scorers``).
+    forward and read by the per-layer scorers.
     """
 
     def __init__(
@@ -247,18 +198,11 @@ class KVCompressor:
             f"num_kv_heads ({num_kv_heads}) must be divisible by "
             f"page_group_size ({page_group_size}).")
 
-        # Budget scope (compression axis 1): the aggregation rule turning
-        # eval scores into a per-(layer, group) kept COUNT. ``budget_scope`` is
-        # ``cache_config.compression_budget_scope`` (see budget_scope.py).
-        # Chosen once here; ``prepare_keep_decision`` calls
-        # ``self.scope.compute_counts`` and never branches on the scope again.
+        # Axes 1 and 3, chosen once; nothing downstream branches on either.
         self.scope: BudgetScope = make_budget_scope(budget_scope)
-        # The per-entry ceiling the keep decision applies is the width the
-        # workspace reserved, and that width depends on the scope: a pooling
-        # scope needs room for one entry outgrowing ``budget``. Sized for the
-        # wrong scope the decision still runs — it just caps every entry at
-        # ``budget`` again and the pooling silently does nothing, which is the
-        # defect this pairing exists to prevent.
+        # The per-entry ceiling IS the reserved width, and a pooling scope
+        # needs room for one entry outgrowing ``budget``. Sized for the wrong
+        # scope nothing raises: it just caps every entry again, silently.
         if (workspace.spec.slot_capacity > 0
                 and workspace.spec.budget_scope != budget_scope):
             raise RuntimeError(
@@ -268,15 +212,7 @@ class KVCompressor:
                 f"(per_group_capacity={workspace.spec.per_group_capacity}). "
                 "Both come from compression_budget_scope, so they were built "
                 "from different configurations.")
-        # Eviction regime (compression axis 3): which cached positions may be
-        # evicted this chunk, what fraction of them survives, and how long a
-        # position's score lives (see eviction_regime.py). Selected by whether
-        # ``cache_config.compression_budget_tokens`` is set; like the scope it
-        # is chosen once here and never branched on again.
         self.regime: EvictionRegime = make_eviction_regime(regime)
-        # Every tensor the keep decision touches lives here, allocated once at
-        # startup so the memory-profiling run that follows sizes the KV cache
-        # pool around it (see workspace.py).
         self.workspace = workspace
         self.num_layers = num_layers
         self.num_kv_heads_per_layer = num_kv_heads
@@ -289,68 +225,34 @@ class KVCompressor:
         self.device = torch.device(device) if isinstance(device, str) \
             else device
 
-        # Per-layer score producers (axis 2). Populated by
-        # ``load_gate_checkpoint`` (FastKVZip; hidden_states) or
-        # ``set_qk_scorers`` (gate-free query/key scorers — SnapKV, KeyDiff);
-        # kept separate so unit tests can exercise compress() without one.
-        # ``scorer_consumes`` ("hidden_states" | "qk") decides how the scorer
-        # is delivered: a query/key scorer stored on the inner ``Attention``,
-        # or a hidden_states gate wrapped around the outer block (see
-        # ``attach_scorers``).
+        # Installed later, so a unit test needs no scorer.
+        # ``scorer_consumes`` decides delivery: ``"qk"`` on the inner
+        # ``Attention``, ``"hidden_states"`` wrapping the outer block.
         self.scorers: list[nn.Module] = []
         self.scorer_consumes: str = "hidden_states"
-        # Where a live position's score comes from under a fixed budget (see
-        # slot_scores.py). Replaced once the scorer is installed, since the
-        # scorer is what decides whether the cache can be rescored; the default
-        # keeps unit tests that install no scorer working.
-        # ``slot_score_source`` is ``cache_config.compression_slot_score_source``
-        # — "auto" in production, a source name only when an ablation pins the
-        # score provenance while the retention target changes.
+        # Replaced once the scorer is installed: it decides rescorability.
         self.slot_score_source_choice = slot_score_source
         self.slot_score_source: SlotScoreSource = PersistedChunkScores()
 
-        # member->(cluster, column) maps used by the keep decision. Member row
-        # m = layer * num_kv_heads_per_layer + head; member_to_cluster[m] is the
-        # global cluster id (flat c = layer * num_head_groups_per_layer + group
-        # under the identity map) whose physical KV blocks that head shares, and
-        # member_to_col[m] the head's column within that cluster's page.
-        # Populated by ``set_cluster_map``; the keep decision requires both.
+        # member -> (cluster, column), both filled by ``set_cluster_map``.
         self.member_to_cluster: torch.Tensor | None = None
         self.member_to_col: torch.Tensor | None = None
-        # [num_clusters, page_group_size] inverse of the two maps above:
-        # (cluster, column) -> member row, or -1 for a column no member fills
-        # (a cross-layer map may leave a cluster empty). The eviction regime's
-        # score memory needs it because the writeback addresses cluster columns
-        # while a score buffer is addressed by member.
+        # [num_clusters, page_group_size] inverse, -1 for an unfilled column.
+        # The writeback addresses columns, a score buffer members.
         self.cluster_members: torch.Tensor | None = None
 
-        # Optional observer notified of every finalized per-request keep
-        # decision (see ``compute_kept_lengths_per_rank``). ``None`` in
-        # production: the keep-decision path then does no extra work. Offline
-        # tooling attaches an observer to record the decisions it needs (the
-        # head-group clustering retention profiler does this via
-        # ``vllm.v1.attention.compression.profiling``); the engine itself stays
-        # agnostic to what the observer does with them.
+        # ``None`` in production, so the keep-decision path does no extra work.
         self.keep_decision_observer: KeepDecisionObserver | None = None
 
         self.req_state: dict[str, _RequestCompressState] = {}
 
-        # Whether the per-chunk scorer has to run at all. A score source that
-        # recomputes from the cached keys never reads the chunk's own scores, so
-        # the scorer forward and its buffer write are skipped outright.
+        # A recomputing source never reads the chunk's own scores, so both the
+        # scorer forward and its buffer write are skipped.
         self.compress_active: bool = False
-        # ``(req_id, start, end)`` token range of each compression-active
-        # request in the batch's hidden_states; tokens outside any triple are
-        # skipped.
+        # ``(req_id, start, end)`` in hidden_states; anything outside is skipped.
         self.pending_req_offsets: list[tuple[str, int, int]] | None = None
-        # ``pending_req_pos_offsets`` maps a compression-active ``req_id`` to
-        # the global sequence position of its chunk's first scored token
-        # (the request's ``num_computed_tokens`` this step). Query/key scorers
-        # that depend on absolute token position (StreamingLLM recency,
-        # ExpectedAttention's future-position RoPE rotation) read it in the
-        # query/key scorer; position-independent scorers ignore it. Kept
-        # parallel to ``pending_req_offsets`` (set/cleared together) so the
-        # batch-range tuples stay unchanged and the gate scorer is untouched.
+        # req_id -> global position of its chunk's first scored token, read by
+        # the position-dependent scorers. Set and cleared with the offsets.
         self.pending_req_pos_offsets: dict[str, int] | None = None
 
     def load_gate_checkpoint(
@@ -387,17 +289,15 @@ class KVCompressor:
         num_q_per_kv: int,
         options: Mapping[str, str] | None = None,
     ) -> None:
-        """Install a gate-free query/key scorer (SnapKV, KeyDiff, StreamingLLM,
-        TOVA, ExpectedAttention): one shared stateless instance per compressible
-        layer. Scores come from the model's post-RoPE query/key, so no
-        checkpoint is loaded. ``num_q_per_kv`` is the per-rank GQA ratio (model
-        q-heads / kv-heads); scorers that ignore it (KeyDiff) simply do not use
-        it. ``options`` carries the settings the selected scorer declared in its
-        ``OPTIONS`` (see scorer_options.py), so this signature does not grow when
-        a scorer gains a hyperparameter. The concrete scorer comes from
-        ``build_qk_scorer`` — a registry lookup, with no scorer branch — and
-        ``scorer_consumes`` is read off the module so the delivery dispatch in
-        ``attach_scorers`` stays scorer-agnostic."""
+        """Install a gate-free query/key scorer: one shared stateless instance
+        across every compressible layer, scoring from post-RoPE query/key, so no
+        checkpoint is loaded.
+
+        ``options`` carries whatever the selected scorer declared in its
+        ``OPTIONS``, so this signature does not grow when a scorer gains a
+        hyperparameter. The scorer comes from ``build_qk_scorer``, a registry
+        lookup with no per-scorer branch, and ``scorer_consumes`` is read off
+        the module so ``attach_scorers`` stays scorer-agnostic."""
         scorer = build_qk_scorer(
             scorer_name,
             num_kv_heads=self.num_kv_heads_per_layer,
@@ -406,8 +306,7 @@ class KVCompressor:
             options=options,
         ).to(device=self.device)
         scorer.eval()
-        # The scorer is stateless, so all layers share one instance; the list
-        # length matches ``num_layers`` for ``attach_scorers``'s zip.
+        # Stateless, so one instance; the length matches ``attach_scorers``.
         self.scorers = [scorer for _ in range(self.num_layers)]
         self.scorer_consumes = scorer.consumes
         self._select_slot_score_source(scorer)
@@ -424,13 +323,10 @@ class KVCompressor:
     def set_cluster_map(self, head_group_cluster_map: str | None) -> None:
         """Bind the member->(cluster, column) maps the keep decision uses.
 
-        ``head_group_cluster_map is None`` selects the identity map (each KV
-        head clusters with its adjacent neighbours within a layer); a loaded
-        cluster map instead assigns each head to the (possibly cross-layer)
-        cluster it shares physical KV blocks with. Either way the maps mirror
-        those the FlashAttention builder uses for paging, so scoring and
-        physical placement agree (see ``ragged_layout.py``). Member row
-        ``m = layer * num_kv_heads_per_layer + head``.
+        ``None`` selects the identity map; a loaded map assigns each head to
+        the possibly cross-layer cluster whose physical blocks it shares. Either
+        way these mirror the maps the FlashAttention builder pages with, so
+        scoring and physical placement agree.
         """
         if head_group_cluster_map is None:
             member_to_cluster, member_to_col = identity_member_maps(
@@ -454,8 +350,7 @@ class KVCompressor:
         self.member_to_cluster = member_to_cluster
         self.member_to_col = member_to_col
         num_clusters = self.num_layers * self.num_head_groups_per_layer
-        # Invert the two maps once. -1 marks a (cluster, column) no member
-        # occupies, so a score buffer never mistakes an empty slot for member 0.
+        # -1 so a score buffer never mistakes an empty slot for member 0.
         cluster_members = torch.full(
             (num_clusters, self.page_group_size), -1,
             dtype=torch.long, device=self.device)
@@ -489,8 +384,7 @@ class KVCompressor:
                                                        score_store=store)
 
     def end_request(self, req_id: str) -> None:
-        # Idempotent for worker shutdown paths. Releasing the row is what keeps
-        # the fixed row pool from leaking across a long-running engine.
+        # Idempotent for shutdown paths; releasing is what stops a row leak.
         state = self.req_state.pop(req_id, None)
         if state is not None:
             self.workspace.release_row(state.row)
@@ -501,29 +395,22 @@ class KVCompressor:
         layer_idx: int,
         score: torch.Tensor,
     ) -> None:
-        """Stash the scorer-produced ``[num_kv_heads_per_layer, sub_chunk_len]``
-        score, accumulating across budget-sliced sub-chunks until the boundary
-        step consumes it. Source-agnostic (FastKVZip gate or SnapKV); both feed
-        the same buffer.
+        """Stash one layer's ``[num_kv_heads_per_layer, sub_chunk_len]`` score,
+        accumulating across budget-sliced sub-chunks until the boundary step
+        consumes it. Source-agnostic: gate and qk scorers feed the same buffer.
 
-        Concurrency lets the scheduler split one compression chunk into several
-        forward steps (the token budget is shared), and the scorer scores only
-        the tokens present in each step. Concatenating in arrival order
-        assembles a full ``chunk_size`` of per-token scores by the boundary
-        step that runs the keep decision. ``_take_pending`` consumes + rewinds
-        it only at a boundary step.
+        Concurrency lets the scheduler split one compression chunk over several
+        forward steps, each scoring only its own tokens; concatenating in
+        arrival order assembles a full ``chunk_size`` by the boundary step,
+        where ``_take_pending`` consumes and rewinds it.
 
-        Byte-equivalence to the serial baseline's single full-chunk score holds
-        for the hidden-states gate only: a token's hidden_states does not
-        depend on how prefill was sliced (chunked prefill keeps full KV and
-        attention is causal), so its score does not either. The qk scorers
-        (``snapkv``, the default, and ``tova``) measure a chunk-relative
-        observation window — see ``_make_qk_scorer`` — so a sub-chunk's window
-        is not the full chunk's, and the assembled buffer differs from the
-        serial one. That divergence is accepted, not a defect: the alternative
-        is refusing to score until a chunk is whole, which costs the
-        concurrency. Do not use bit-identical output as a test oracle for a
-        chunk-relative scorer."""
+        This is byte-equivalent to a serial full-chunk score for the
+        hidden-states gate only, whose per-token score does not depend on how
+        prefill was sliced. A qk scorer measures a chunk-relative observation
+        window, so a sub-chunk's window is not the full chunk's and the
+        assembled buffer differs from the serial one -- accepted, the
+        alternative being to refuse to score until a chunk is whole. Do not use
+        bit-identical output as a test oracle for a chunk-relative scorer."""
         if score.shape[0] != self.num_kv_heads_per_layer:
             raise ValueError(
                 f"score head dim {score.shape[0]} != "
@@ -572,16 +459,11 @@ class KVCompressor:
     ) -> KeepDecision:
         """Run the keep decision for one chunk.
 
-        Three delegations, no policy of its own: the active eviction regime
-        (axis 3) fixes the geometry — which slots may be evicted, what fraction
-        survives — and supplies the eval-region scores from its own score
-        memory; the active budget scope (axis 1) turns those scores into a
-        per-(layer, group) kept COUNT; and this method caches the per-(layer,
-        group) POSITION ranking the executor gathers with.
-
-        Enforces the once-only invariant: ``prev_seq_lens_per_layer`` matches
-        the last ``valid_lengths_per_group`` (or is all-zero on the first
-        chunk).
+        Three delegations: the regime fixes the geometry and supplies the
+        eval-region scores, the scope turns those into a per-entry kept COUNT,
+        and this caches the POSITION ranking the executor gathers with.
+        ``prev_seq_lens_per_layer`` must equal the last committed lengths, or be
+        all-zero on the first chunk.
         """
         if req_id not in self.req_state:
             raise RuntimeError(
@@ -604,8 +486,7 @@ class KVCompressor:
 
         self._assert_once_only(req, prev_lens, num_layers, num_groups)
 
-        # This chunk's scores, as one [L, num_kv_heads, chunk_len] view into the
-        # row's pending slab; consuming it rewinds the per-layer write cursors.
+        # One [L, num_kv_heads, chunk_len] view; consuming rewinds the cursors.
         pending = self._take_pending(req, num_layers, chunk_len)
         device = pending.device
         store = req.score_store
@@ -641,34 +522,20 @@ class KVCompressor:
             geometry,
         )
 
-        # The regime owns the locked counts for this chunk; publish them so the
-        # executor and the next chunk read one value.
+        # Publish the regime's locked counts, so every reader sees one value.
         self.workspace.locked[req.row].copy_(locked)
 
-        # Keep decision = COUNT (per-cluster shared length) + POSITION
-        # (per-member ranking). Each KV head (member) keeps its OWN top-scored
-        # positions; a cluster then shares ONE kept length, because the
-        # cluster's members share the same physical KV blocks (so the length is
-        # single). Grouping heads with similar retention budgets via the cluster
-        # map makes that shared length approximate each member's ideal — the
-        # source of the memory saving. Per-member individual lengths are never
-        # stored; only the cluster's one length is.
-        #
-        # POSITION (ratio-independent rank) is cached whenever there is an eval
-        # region to keep from, INCLUDING the zero path (adjusted_ratio == 0):
-        # the ratio budget keeps no middle there, but floor_min can still force
-        # k_aligned > 0, and run_request indexes this ranking to pick the kept
-        # positions (omitting it subscripts None on short prompts). COUNT is
-        # cached only on the genuine path — compute_counts is undefined at
-        # ratio <= 0, and at ratio 0 the base count is 0 (floor_min supplies the
-        # retention against the ranking above).
+        # COUNT is one shared length per cluster, POSITION each member's own
+        # top-scored slots; grouping similar-retention heads is what makes the
+        # single stored length approximate each member's ideal. The ranking is
+        # cached whenever an eval region exists, ``floor_min`` being able to
+        # force a positive count even at ratio 0; the COUNT only above zero,
+        # where ``compute_counts`` is defined.
         if eval_len > 0 and adjusted_ratio < 1.0:
             req.borrowed_sorted_indices = self._rank_positions(
                 eval_scores, num_layers, num_kv_heads, num_groups)
             if adjusted_ratio > 0.0:
-                # Clamp to the genuine eval width: under a ragged eval region
-                # (the budget regime, where kept lengths diverge) the score
-                # tensor is padded, and a count must never reach into padding.
+                # A count must never reach into a ragged region's padding.
                 req.cached_k_new_cpu = np.minimum(
                     self.scope.compute_counts(
                         eval_scores, adjusted_ratio, self.member_to_cluster,
@@ -700,26 +567,19 @@ class KVCompressor:
         num_kv_heads: int,
         num_groups: int,
     ) -> torch.Tensor:
-        """Per-member descending POSITION ranking, in the executor's
-        ``[num_layers, num_groups, page_group_size, width]`` (cluster, column)
-        layout. Shared by every budget scope — the kept COUNT differs between
-        them, the POSITION ranking is the same.
+        """Per-member descending POSITION ranking in the executor's
+        ``[num_layers, num_groups, page_group_size, width]`` layout, read as
+        ``sorted_idx[layer, group, col, :k_aligned]``. Every budget scope shares
+        it: the COUNT differs between scopes, the ranking does not.
 
-        Each member ranks its OWN scores descending; the executor reads
-        ``sorted_idx[layer, group, col, :k_aligned]`` for that column's head.
-        Member row ``m = layer * num_kv_heads + head``; ``member_to_cluster[m]``
-        / ``member_to_col[m]`` (bound by ``set_cluster_map``) place it.
-
-        Two details are there to keep this allocation-free. The scores are
-        scattered into cluster order BEFORE sorting rather than the indices
-        after, because a score is half the width of an int64 index and the
-        scatter target is a slab we already hold. And the sort runs over the
-        slab's FULL reserved width with the unused tail held at the dtype
-        minimum, so both sort outputs are contiguous slabs: a narrower slice
-        would be non-contiguous, and ``torch.sort`` would fall back to a
-        temporary of exactly the size we are trying not to allocate. Padding can
-        never be selected — it sorts last, and the kept count is clamped to each
-        (layer, group)'s genuine eval width.
+        Two details keep this allocation-free. Scores are scattered into cluster
+        order BEFORE sorting rather than indices after, a score being half the
+        width of an int64 index and the target slab already held. And the sort
+        covers the slab's FULL width with the unused tail at the dtype minimum,
+        so both outputs are contiguous -- a narrower slice is not, and
+        ``torch.sort`` would allocate the very temporary this avoids. Padding
+        sorts last and the count is clamped to the genuine width, so it can
+        never be selected.
         """
         eval_len = eval_scores.shape[-1]
         num_clusters_total = num_layers * num_groups
@@ -746,20 +606,14 @@ class KVCompressor:
     ) -> np.ndarray:
         """Compute this chunk's per-(layer, group) post-evict kept_lengths.
 
-        This is the single source of truth for how many token slots each
-        (layer, group) keeps. It runs in three passes because a pooling budget
-        scope shares one total over a span of entries: pass 1 collects each
-        entry's block-rounded demand, pass 2 enforces the budget (per span
-        under ``layer`` / ``global``, per entry under ``uniform``), pass 3
-        turns the counts back into lengths.
+        The single source of truth for how many slots each entry keeps. Three
+        passes, because a pooling scope shares one total over a span: collect
+        each entry's block-rounded demand, enforce the budget (per span when the
+        scope pools, else per entry), turn the counts back into lengths.
 
-        It touches no KV cache; the result is cached on
-        ``req.cached_kept_lengths_cpu`` and
-        :py:meth:`CompressionExecutor.run_request`
-        reads it back (deriving its top-k span from it via
-        ``_new_region_from_kept_length``) rather than recomputing — so the two
-        stay consistent by construction. Under TP the caller may cross-rank
-        MAX-reduce the cache before ``run_request`` to keep the block pool
+        Touches no KV cache. ``run_request`` reads the cached result back rather
+        than recomputing, so the two agree by construction. Under TP the caller
+        may MAX-reduce it across ranks first, to keep the block pool
         consistent."""
         req = self.req_state.get(req_id)
         if req is None or req.cross_layer_decision is None:
@@ -783,8 +637,7 @@ class KVCompressor:
             np.int64, copy=False).reshape(num_layers, num_groups)
         total_seen = prev_lens + chunk_len
 
-        # adjusted_ratio >= 1: keep every position in the eval region. Under the
-        # budget regime this is the "cache still fits the budget" path.
+        # Keep everything; under a budget, the "cache still fits" path.
         if adjusted_ratio >= 1.0:
             kept_lengths = total_seen.astype(np.int32)
             req.cached_kept_lengths_cpu = kept_lengths
@@ -792,26 +645,16 @@ class KVCompressor:
 
         locked_cpu = req.locked_count_cpu
         k_new_cpu = req.cached_k_new_cpu
-        # Genuine (unpadded) eval width per (layer, group). Uniform under the
-        # ratio regime; ragged under the budget regime.
         real_eval_len = req.real_eval_len_cpu
 
-        # Under a budget the ceiling is the workspace's, not the raw budget:
-        # a pooling scope was sized for one entry outgrowing ``budget`` (see
-        # ``WorkspaceSpec.per_group_capacity``), and reading it back here is
-        # what keeps the reserved width and the decision from disagreeing.
-        # ``pooled_span`` is the scope's own declaration of which entries share
-        # one total; ``None`` (``uniform``, and every scope under the ratio
-        # regime, which has no absolute total to share) keeps the per-entry
-        # cap.
+        # The workspace's ceiling, not the raw budget: reading back the width
+        # a pooling scope was sized for is what keeps the two agreeing.
         pooled_span = (self.scope.pooled_span
                        if budget_tokens is not None else None)
         per_group_capacity = (self.workspace.spec.per_group_capacity
                               if budget_tokens is not None else 0)
 
-        # Pass 1 — per entry: how much it asks for (``want``, already block
-        # rounded and clamped), its block floor, and the demand that flooring
-        # dropped. Nothing is shared yet.
+        # Pass 1 — per entry: block-rounded demand, floor, dropped remainder.
         want = np.zeros((num_layers, num_groups), dtype=np.int64)
         base = np.zeros((num_layers, num_groups), dtype=np.int64)
         remainder = np.zeros((num_layers, num_groups), dtype=np.int64)
@@ -827,8 +670,7 @@ class KVCompressor:
                          if k_new_cpu is not None else 0)
                 kept_now = (
                     sink_size + locked_count + k_new + tail_size)
-                # The floor cannot ask for more than the cache holds, nor
-                # (under a budget) for more than the budget allows.
+                # A floor cannot exceed what the cache holds, nor the budget.
                 target_floor = min(floor_min_int, total_seen_g)
                 if budget_tokens is not None:
                     target_floor = min(target_floor, budget_tokens)
@@ -843,14 +685,11 @@ class KVCompressor:
                     * block_size)
                 k_aligned = min(k_aligned, eval_len_g)
                 if budget_tokens is not None:
-                    # Rounding the selection UP to a block is what keeps the
-                    # kept span page-contiguous, so the entry's own ceiling is
-                    # rounded DOWN to a block multiple rather than cutting
-                    # mid-block: the kept length then never exceeds the
-                    # capacity and stays block-aligned. Under ``uniform`` the
-                    # capacity IS the budget, so this is the whole constraint;
-                    # under a pooling scope it is only the physical ceiling and
-                    # the budget itself is enforced per span in pass 2.
+                    # The selection rounds UP for page contiguity, so the
+                    # ceiling rounds DOWN rather than cutting mid-block. Under
+                    # ``uniform`` the capacity IS the budget; under a pooling
+                    # scope it is the physical ceiling and pass 2 enforces the
+                    # budget.
                     room_g = (per_group_capacity - sink_size - locked_count
                               - tail_size)
                     k_aligned = min(
@@ -861,11 +700,8 @@ class KVCompressor:
                 remainder[layer_idx, group_idx] = (
                     k_new - base[layer_idx, group_idx])
 
-        # Pass 2 — per span: a pooling scope's entries share one total, so
-        # the budget is enforced over the span instead of entry by entry. The
-        # total is the sum of what the BUDGET (not the capacity) leaves each
-        # entry, which is where the pooling is: an entry that wants less than
-        # its share leaves the rest for the others.
+        # Pass 2 — per span: the total sums what the BUDGET, not the capacity,
+        # leaves each entry, so one wanting less leaves the rest. The pooling.
         if pooled_span is None:
             keep_counts = want
         else:
@@ -901,9 +737,6 @@ class KVCompressor:
                     kept_length = total_seen_g
                 kept_lengths[layer_idx, group_idx] = kept_length
         req.cached_kept_lengths_cpu = kept_lengths
-        # Emit the finalized decision to an optional observer (None in
-        # production — no extra work). Offline tooling uses this to record
-        # per-(layer, head) retention without touching the production path.
         if self.keep_decision_observer is not None:
             self.keep_decision_observer.record(
                 req_id,
@@ -926,14 +759,14 @@ class KVCompressor:
         """Follow one (layer, head-group)'s KV eviction in the score memory.
 
         Called by the executor right after it gathers a cluster's kept KV, with
-        the same per-column position matrix, so the active regime's score memory
-        stays slot-aligned with the KV and an evicted position's statistics are
-        released. A no-op under the ratio regime, whose score memory is
-        chunk-local and holds nothing that outlives the eviction.
+        the same per-column position matrix, so a score stays slot-aligned with
+        its KV and an evicted position's statistics are released. A no-op under
+        the ratio regime, whose score memory holds nothing that outlives the
+        eviction.
 
-        ``compressed_layer_idx`` is the index in COMPRESSED layer space (the
-        space the compressor's caches and the cluster ids live in), not the
-        physical layer the executor addresses the KV cache with.
+        ``compressed_layer_idx`` is in COMPRESSED layer space -- the space the
+        compressor's caches and cluster ids live in -- not the physical layer
+        the executor addresses the cache with.
         """
         req = self.req_state.get(req_id)
         if req is None:
@@ -950,9 +783,9 @@ class KVCompressor:
         num_layers: int,
         num_groups: int,
     ) -> None:
-        """Compression must run only on chunked-prefill: ``prev_lens`` must
-        match the kept lengths the last eviction committed (or be all-zero
-        before the first one)."""
+        """``prev_lens`` must equal the kept lengths the last eviction
+        committed, or be all-zero before the first one. An interleaved decode
+        step would have advanced them."""
         del num_layers, num_groups
         if not req.has_committed:
             if (prev_lens != 0).any():
@@ -984,8 +817,7 @@ class KVCompressor:
         silently rank stale scores.
         """
         if not self.chunk_scoring_enabled:
-            # The scorer never ran, by design; hand back an empty view so the
-            # score source sees a well-formed (zero-width) chunk.
+            # The scorer never ran by design; an empty view is well-formed.
             return self.workspace.pending_score[req.row, :, :, :0]
         cursors = self.workspace.pending_len[req.row, :num_layers]
         bad = np.flatnonzero(cursors != chunk_len)
@@ -1004,12 +836,10 @@ class KVCompressor:
         new_locked: np.ndarray,
         kept_lengths: np.ndarray,
     ) -> None:
-        """Record the result of one eviction: the positions now permanently kept
-        and the length each (layer, group) was cut to.
-
-        Called by the executor once the KV has actually been rewritten, so the
-        next chunk's ``prev_seq_lens`` check and the regime's locked counts read
-        the committed state rather than the intent.
+        """Record one eviction's result: the positions now permanently kept and
+        the length each (layer, group) was cut to. Called once the KV is
+        actually rewritten, so the next chunk's once-only check and the
+        regime's locked counts read committed state, not intent.
         """
         state = self.req_state.get(req_id)
         if state is None:
@@ -1029,30 +859,22 @@ class KVCompressor:
     ) -> None:
         """Wire the per-layer scorer into the model (axis 2), compile-safely.
 
-        ``parents[i]`` is layer i's outer attention block (exposes
-        hidden_states); ``inners[i]`` is its inner ``Attention`` (exposes
-        post-RoPE query/key). Neither uses module forward hooks: torch.compile
-        skips hooks when it inlines module forwards, which would silently drop
-        all scoring under compilation. Instead, both scorer kinds are
-        delivered through custom ops that are piecewise *splitting ops*
-        (listed in ``CompilationConfig._attention_ops``), so their Python
-        bodies execute eagerly between captured CUDA-graph pieces on every
-        step:
+        ``parents[i]`` is layer i's outer block (has hidden_states),
+        ``inners[i]`` its inner ``Attention`` (has post-RoPE query/key). No
+        forward hooks: torch.compile skips them when it inlines a module
+        forward, which would silently drop all scoring. Both kinds are
+        delivered through piecewise SPLITTING ops instead -- they must stay
+        listed in ``CompilationConfig._attention_ops`` -- so their Python
+        bodies run eagerly between captured CUDA-graph pieces every step. A qk
+        scorer goes on the inner ``Attention`` as ``compression_qk_scorer``,
+        invoked from the ``vllm::unified_attention_ragged`` body; a
+        hidden_states scorer as ``compression_gate_capture``, invoked by a
+        ``vllm::tangram_gate_capture`` call wrapped in front of the outer
+        block's forward, which dynamo does trace.
 
-        - query/key scorers (SnapKV, KeyDiff, ...) are stored on the inner
-          ``Attention`` as ``compression_qk_scorer`` and invoked at the top of
-          the ``vllm::unified_attention_ragged`` op body, which receives
-          the same token-major query/key/value the old pre-hook saw.
-        - hidden_states scorers (FastKVZip gate) are stored on the inner
-          ``Attention`` as ``compression_gate_capture`` and invoked by a
-          ``vllm::tangram_gate_capture`` op call inserted in front of the
-          outer block's forward (instance-level wrap; dynamo traces the
-          wrapper and keeps the op as an opaque graph node).
-
-        Every delivered fn fires only when ``compress_active`` is True and
-        ``pending_req_offsets`` is non-empty (else zero overhead). Caller owns
-        the ordering: ``parents[i]`` / ``inners[i]`` must correspond to
-        ``scorers[i]``."""
+        Each fires only while ``compress_active`` and ``pending_req_offsets``
+        are set, so the dense path pays nothing. The caller owns the ordering:
+        ``parents[i]`` / ``inners[i]`` must correspond to ``scorers[i]``."""
         if self.scorer_consumes not in ("hidden_states", "qk"):
             raise ValueError(
                 f"attach_scorers: unknown scorer_consumes "
@@ -1064,9 +886,7 @@ class KVCompressor:
         for layer_idx, (parent, inner, scorer) in enumerate(
                 zip(parents, inners, self.scorers)):
             if self.scorer_consumes == "qk":
-                # ``parent`` is threaded through because ExpectedAttention
-                # needs the outer block's ``rotary_emb`` (the inner op only
-                # runs the attention kernel and has no RoPE).
+                # ExpectedAttention needs the outer block's ``rotary_emb``.
                 inner.compression_qk_scorer = self._make_qk_scorer(
                     layer_idx, scorer, parent)
             else:
@@ -1075,11 +895,11 @@ class KVCompressor:
                 _wrap_forward_with_gate_capture(parent, inner.layer_name)
 
     def _make_hidden_states_capture(self, layer_idx: int, scorer: nn.Module):
-        """Capture fn for hidden_states scorers (FastKVZip gate), invoked by
-        the ``vllm::tangram_gate_capture`` op with the outer block's input
-        hidden_states. Concatenates all compression-active request slices into
-        a single forward per layer to amortise kernel launch (per-token scores
-        are request-independent)."""
+        """Capture fn for hidden_states scorers, invoked by
+        ``vllm::tangram_gate_capture`` with the outer block's input
+        hidden_states. Concatenates every compression-active request slice into
+        one forward per layer to amortise the launch -- per-token gate scores
+        are request-independent."""
 
         def capture(hidden_states: torch.Tensor,
                     _idx=layer_idx, _scorer=scorer) -> None:
@@ -1119,22 +939,17 @@ class KVCompressor:
     def _make_qk_scorer(
         self, layer_idx: int, scorer: nn.Module, parent: nn.Module,
     ):
-        """Scorer fn for query/key scorers (SnapKV, KeyDiff, StreamingLLM,
-        TOVA, ExpectedAttention), invoked from the ragged attention op
-        body with the op's token-major query / key / value (post-RoPE — the
-        same tensors the inner ``Attention``'s forward receives). Scores each
-        request's chunk independently — the observation window is
-        chunk-relative, so request slices must NOT be concatenated.
+        """Scorer fn for qk scorers, invoked from the ragged attention op body
+        with its token-major post-RoPE query / key / value. Each request's chunk
+        is scored independently: the observation window is chunk-relative, so
+        request slices must NOT be concatenated.
 
-        Every qk scorer is called with the uniform contract
-        ``scorer(query, key, value, *, module, position_offset)``: ``value``
-        feeds value-norm reweighting (ExpectedAttention); ``module`` is the
-        OUTER attention block (``parent``), the one that owns ``rotary_emb`` —
-        the inner op only runs the attention kernel and has no RoPE — so
-        ExpectedAttention can recover pre-RoPE queries / build the future-
-        position rotation; ``position_offset`` is the chunk's global start
-        position (StreamingLLM recency, ExpectedAttention future positions).
-        Scorers that do not need an argument simply ignore it."""
+        Uniform contract ``scorer(query, key, value, *, module,
+        position_offset)``, arguments ignored by scorers that do not need them.
+        ``value`` feeds value-norm reweighting. ``module`` is the OUTER block,
+        the one owning ``rotary_emb`` -- the inner op only runs the kernel and
+        has no RoPE. ``position_offset`` is the chunk's global start
+        position."""
 
         def score_qk(query: torch.Tensor, key: torch.Tensor,
                      value: torch.Tensor | None,

@@ -1,31 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""StreamingLLM scorer — recency-based importance score (compression axis 2).
+"""StreamingLLM scorer — recency-based importance score (axis 2).
 
-Produces the same ``[num_kv_heads, chunk_len]`` score contract every scorer
-does, but from token *position* alone (it ignores query/key/value content).
-The shared chunk machinery consumes the score identically.
+Scores by token position alone, ignoring query/key/value content. Paper:
+"Efficient Streaming Language Models with Attention Sinks"
+(https://arxiv.org/abs/2309.17453) -- keep the sink plus the most recent tokens,
+evict the middle. Both of those are already protected unconditionally, so this
+scorer only ranks the eval region between them by recency, extending the recent
+block; with the uniform budget scope that reproduces StreamingLLM exactly.
 
-Paper "Efficient Streaming Language Models with Attention Sinks"
-(Xiao et al., https://arxiv.org/abs/2309.17453): keep the attention-sink
-tokens plus the most recent tokens, evict the middle. tangram's shared
-machinery already protects the sink (``n_sink_tokens``) and the recent window
-(``window_size``) unconditionally, so this scorer only has to rank the
-*eval region* (between sink and window) by recency — the most recent eval
-tokens are kept first, extending the recent block. With the uniform budget
-scope this reproduces StreamingLLM exactly.
-
-The score MUST be monotonic in the token's GLOBAL sequence position, not its
-chunk-local position: the keep decision ranks the current chunk's body against
-the carried-over previous-chunk window in one workspace (compressor.py
-``prepare_keep_decision``), and those tokens span chunk boundaries. A
-chunk-local ``arange`` would let an older previous-chunk token outrank a newer
-current-chunk token (inverting recency), so the score is anchored at the
-chunk's global start via ``position_offset``.
-
-Because it is purely positional, StreamingLLM is best read as a recency
-*baseline* — the reference line that content-aware scorers (SnapKV,
-ExpectedAttention) must beat — rather than a content-aware method.
+The score MUST be monotonic in the token's GLOBAL sequence position, hence the
+anchor at ``position_offset``: the keep decision ranks the fresh chunk against
+the carried previous window in one workspace, so a chunk-local ``arange`` would
+let an older carried token outrank a newer one and invert recency.
 """
 from __future__ import annotations
 
@@ -35,14 +22,9 @@ from vllm.v1.attention.compression.qk_scorer_base import QKScorer
 
 
 class StreamingLLMScorer(QKScorer):
-    """One (stateless) instance shared across all compressible layers.
-
-    Input:  ``query`` / ``key`` / ``value`` (all unused — accepted only to
-            match the uniform qk scorer contract) and ``position_offset``, the
-            global sequence position of the chunk's first token.
-    Output: scores ``[num_kv_heads, chunk_len]`` (float32); higher = more
-            recent (kept), lower = older (evicted first).
-    """
+    """Reads only ``position_offset``, the global sequence position of the
+    chunk's first token; query/key/value are accepted to match the shared
+    contract. Higher score = more recent, hence kept."""
 
     # Axis-2 dispatch: this scorer uses the query/key delivery path, so it
     # shares the call signature even though it reads neither q nor k.
@@ -55,9 +37,8 @@ class StreamingLLMScorer(QKScorer):
         head_size: int = 0,
         num_q_per_kv: int = 1,
     ) -> None:
-        # ``head_size`` / ``num_q_per_kv`` are part of the shared
-        # construction contract every scorer is built with; a purely
-        # positional score needs neither.
+        # Part of the shared construction contract; a positional score needs
+        # neither.
         del head_size, num_q_per_kv
         super().__init__()
         self.num_kv_heads = num_kv_heads
@@ -77,19 +58,17 @@ class StreamingLLMScorer(QKScorer):
         del query, value, module
 
         chunk_len = key.shape[0]
-        # Global position of each token: a token later in the sequence scores
-        # higher, so the uniform top-k keeps the most recent eval tokens. fp32
-        # is exact for any real sequence position (< 2**24) and matches the
-        # other scorers' fp32 output.
+        # Later in the sequence scores higher, so the top-k keeps the most
+        # recent eval tokens. fp32 is exact below 2**24 positions and matches
+        # every other scorer's output dtype.
         positions = torch.arange(
             position_offset,
             position_offset + chunk_len,
             dtype=torch.float32,
             device=key.device,
         )
-        # All heads share the same positional score (StreamingLLM is
-        # head-agnostic); broadcast to the per-head contract. Materialize so the
-        # returned tensor owns its storage (the score is stashed and later
-        # concatenated / copied into the score workspace).
+        # Head-agnostic, so broadcast one score to the per-head contract.
+        # Materialize: the result is stashed and later copied, so it must own
+        # its storage.
         return positions.unsqueeze(0).expand(
             self.num_kv_heads, chunk_len).contiguous()

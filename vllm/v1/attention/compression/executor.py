@@ -28,12 +28,9 @@ def _new_region_from_kept_length(
 ) -> int:
     """Recover the block-aligned top-k ("new") span from ``kept_length``.
 
-    ``kept_length`` is produced once by
-    ``KVCompressor.compute_kept_lengths_per_rank`` and packs
-    ``sink + locked + new + tail`` slots; the writeback needs the ``new``
-    region back out. ``eval_len`` clamps it to the scored region when the
-    caller slices ``sorted_idx``; the keep-all fast path takes no slice and
-    omits the clamp.
+    ``kept_length`` packs ``sink + locked + new + tail`` and the writeback
+    needs ``new`` back. ``eval_len`` clamps it to the scored region when the
+    caller slices ``sorted_idx``; the keep-all path takes no slice and omits it.
     """
     new = max(0, kept_length - sink_size - locked - tail_size)
     if eval_len is not None:
@@ -45,9 +42,8 @@ def _new_region_from_kept_length(
 class CompressionMetadata:
     """Per-(request, step) compression info passed to ``run_request``.
 
-    ``floor_min`` is the per-(layer, group) ``kept_lengths`` absolute
-    floor; 0 disables it. All other run-shape config lives on the
-    compressor under ``req_state[req_id]``.
+    ``floor_min`` is the per-entry absolute ``kept_lengths`` floor, 0 to
+    disable. Everything else lives on the compressor's ``req_state``.
     """
     req_id: str
     row_idx: int
@@ -79,15 +75,9 @@ class CompressionExecutor:
         )
         self.head_size = head_size
         self.block_size = block_size
-        # Physical indices of the compressible (full-attention) layers, in the
-        # same order as the compressor's per-layer state. For a dense model
-        # every layer is compressible, so this is ``range(num_layers)`` and the
-        # loop below is unchanged. For sliding-window hybrids (e.g. gemma-3,
-        # gpt-oss) only the full-attention layers appear here; sliding-window
-        # layers keep their full KV and are skipped (never evicted). The
-        # compressor's caches are indexed by the *compressed* position
-        # ``static_idx`` while KV / block-table access uses the *physical*
-        # layer ``compressed_layer_ids[static_idx]``.
+        # The compressor's caches are indexed by COMPRESSED position while KV
+        # and block-table access uses the PHYSICAL layer; for a dense model
+        # the two coincide.
         if compressed_layer_ids is None:
             compressed_layer_ids = list(range(num_layers))
         self.compressed_layer_ids = compressed_layer_ids
@@ -106,26 +96,17 @@ class CompressionExecutor:
     ) -> np.ndarray:
         """Apply the keep decision to every compressible layer in one call.
 
-        Compressible layers are the full-attention layers (all layers for a
-        dense model; only the non-sliding layers for a sliding-window hybrid).
-        Slots ``[0, kept_lengths[compressed_layer, group])`` of each cache are
-        overwritten with the kept KV (block-aligned write). The
-        ``block_table`` is not mutated; the caller invokes
+        Slots ``[0, kept_lengths[entry])`` are overwritten with the kept KV,
+        block-aligned, and ``block_table`` is NOT mutated -- the caller runs
         ``compact_after_compress_all_layers`` afterwards. Returns
-        ``[num_compressed, num_groups]`` int32 post-evict lengths, indexed by
-        compressed position (not physical layer).
+        ``[num_compressed, num_groups]`` int32 by compressed position, and
+        requires ``prepare_keep_decision`` to have run.
 
-        ``prev_seq_lens_static_cpu`` is the ``[num_compressed, num_groups]``
-        per-compressible-layer valid length as of the previous compression
-        boundary (the kept_lengths the last eviction left). It is passed
-        explicitly rather than read from the worker's ``effective_seq_lens``
-        because, once a chunk is sliced across forward steps, that array holds
-        the raw write extent (kept + accumulated), not the pre-chunk length the
-        keep arithmetic needs. ``total_seen = prev + chunk_len`` still equals
-        the physical written extent, so the block reads are unchanged.
-
-        Requires ``prepare_keep_decision`` to have populated
-        ``req.cross_layer_decision`` and the per-(layer, group) caches.
+        ``prev_seq_lens_static_cpu`` is the length as of the previous boundary,
+        passed explicitly rather than read from ``effective_seq_lens`` because
+        once a chunk is sliced across steps that array holds the raw write
+        extent instead. ``total_seen = prev + chunk_len`` still equals the
+        written extent, so the block reads are unchanged.
         """
         assert block_table.ragged, (
             "CompressionExecutor.run_request requires a ragged "
@@ -133,9 +114,6 @@ class CompressionExecutor:
         )
         assert len(layer_kv_caches) == self.num_layers
 
-        # ``num_compressed`` sizes the compressor's per-compressed-layer state
-        # (kept_lengths, locked, sorted_idx); ``compressed_layer_ids`` maps a
-        # compressed position to its physical layer for KV / block-table access.
         num_compressed = self.num_compressed_layers
         compressed_layer_ids = self.compressed_layer_ids
         num_groups = self.num_head_groups_per_layer
@@ -151,16 +129,13 @@ class CompressionExecutor:
                 "must run before run_request.")
         keep_dec = req.cross_layer_decision
         sink_size = keep_dec.sink_size
-        # Trailing always-kept span: the recent window under the ratio regime,
-        # the whole fresh chunk under the budget regime (unless configured
-        # otherwise). The writeback only needs its width.
+        # The writeback needs only the always-kept tail's width.
         tail_size = keep_dec.tail_size
         adjusted_ratio = keep_dec.adjusted_ratio
         eval_len = keep_dec.eval_len
-        # Genuine (unpadded) eval width per (layer, group): uniform under the
-        # ratio regime, ragged under the budget regime, where the score tensor
-        # is padded to the widest group. Slicing ``sorted_idx`` past a group's
-        # own width would pick padding positions.
+        # Ragged under the budget regime, where the score tensor is padded to
+        # the widest group: slicing ``sorted_idx`` past a group's own width
+        # would pick padding.
         real_eval_len = req.real_eval_len_cpu
 
         # Under TP the runner cross-rank MAX-reduces kept_lengths before
@@ -195,10 +170,6 @@ class CompressionExecutor:
         row_idx = metadata.row_idx
 
         for static_idx, layer_idx in enumerate(compressed_layer_ids):
-            # ``layer_idx`` is the physical layer (KV cache + block-table);
-            # ``static_idx`` indexes the compressor's per-compressed-layer
-            # caches (kept_lengths, locked, sorted_idx, layer_states). For a
-            # dense model the two coincide.
             kv_cache = layer_kv_caches[layer_idx]
             layer_first = layer_idx * num_groups
 
@@ -231,9 +202,8 @@ class CompressionExecutor:
                 kept_lo = sink_size + locked
                 tail_lo = total_seen - tail_size
 
-                # Under TP this rank may need to extend its top-k up to
-                # the cross-rank-MAX-reduced kept_length; sorted_idx
-                # already holds eval_len positions so the slice is safe.
+                # Under TP this rank may extend its top-k to the MAX-reduced
+                # length; sorted_idx holds eval_len, so the slice is safe.
                 kept_length = int(kept_lengths_all[static_idx, group_idx])
                 k_aligned = _new_region_from_kept_length(
                     kept_length, sink_size, locked, tail_size,
@@ -262,18 +232,14 @@ class CompressionExecutor:
                     kept_length=kept_length,
                     device=device,
                 )
-                # Keep the regime's score memory slot-aligned with the KV it
-                # just rewrote, using the very same positions: an evicted
-                # position's statistics are released, a surviving position's
-                # follow it to its new slot. No-op under the ratio regime.
+                # The very same positions, so a survivor's statistics follow
+                # it to its new slot and an evicted one's are released.
                 compressor.compact_cluster_stats(
                     metadata.req_id, static_idx, group_idx,
                     keep_positions, kept_length)
 
-        # Publish the committed result in one call: the positions now
-        # permanently kept and the length each (layer, group) was cut to. The
-        # compressor owns that state (it lives in the preallocated workspace),
-        # so the executor reports rather than writes it.
+        # The compressor owns this state -- it lives in the preallocated
+        # workspace -- so the executor reports rather than writes it.
         compressor.commit_chunk(
             metadata.req_id, new_locked_all, kept_lengths_all)
         req.borrowed_sorted_indices = None
@@ -296,37 +262,25 @@ class CompressionExecutor:
     ) -> torch.Tensor:
         """Evict one (layer, group): gather the kept KV positions, write back.
 
-        ``block_ids`` are the cluster's physical blocks covering the
-        pre-eviction span. Its column-major page
-        ``[2, n_blocks, page_group_size, block_size, head_size]`` is viewed
-        token-major (a free permute, no copy) so the kept positions can be
-        gathered directly — the full slab is never materialised, avoiding the
-        O(total_seen) copy a ``.reshape`` of the permuted tensor would force.
-        The kept KV is then written back block-aligned into the same blocks,
-        with the trailing partial block zero-padded.
+        The column-major page is viewed token-major -- a free permute -- so the
+        kept positions gather directly and the full slab is never materialised,
+        which a ``.reshape`` of the permuted tensor would force at
+        O(total_seen). The result is written back block-aligned into the same
+        blocks, trailing partial block zero-padded.
 
-        The kept positions form a ``[page_group_size, kept_length]`` matrix:
-        every column (KV head) keeps the same sink / locked / tail positions,
-        and only the middle ``k_aligned`` block — that column's own top-k by
-        score, taken from ``sorted_idx_group`` (the per-(layer, group)
-        descending ranking, shape ``[page_group_size, eval_len]``) — differs.
-        ``sorted_idx_group`` is dereferenced only when ``k_aligned > 0``; the
-        fast / zero paths pass ``k_aligned == 0`` (and may pass ``None``). The
-        shared sink/locked/k_aligned/tail counts make every column the same
-        length, so the pad + write-back are column-uniform.
-
-        Returns that matrix, so the caller can apply the identical positions to
-        anything else stored per cache slot (the regime's score memory).
-
-        See vllm/v1/attention/backends/ragged_layout.py for the layout.
+        The kept positions form a ``[page_group_size, kept_length]`` matrix in
+        which every column keeps the SAME sink / locked / tail and only the
+        middle ``k_aligned`` span differs, so the pad and write-back are
+        column-uniform. It is returned, so the caller can apply the identical
+        positions to anything else stored per cache slot.
+        ``sorted_idx_group`` is dereferenced only when ``k_aligned > 0``.
         """
         page_group_size = self.page_group_size
         block_size = self.block_size
         head_size = self.head_size
         sink_size = int(sink_idx.numel())
 
-        # Token-major view of the cluster's blocks, so token t lives at block
-        # t // block_size, offset t % block_size (see ragged_layout).
+        # Token t then lives at block t // block_size, offset t % block_size.
         slab_view = cluster_pages_token_major(kv_cache, block_ids)
 
         col_parts: list[torch.Tensor] = []
@@ -356,8 +310,7 @@ class CompressionExecutor:
         col_ix = torch.arange(
             page_group_size, device=device, dtype=torch.long
         ).unsqueeze(1).expand_as(keep_mat)
-        # Advanced-index (block, offset, column) -> [2, page_group_size,
-        # kept_length, head_size].
+        # (block, offset, column) -> [2, page_group_size, kept, head_size].
         kept_kv = slab_view[
             :, keep_block, keep_offset, col_ix
         ].permute(0, 2, 1, 3).contiguous()
@@ -370,8 +323,7 @@ class CompressionExecutor:
                 2, padded_size - kept_length, page_group_size, head_size,
                 dtype=kept_kv.dtype, device=device)
             kept_kv = torch.cat([kept_kv, pad], dim=1)
-        # Inverse of the gather: token-major slab back to column-major
-        # [2, n_blocks_write, page_group_size, block_size, head_size].
+        # Inverse of the gather: token-major slab back to column-major.
         kv_cache[:, block_ids[:n_blocks_write]] = (
             kept_kv.view(
                 2, n_blocks_write, block_size, page_group_size, head_size)

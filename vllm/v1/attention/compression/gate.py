@@ -22,8 +22,7 @@ logger = init_logger(__name__)
 # Hub repo hosting the trained gate checkpoints, laid out as per-model
 # subdirectories (e.g. ``qwen3-4b-instruct-2507/q4_dim16_sink16.pt``).
 _GATE_HF_REPO = "hmkim97/tangram-gate"
-# Pin to an immutable commit so a later push to the repo can't silently swap
-# the weights behind an unchanged filename (reproducibility).
+# Pinned so a later push cannot swap weights behind an unchanged filename.
 _GATE_HF_REVISION = "06a628fab229ff3075f69b61f43fa0ef6631c875"
 _GATE_SHORT_ID_ALIASES = {
     "llama-3.1-8b-instruct": "llama3.1-8b-instruct",
@@ -174,8 +173,7 @@ def _hf_cached_gate_path(resolved: str) -> str | None:
 
 
 def _hf_download_gate_path(resolved: str, gate_path: str) -> str:
-    # Download from the pinned revision; on failure raise with the cause
-    # distinguished instead of a generic "not found".
+    # From the pinned revision; a failure raises with the cause named.
     from huggingface_hub import hf_hub_download
     from huggingface_hub.utils import (EntryNotFoundError, GatedRepoError,
                                        HfHubHTTPError, OfflineModeIsEnabled,
@@ -286,11 +284,9 @@ def load_gates(
 ) -> list[CompressionGate]:
     """Load per-layer gate modules from a Fast-KVzip checkpoint.
 
-    Shapes (``num_groups``, ``output_dim``, ``sink_dim``) are inferred
-    from the layer-0 state dict. Under TP, the checkpoint stores
-    global KV heads; each rank slices its own range via
-    ``_shard_gate_state_dict``. Errors out (no random-init fallback) if
-    the checkpoint is missing or shape-mismatched.
+    Shapes are inferred from the layer-0 state dict. The checkpoint stores
+    global KV heads, so under TP each rank slices its own range. A missing or
+    shape-mismatched checkpoint raises: there is no random-init fallback.
     """
     file_path = _download_or_local(model_name, gate_path)
     # full unpickling is trusted here. Only blob["module"] (tensors) is consumed.
@@ -326,9 +322,8 @@ def load_gates(
             f"must be a multiple of num_kv_heads_per_rank "
             f"({num_kv_heads_per_rank}).")
 
-    # k_base's third dim is the authoritative sink count (the gate is built and
-    # weight-loaded against it). A differing filename-encoded count means a
-    # mislabeled checkpoint — fail loudly, like the mismatch checks above.
+    # k_base's third dim is the authoritative sink count, the gate being built
+    # against it; a differing filename count means a mislabeled checkpoint.
     m = re.search(r"sink(\d+)", os.path.basename(file_path))
     if m and int(m.group(1)) != sink_dim:
         raise ValueError(

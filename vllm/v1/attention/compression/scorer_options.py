@@ -1,31 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Per-scorer hyperparameters (compression axis 2), declared by the scorer.
+"""Per-scorer hyperparameters (axis 2), declared by the scorer.
 
-A scorer often has settings that only it understands — SnapKV's observation
-window, KeyDiff's anchor formula, ExpectedAttention's covariance term. Giving
-each of them its own configuration field, CLI flag and constructor parameter
-makes adding a scorer a six-file change, which is exactly what the axis-2
-registry exists to prevent. Instead a scorer declares its settings as
-``OPTIONS``, and the engine carries them through one generic channel
-(``CacheConfig.compression_scorer_options``):
+A scorer declares its settings as ``OPTIONS`` and the engine carries them
+through one generic channel (``CacheConfig.compression_scorer_options``), so a
+new scorer or setting is a subclass plus one declaration -- no configuration,
+CLI, entrypoint or factory signature changes. The declaration is the single
+source of truth for the default, the accepted values and the help text, so
+validation, the startup log and the error messages cannot drift from the code
+that consumes them.
 
-    class KeyDiffScorer(QKScorer):
-        OPTIONS = (ScorerOption("anchor", str, "unnormalized", "...",
-                                choices=("unnormalized", "normalized")),)
-
-    vllm serve ... --compression-scorer keydiff \\
-                   --compression-scorer-options anchor=normalized
-
-So a new scorer, or a new setting on an existing one, is a subclass plus one
-declaration: no configuration, CLI, entrypoint or factory signature changes.
-The declaration is also the single source of truth for the setting's DEFAULT,
-its accepted values and its help text, so validation, the startup log and the
-error messages cannot drift apart from the code that consumes it.
-
-This module deliberately holds no torch import: configuration validation and
-CLI parsing resolve options through it, and neither should pull the runtime
-scorer modules into its import graph.
+No torch import here on purpose: config validation and CLI parsing resolve
+options through this module and must not pull the runtime scorers in.
 """
 from __future__ import annotations
 
@@ -42,17 +28,13 @@ class ScorerOption:
     """One setting a scorer understands.
 
     Attributes:
-        name: key as written on the command line (namespaced by the scorer, so
-            short names like ``window`` are unambiguous).
-        type: ``str`` / ``int`` / ``float`` / ``bool`` — how the raw string is
-            converted before it reaches the scorer's constructor.
-        default: value used when the setting is not given. This is THE default;
-            configuration must not carry a second copy of it.
+        name: key as written on the command line, namespaced by the scorer.
+        type: how the raw string is converted before the constructor sees it.
+        default: THE default. Configuration must not carry a second copy.
         help: one sentence for ``--help`` and the startup log.
-        choices: accepted values for a ``str`` option, or ``None`` for free form.
-        requirement: what the converted value must satisfy, as the phrase for
-            the error message and the predicate, e.g.
-            ``("a positive odd integer", lambda v: v > 0 and v % 2 == 1)``.
+        choices: accepted values for a ``str`` option, else ``None``.
+        requirement: ``(phrase, predicate)`` the converted value must satisfy,
+            e.g. ``("a positive odd integer", lambda v: v > 0 and v % 2 == 1)``.
     """
     name: str
     type: type
@@ -65,10 +47,9 @@ class ScorerOption:
 def parse_scorer_options(raw: str) -> dict[str, str]:
     """Parse ``"key=value,key=value"`` into a mapping of raw strings.
 
-    Values are left as text here because only the scorer's ``OPTIONS`` know
-    each key's type; ``resolve_scorer_options`` does the conversion. An empty
-    string is an empty mapping so ``--compression-scorer-options ""`` means
-    "no options" rather than an error.
+    Left as text because only the scorer's ``OPTIONS`` know each key's type;
+    ``resolve_scorer_options`` converts. An empty string is an empty mapping, so
+    ``--compression-scorer-options ""`` means "no options", not an error.
     """
     options: dict[str, str] = {}
     for item in raw.split(","):
@@ -131,11 +112,9 @@ def resolve_scorer_options(
 ) -> dict[str, Any]:
     """Apply ``given`` on top of the declared defaults, typed and validated.
 
-    Every key must be one this scorer declares: an unknown key is a mistake the
-    user wants to hear about (a typo, or a setting meant for a different
-    scorer), never something to ignore. The returned mapping is complete — one
-    entry per declared option — so the scorer's constructor receives every
-    setting explicitly and never has to re-state a default.
+    An unknown key raises -- it is a typo or a setting meant for another
+    scorer, never something to ignore. The result is complete, one entry per
+    declared option, so a constructor never re-states a default.
     """
     declared = {option.name: option for option in options_spec}
     resolved: dict[str, Any] = {
@@ -158,11 +137,9 @@ def describe_scorer_options(
     options_spec: Sequence[ScorerOption],
     resolved: Mapping[str, Any],
 ) -> str:
-    """One line naming every setting in force, for the startup log.
-
-    Printed whether or not anything was overridden: a scorer's behaviour
-    depends on these, so a run's log should state them rather than leave the
-    reader to infer defaults from the source.
+    """One line naming every setting in force, printed whether or not anything
+    was overridden: behaviour depends on these, so a log should state them
+    rather than leave a reader to infer defaults from the source.
     """
     if not options_spec:
         return f"scorer '{scorer_name}' has no options"
