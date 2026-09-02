@@ -510,12 +510,20 @@ class KVCompressor:
         forward steps (the token budget is shared), and the scorer scores only
         the tokens present in each step. Concatenating in arrival order
         assembles a full ``chunk_size`` of per-token scores by the boundary
-        step that runs the keep decision. Per-token scores are chunk-invariant
-        (a token's hidden_states is identical regardless of how prefill was
-        sliced — chunked prefill keeps full KV and attention is causal), so the
-        appended buffer is byte-equivalent to the serial baseline's single
-        full-chunk score. ``_take_pending`` consumes + rewinds it only at a
-        boundary step."""
+        step that runs the keep decision. ``_take_pending`` consumes + rewinds
+        it only at a boundary step.
+
+        Byte-equivalence to the serial baseline's single full-chunk score holds
+        for the hidden-states gate only: a token's hidden_states does not
+        depend on how prefill was sliced (chunked prefill keeps full KV and
+        attention is causal), so its score does not either. The qk scorers
+        (``snapkv``, the default, and ``tova``) measure a chunk-relative
+        observation window — see ``_make_qk_scorer`` — so a sub-chunk's window
+        is not the full chunk's, and the assembled buffer differs from the
+        serial one. That divergence is accepted, not a defect: the alternative
+        is refusing to score until a chunk is whole, which costs the
+        concurrency. Do not use bit-identical output as a test oracle for a
+        chunk-relative scorer."""
         if score.shape[0] != self.num_kv_heads_per_layer:
             raise ValueError(
                 f"score head dim {score.shape[0]} != "

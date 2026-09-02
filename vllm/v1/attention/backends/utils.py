@@ -56,7 +56,7 @@ def full_attention_layer_indices(vllm_config: VllmConfig) -> list[int]:
     ``sliding_window is None`` — the single signal used to decide which layers
     are compressible by FastKVZip (and therefore carry a head-group cluster
     map). This is the shared source of truth for that decision: the compression
-    engine (``GPUModelRunner._init_compression``) and the ragged
+    engine (``CompressionModelRunnerMixin._init_compression``) and the ragged
     FlashAttention metadata builder both call it, so their static-layer sets
     cannot drift. For a dense model every layer is full-attention, so the result
     is ``range(num_decoder_layers)``.
@@ -88,9 +88,9 @@ def sliding_window_layers(vllm_config: VllmConfig) -> tuple[list[int], int]:
     These layers are not compressed by FastKVZip (they keep full KV within the
     window); the sliding-window KV eviction
     (``BlockTable.null_front_blocks_sliding`` driven by
-    ``GPUModelRunner._run_compression_layer_loop``) frees their out-of-window
-    blocks. Defined next to ``full_attention_layer_indices`` so the
-    full-vs-sliding layer split has one source of truth.
+    ``CompressionModelRunnerMixin._run_compression_layer_loop``) frees their
+    out-of-window blocks. Defined next to ``full_attention_layer_indices`` so
+    the full-vs-sliding layer split has one source of truth.
 
     A single window across all sliding-window layers is assumed (e.g. gemma-3:
     1024); a model mixing window sizes raises ``NotImplementedError``. Returns

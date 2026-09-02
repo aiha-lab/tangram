@@ -163,7 +163,7 @@ class CompressionRequestMetadata:
 
     Populated only for prefill chunks of compression-enabled requests;
     empty otherwise. Consumed by
-    ``GpuModelRunner._execute_with_compression``.
+    ``CompressionModelRunnerMixin._compression_step``.
     """
     req_id: str
     # Keep fraction of the re-eval region per chunk
