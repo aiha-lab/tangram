@@ -17,6 +17,7 @@ coalescing.
 """
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -410,6 +411,38 @@ class RaggedStepViews:
     seq_lens_grouped: torch.Tensor
     slot_mapping_grouped: torch.Tensor
     query_start_loc_grouped: torch.Tensor
+
+
+def layer_overlay(
+    metadata,
+    *,
+    num_actual_tokens: int,
+    block_table: torch.Tensor,
+    seq_lens: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    query_start_loc: torch.Tensor,
+):
+    """A per-layer view of one step's attention metadata.
+
+    Under ragged paging a layer's sequences are its own (request, KV-head)
+    members, so five fields differ per layer while every other field of the
+    step's metadata is shared. This returns a shallow copy with exactly those
+    five replaced -- the single place that says which five they are.
+
+    ``copy.copy`` rather than ``dataclasses.replace``: replace() re-runs
+    ``__init__`` over every field, which is pure-Python work paid once per layer
+    per step on the eager critical path. Copying ``__dict__`` and overwriting
+    five entries leaves the rest as shared read-only references, which is what
+    the caller wants anyway. Equivalent because the metadata dataclasses on this
+    path define no ``__post_init__``.
+    """
+    overlay = copy.copy(metadata)
+    overlay.num_actual_tokens = num_actual_tokens
+    overlay.block_table = block_table
+    overlay.seq_lens = seq_lens
+    overlay.slot_mapping = slot_mapping
+    overlay.query_start_loc = query_start_loc
+    return overlay
 
 
 def build_ragged_step_views(

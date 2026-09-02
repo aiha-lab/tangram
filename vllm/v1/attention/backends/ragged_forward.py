@@ -23,12 +23,12 @@ why its inputs may be padded to a capture size.
 # import one-way, with no runtime dependency back on the layer.
 from __future__ import annotations
 
-from dataclasses import replace as dataclass_replace
 from typing import TYPE_CHECKING
 
 import torch
 
 from vllm.v1.attention.backends.ragged_layout import (
+    layer_overlay,
     member_virtual_block_table,
 )
 
@@ -246,7 +246,7 @@ def _ragged_member_major_forward(
     slot_mapping_layer = slot_mapping_grouped[
         layer_start:layer_end].reshape(-1)
 
-    layer_md = dataclass_replace(
+    layer_md = layer_overlay(
         attn_metadata,
         num_actual_tokens=num_kv_heads * num_actual,
         block_table=block_table_layer,

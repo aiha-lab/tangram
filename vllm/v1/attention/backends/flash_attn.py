@@ -2,8 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Attention layer with FlashAttention."""
 
-import copy
-from dataclasses import dataclass, replace as dataclass_replace
+from dataclasses import dataclass
 from typing import ClassVar
 
 import numpy as np
@@ -45,6 +44,7 @@ from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backends.ragged_layout import (
     as_virtual_block_view,
     build_ragged_step_views,
+    layer_overlay,
     identity_member_maps,
     load_cluster_map,
     member_maps_from_cluster_map,
@@ -275,9 +275,8 @@ class FlashAttentionMetadata:
     # layer; shape ``[num_kv_heads × num_reqs + 1]``.
     query_start_loc_grouped: torch.Tensor | None = None
     ragged_decode_layout: bool = False
-    # Per-layer ``FlashAttentionMetadata`` overlays for the decode fast
-    # path; pre-built so attention avoids ``dataclass_replace`` in the
-    # hot loop.
+    # Per-layer overlays (``ragged_layout.layer_overlay``) for the decode fast
+    # path, pre-built here so attention picks its layer with a list lookup.
     per_layer_md: list | None = None
 
 
@@ -751,28 +750,24 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
             # the right metadata with a single list lookup. One sequence per
             # (request, KV-head member) now that members are per-head.
             num_virtual_seqs = num_reqs * self._num_kv_heads_per_layer
-            # Shallow ``copy.copy`` + field overwrite, not ``dataclass_replace``:
-            # replace() re-runs __init__ over every field, which is pure-Python
-            # overhead paid num_layers times per decode step (on the eager
-            # critical path). copy.copy clones __dict__ and we overwrite only the
-            # five per-layer fields; the rest are shared (read-only) references.
             per_layer_md = []
             for layer_idx in range(num_layers_local):
-                layer_md = copy.copy(attn_metadata)
-                layer_md.num_actual_tokens = num_virtual_seqs
                 # This layer's virtual block table, built on demand:
                 # [num_reqs, num_kv_heads, max_blocks] ->
                 # [num_reqs * num_kv_heads, max_blocks].
-                layer_md.block_table = member_virtual_block_table(
+                block_table_layer = member_virtual_block_table(
                     cluster_block_table, clusters_per_layer[layer_idx],
                     cols_per_layer[layer_idx], self._page_group_size,
                     cluster_axis=1).reshape(num_virtual_seqs, -1)
-                layer_md.seq_lens = seq_lens_grouped[layer_idx].view(
-                    num_virtual_seqs)
-                layer_md.slot_mapping = slot_mapping_grouped[
-                    layer_idx].reshape(-1)
-                layer_md.query_start_loc = query_start_loc_grouped
-                per_layer_md.append(layer_md)
+                per_layer_md.append(layer_overlay(
+                    attn_metadata,
+                    num_actual_tokens=num_virtual_seqs,
+                    block_table=block_table_layer,
+                    seq_lens=seq_lens_grouped[layer_idx].view(
+                        num_virtual_seqs),
+                    slot_mapping=slot_mapping_grouped[layer_idx].reshape(-1),
+                    query_start_loc=query_start_loc_grouped,
+                ))
             attn_metadata.per_layer_md = per_layer_md
         return attn_metadata
 
