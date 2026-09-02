@@ -54,6 +54,17 @@ opt() { if [ -n "${2:-}" ]; then METHOD_ARGS+=("$1" "$2"); fi; }
 # fastkvzip only; unset lets the engine auto-resolve the gate.
 opt --compression-gate-path "${GATE_PATH:-}"
 opt --compression-scorer-options "${SCORER_OPTIONS:-}"
+# Per-entry keep floor. Unset leaves the engine default; 0 lets a weak head
+# group be emptied, which is what the speedup presets were calibrated with.
+opt --compression-floor-min "${FLOOR_MIN:-}"
+# The engine's periodic stats logger is the only source of the preemption count
+# and the peak KV occupancy -- neither reaches the result JSON. Off by default
+# so a standalone run stays readable; the speedup harness turns it on and reads
+# the captured log back.
+LOG_STATS=${LOG_STATS:-0}
+if [ "${LOG_STATS}" = "1" ]; then
+    METHOD_ARGS+=(--enable-log-stats)
+fi
 # A .npz from tools/head_group_clustering; unset or missing falls back to
 # identity (adjacent-head) grouping.
 if [ -n "${HEAD_GROUP_CLUSTER_MAP:-}" ] && [ -f "${HEAD_GROUP_CLUSTER_MAP}" ]; then
@@ -64,20 +75,31 @@ OUTPUT_DIR=${OUTPUT_DIR:-"${SCRIPT_DIR}/performance_results/${SCORER}_${SELECTIO
 # ---- Run -----------------------------------------------------------------
 for RATIO in ${RATIOS}; do
     echo "===== ${SCORER} ${SELECTION}  dataset=${DATASET}  ratio=${RATIO} ====="
-    CUDA_VISIBLE_DEVICES="${GPU_ID}" "$PYTHON" "${SCRIPT_DIR}/benchmark_scbench.py" \
-        -d "${DATASET}" \
-        --num "${NUM}" \
-        --compression-ratio "${RATIO}" \
-        --max-num-seqs "${MAX_NUM_SEQS}" \
-        --gpu-memory-utilization "${GPU_MEM_UTIL}" \
-        --page-group-size "${PAGE_GROUP_SIZE}" \
-        --max-tokens "${MAX_TOKENS}" \
-        --single-turn \
-        --force-exact-tokens \
-        "${METHOD_ARGS[@]}" \
-        -m "${MODEL}" \
-        --max-model-len "${MAX_LEN}" \
-        --output-dir "${OUTPUT_DIR}"
+    RUN=("$PYTHON" "${SCRIPT_DIR}/benchmark_scbench.py"
+         -d "${DATASET}"
+         --num "${NUM}"
+         --compression-ratio "${RATIO}"
+         --max-num-seqs "${MAX_NUM_SEQS}"
+         --gpu-memory-utilization "${GPU_MEM_UTIL}"
+         --page-group-size "${PAGE_GROUP_SIZE}"
+         --max-tokens "${MAX_TOKENS}"
+         --single-turn
+         --force-exact-tokens
+         "${METHOD_ARGS[@]}"
+         -m "${MODEL}"
+         --max-model-len "${MAX_LEN}"
+         --output-dir "${OUTPUT_DIR}")
+
+    # The log lands beside this ratio's result JSON, one file per ratio, so a
+    # reader can attribute preemptions to the ratio that caused them.
+    if [ "${LOG_STATS}" = "1" ]; then
+        mkdir -p "${OUTPUT_DIR}/${DATASET}"
+        CUDA_VISIBLE_DEVICES="${GPU_ID}" "${RUN[@]}" 2>&1 \
+            | tee "${OUTPUT_DIR}/${DATASET}/engine_r${RATIO}.log"
+        continue
+    fi
+
+    CUDA_VISIBLE_DEVICES="${GPU_ID}" "${RUN[@]}"
 done
 
 # ---- Performance summary -------------------------------------------------

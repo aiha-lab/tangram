@@ -33,14 +33,21 @@ model-independent so it unit-tests without a GPU.
 
 ## Usage
 
+From the repository root (`python -m` needs it on the path):
+
 ```bash
-cd /workspace/vllm-asp
 python -m tools.head_group_clustering.build_cluster_map \
-    --profile /workspace/tangram_impl/static_budget_profiles/qwen25-7b-1m.npz \
-    --base-ratio 0.5 \
+    --profile tools/head_group_clustering/cluster_maps/fastkvzip/qwen3-4b-instruct-2507/profile.npz \
+    --base-ratio 0.3 \
     --page-group-size 4 \
-    --out /workspace/tangram_impl/static_budget_profiles/qwen25-7b-1m.cluster.npz
+    --cluster-scope global \
+    --out tools/head_group_clustering/cluster_maps/fastkvzip/qwen3-4b-instruct-2507/pg4_r0.3.npz
 ```
+
+`build_all_maps.sh` does this for every (scorer, model) pair and is the normal
+entry point. `--cluster-scope` must match the profile's threshold scope
+(`profile.npz` is `global`, `profile_perlayer.npz` is `per_layer`); pairing them
+wrong pools score scales that are not comparable.
 
 Key flags:
 
@@ -82,5 +89,5 @@ from the same layer occupy contiguous columns.
 ## Tests
 
 ```bash
-cd /workspace/vllm-asp && python -m pytest tools/head_group_clustering/tests/ -q
+python -m pytest --noconftest tools/head_group_clustering/tests/ -q
 ```
