@@ -106,11 +106,9 @@ def cluster_member_rows(
 ) -> np.ndarray | None:
     """Member rows holding one cluster's slots, or ``None`` if it holds none.
 
-    A cluster map assigns whole clusters, so a cluster is either fully occupied
-    or entirely unused. A partly occupied one is rejected rather than skipped:
-    its occupied members would be rewritten while the rest kept scores from
-    before the eviction, and those stale scores would then compete for
-    retention. ``caller`` names the operation in that error.
+    A cluster map assigns whole clusters, so a partly occupied one is rejected:
+    its untouched members would keep scores from before the eviction and those
+    would compete for retention. ``caller`` names the operation in that error.
     """
     rows = cluster_members_cpu[cluster_id]
     if not (rows < 0).any():

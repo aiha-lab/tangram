@@ -134,17 +134,12 @@ def _validate_bijection(
     subject: str,
 ) -> None:
     """Reject a member -> (cluster, column) map that is not a bijection onto
-    full clusters.
+    full clusters. Both flat arrays are int64 over member rows.
 
-    Two properties, and breaking either silently corrupts KV rather than
-    failing: every (cluster, column) slot must be occupied exactly once, or two
-    KV heads write the same page column and one overwrites the other; and every
-    cluster must be full to ``page_group_size``, or a page carries a column no
-    head reads while the budget was still spent on it.
-
-    Both flat arrays are int64 over member rows. ``subject`` names the map in
-    the error -- a file's contents and an engine-derived map reach this from
-    different places and the reader needs to know which.
+    A shared slot means two KV heads write the same page column and one
+    overwrites the other; a cluster short of ``page_group_size`` means a page
+    carries a column no head reads. Either corrupts KV silently, hence the
+    check. ``subject`` names the map in the error.
     """
     import numpy as np
 
@@ -426,17 +421,14 @@ def layer_overlay(
 ):
     """A per-layer view of one step's attention metadata.
 
-    Under ragged paging a layer's sequences are its own (request, KV-head)
-    members, so five fields differ per layer while every other field of the
-    step's metadata is shared. This returns a shallow copy with exactly those
-    five replaced -- the single place that says which five they are.
+    A layer's sequences are its own (request, KV-head) members, so five fields
+    differ per layer and the rest are shared. The single place that says which
+    five.
 
     ``copy.copy`` rather than ``dataclasses.replace``: replace() re-runs
-    ``__init__`` over every field, which is pure-Python work paid once per layer
-    per step on the eager critical path. Copying ``__dict__`` and overwriting
-    five entries leaves the rest as shared read-only references, which is what
-    the caller wants anyway. Equivalent because the metadata dataclasses on this
-    path define no ``__post_init__``.
+    ``__init__`` over every field, once per layer per step on the eager critical
+    path. Equivalent here because no metadata dataclass on this path defines
+    ``__post_init__``.
     """
     overlay = copy.copy(metadata)
     overlay.num_actual_tokens = num_actual_tokens
@@ -461,7 +453,7 @@ def build_decode_layer_overlays(
     them up front lets the attention forward pick its layer with a list lookup
     instead of assembling an overlay inside the per-layer call.
 
-    Only valid when ``views.ragged_decode_layout`` is set -- that is what puts
+    Only valid under ``views.ragged_decode_layout``: that is what puts
     ``seq_lens_grouped`` / ``slot_mapping_grouped`` in the
     ``[num_layers, num_reqs, num_kv_heads]`` form indexed here.
     """

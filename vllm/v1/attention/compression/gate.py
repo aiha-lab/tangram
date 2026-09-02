@@ -221,8 +221,7 @@ def _download_or_local(model_name: str, gate_path: str) -> str:
             or _hf_download_gate_path(resolved, gate_path))
 
 
-# Gate parameters whose leading axis is ``num_heads x per_head`` flattened, and
-# so are sliced per rank rather than passed through.
+# Sliced per rank rather than passed through: leading axis is head-major.
 HEAD_MAJOR_GATE_PARAMS = frozenset(
     {"q_proj.weight", "q_proj.bias", "k_proj.weight", "k_proj.bias"}
 )
@@ -237,9 +236,8 @@ def _shard_head_major(
     """Take one head range out of a tensor whose leading axis is head-major.
 
     A projection's rows are ``num_heads x per_head`` flattened whatever the
-    tensor's rank -- a weight carries an input axis after that, a bias carries
-    nothing -- so splitting the leading axis, slicing heads and flattening back
-    is the same operation for both.
+    rank -- a weight carries an input axis after that, a bias carries nothing --
+    so this is one operation for both.
     """
     per_head = value.shape[0] // num_heads_total
     trailing = value.shape[1:]
