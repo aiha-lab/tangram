@@ -18,6 +18,7 @@ import pytest
 import torch
 
 from vllm.v1.worker.block_table import BlockTable, MultiGroupBlockTable
+from vllm.v1.worker.ragged_block_table import RaggedBlockTable
 
 BLOCK_SIZE = 4
 MAX_NUM_REQS = 3
@@ -28,27 +29,29 @@ GROUPS_PER_LAYER = 2
 NUM_LAYERS = NUM_HEAD_GROUPS // GROUPS_PER_LAYER
 
 
+BASE_KWARGS = dict(
+    block_size=BLOCK_SIZE,
+    max_num_reqs=MAX_NUM_REQS,
+    max_num_blocks_per_req=MAX_BLOCKS_PER_REQ,
+    max_num_batched_tokens=MAX_BATCHED_TOKENS,
+    pin_memory=False,
+    device=torch.device("cpu"),
+    kernel_block_size=BLOCK_SIZE,
+    cp_kv_cache_interleave_size=1,
+)
+
+
 def make_table(**overrides) -> BlockTable:
+    return BlockTable(**{**BASE_KWARGS, **overrides})
+
+
+def make_ragged(**overrides) -> RaggedBlockTable:
     kwargs = dict(
-        block_size=BLOCK_SIZE,
-        max_num_reqs=MAX_NUM_REQS,
-        max_num_blocks_per_req=MAX_BLOCKS_PER_REQ,
-        max_num_batched_tokens=MAX_BATCHED_TOKENS,
-        pin_memory=False,
-        device=torch.device("cpu"),
-        kernel_block_size=BLOCK_SIZE,
-        cp_kv_cache_interleave_size=1,
-    )
-    kwargs.update(overrides)
-    return BlockTable(**kwargs)
-
-
-def make_ragged(**overrides) -> BlockTable:
-    return make_table(
         num_head_groups=NUM_HEAD_GROUPS,
         num_head_groups_per_layer=GROUPS_PER_LAYER,
-        **overrides,
     )
+    kwargs.update(overrides)
+    return RaggedBlockTable(**{**BASE_KWARGS, **kwargs})
 
 
 # --- Shape: the group axis is what ragged paging adds ----------------------
@@ -78,7 +81,7 @@ def test_ragged_table_carries_a_group_axis():
 
 def test_ragged_defaults_groups_per_layer_to_the_total():
     """Single-layer unit tests may omit it; production always passes it."""
-    table = make_table(num_head_groups=NUM_HEAD_GROUPS)
+    table = make_ragged(num_head_groups_per_layer=None)
 
     assert table.num_head_groups_per_layer == NUM_HEAD_GROUPS
 
@@ -90,7 +93,7 @@ def test_ragged_rejects_a_kernel_block_size_of_its_own():
 
 def test_ragged_rejects_groups_that_do_not_tile_the_layers():
     with pytest.raises(AssertionError, match="must divide"):
-        make_table(num_head_groups=6, num_head_groups_per_layer=4)
+        make_ragged(num_head_groups=6, num_head_groups_per_layer=4)
 
 
 # --- append_row: ids are laid out group-major to a uniform depth ----------
@@ -238,9 +241,11 @@ def test_snapshot_row_copies_rather_than_aliases():
     assert counts[0] == 1
 
 
-def test_snapshot_row_is_ragged_only():
-    with pytest.raises(AssertionError, match="ragged only"):
-        make_table().snapshot_row(0)
+def test_snapshot_row_exists_only_on_the_ragged_table():
+    """The plain layout has one depth per request, so there is nothing a
+    snapshot could preserve that add_row cannot rebuild -- the method is absent
+    rather than guarded."""
+    assert not hasattr(make_table(), "snapshot_row")
 
 
 # --- slot mapping ---------------------------------------------------------
@@ -377,13 +382,8 @@ def test_compact_rejects_a_shape_that_is_not_layers_by_groups():
         )
 
 
-def test_compact_is_ragged_only():
-    with pytest.raises(AssertionError, match="ragged only"):
-        make_table().compact_after_compress_all_layers(
-            row_idx=0,
-            num_head_groups_per_layer=1,
-            new_num_blocks_per_layer=np.zeros((1, 1), dtype=np.int32),
-        )
+def test_compact_exists_only_on_the_ragged_table():
+    assert not hasattr(make_table(), "compact_after_compress_all_layers")
 
 
 # --- sliding window: keep the tail, null the front -----------------------
@@ -444,14 +444,8 @@ def test_null_front_clamps_to_what_a_group_actually_holds():
     assert sorted(freed.tolist()) == [3, 4]
 
 
-def test_null_front_is_ragged_only():
-    with pytest.raises(AssertionError, match="ragged only"):
-        make_table().null_front_blocks_sliding(
-            row_idx=0,
-            sliding_layer_ids=np.array([0]),
-            num_head_groups_per_layer=1,
-            num_skipped_blocks=1,
-        )
+def test_null_front_exists_only_on_the_ragged_table():
+    assert not hasattr(make_table(), "null_front_blocks_sliding")
 
 
 # --- clear ---------------------------------------------------------------
@@ -551,5 +545,7 @@ def test_multi_group_snapshot_and_restore_round_trip():
 
 
 def test_multi_group_snapshot_is_ragged_only():
-    with pytest.raises(AssertionError, match="ragged only"):
+    """MultiGroupBlockTable delegates, so a plain table's missing method is
+    what rejects the call."""
+    with pytest.raises(AttributeError, match="snapshot_row"):
         make_multi().snapshot_row(0)
