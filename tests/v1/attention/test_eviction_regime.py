@@ -10,10 +10,7 @@ import numpy as np
 import pytest
 import torch
 
-from vllm.v1.attention.compression.compressor import (
-    KVCompressor,
-    _apportion_blocks,
-)
+from vllm.v1.attention.compression.compressor import KVCompressor
 from vllm.v1.attention.compression.eviction_regime import (
     BudgetRegime,
     ChunkParams,
@@ -23,6 +20,7 @@ from vllm.v1.attention.compression.workspace import (
     CompressionWorkspace,
     WorkspaceSpec,
 )
+from vllm.v1.attention.compression.keep_lengths import _apportion_blocks
 
 
 @pytest.fixture(scope="module", autouse=True)
