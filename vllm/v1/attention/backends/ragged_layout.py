@@ -125,6 +125,50 @@ def identity_member_maps(
     return member_to_cluster, member_to_col
 
 
+def _validate_bijection(
+    cluster_flat,
+    column_flat,
+    *,
+    num_clusters: int,
+    page_group_size: int,
+    subject: str,
+) -> None:
+    """Reject a member -> (cluster, column) map that is not a bijection onto
+    full clusters.
+
+    Two properties, and breaking either silently corrupts KV rather than
+    failing: every (cluster, column) slot must be occupied exactly once, or two
+    KV heads write the same page column and one overwrites the other; and every
+    cluster must be full to ``page_group_size``, or a page carries a column no
+    head reads while the budget was still spent on it.
+
+    Both flat arrays are int64 over member rows. ``subject`` names the map in
+    the error -- a file's contents and an engine-derived map reach this from
+    different places and the reader needs to know which.
+    """
+    import numpy as np
+
+    if cluster_flat.min() < 0 or cluster_flat.max() >= num_clusters:
+        raise ValueError(
+            f"{subject} cluster ids out of range [0, {num_clusters}); got "
+            f"[{cluster_flat.min()}, {cluster_flat.max()}].")
+    if column_flat.min() < 0 or column_flat.max() >= page_group_size:
+        raise ValueError(
+            f"{subject} columns out of range [0, {page_group_size}); got "
+            f"[{column_flat.min()}, {column_flat.max()}].")
+    slots = cluster_flat * page_group_size + column_flat
+    if np.unique(slots).size != cluster_flat.size:
+        raise ValueError(
+            f"{subject} is not a bijection: some (cluster, column) slot is "
+            "shared or unused.")
+    counts = np.bincount(cluster_flat, minlength=num_clusters)
+    if not bool(np.all(counts == page_group_size)):
+        raise ValueError(
+            f"{subject} clusters are not all full to "
+            f"page_group_size={page_group_size}; member counts seen: "
+            f"{sorted(set(counts.tolist()))}.")
+
+
 def load_cluster_map(
     path: str,
     page_group_size: int,
@@ -167,28 +211,11 @@ def load_cluster_map(
     num_clusters = num_members // page_group_size
     cluster_flat = cluster_of.reshape(-1).astype(np.int64)
     column_flat = column_of.reshape(-1).astype(np.int64)
-    if cluster_flat.min() < 0 or cluster_flat.max() >= num_clusters:
-        raise ValueError(
-            f"head_group_cluster_map cluster ids out of range [0, "
-            f"{num_clusters}); got [{cluster_flat.min()}, "
-            f"{cluster_flat.max()}].")
-    if column_flat.min() < 0 or column_flat.max() >= page_group_size:
-        raise ValueError(
-            f"head_group_cluster_map columns out of range [0, "
-            f"{page_group_size}); got [{column_flat.min()}, "
-            f"{column_flat.max()}].")
-    # Bijection: every slot occupied once, every cluster full.
-    slots = cluster_flat * page_group_size + column_flat
-    if np.unique(slots).size != num_members:
-        raise ValueError(
-            "head_group_cluster_map is not a bijection: some (cluster, column) "
-            "slot is shared or unused.")
-    counts = np.bincount(cluster_flat, minlength=num_clusters)
-    if not bool(np.all(counts == page_group_size)):
-        raise ValueError(
-            f"head_group_cluster_map clusters are not all full to "
-            f"page_group_size={page_group_size}; member counts seen: "
-            f"{sorted(set(counts.tolist()))}.")
+    _validate_bijection(
+        cluster_flat, column_flat,
+        num_clusters=num_clusters,
+        page_group_size=page_group_size,
+        subject="head_group_cluster_map")
     return (
         torch.from_numpy(cluster_flat).view(num_layers, num_kv_heads),
         torch.from_numpy(column_flat).view(num_layers, num_kv_heads),
@@ -295,44 +322,13 @@ def physical_member_maps_from_static_cluster_map(
         cluster_of[layer] = phys_cluster
         column_of[layer] = static_column_of[static_idx].to(torch.int64)
 
-    _validate_member_bijection(
-        cluster_of, column_of, num_layers, num_kv_heads, page_group_size)
+    _validate_bijection(
+        cluster_of.reshape(-1).to(torch.int64).cpu().numpy(),
+        column_of.reshape(-1).to(torch.int64).cpu().numpy(),
+        num_clusters=num_layers * num_kv_heads // page_group_size,
+        page_group_size=page_group_size,
+        subject="derived physical cluster map")
     return cluster_of, column_of
-
-
-def _validate_member_bijection(
-    cluster_of: torch.Tensor,
-    column_of: torch.Tensor,
-    num_layers: int,
-    num_kv_heads: int,
-    page_group_size: int,
-) -> None:
-    """Assert every (cluster, column) slot is occupied once and every cluster
-    is full. The engine-derived counterpart of ``load_cluster_map``'s file
-    checks."""
-    import numpy as np
-
-    num_clusters = num_layers * num_kv_heads // page_group_size
-    co = cluster_of.reshape(-1).cpu().numpy().astype(np.int64)
-    col = column_of.reshape(-1).cpu().numpy().astype(np.int64)
-    if co.min() < 0 or co.max() >= num_clusters:
-        raise ValueError(
-            f"derived cluster ids out of range [0, {num_clusters}); got "
-            f"[{co.min()}, {co.max()}].")
-    if col.min() < 0 or col.max() >= page_group_size:
-        raise ValueError(
-            f"derived columns out of range [0, {page_group_size}); got "
-            f"[{col.min()}, {col.max()}].")
-    slots = co * page_group_size + col
-    if np.unique(slots).size != co.size:
-        raise ValueError(
-            "derived physical cluster map is not a bijection: a (cluster, "
-            "column) slot is shared or unused.")
-    counts = np.bincount(co, minlength=num_clusters)
-    if not bool(np.all(counts == page_group_size)):
-        raise ValueError(
-            "derived physical cluster map clusters are not all full to "
-            f"page_group_size={page_group_size}.")
 
 
 def member_virtual_block_table(

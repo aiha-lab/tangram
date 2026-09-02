@@ -25,6 +25,7 @@ from vllm.v1.attention.compression.slot_scores import (
     ChunkScoreInputs,
     SlotFillTarget,
     SlotScoreSource,
+    cluster_member_rows,
 )
 
 if TYPE_CHECKING:
@@ -325,15 +326,10 @@ class _SlotScoreStore(RegimeScoreStore):
         # recomputing source rebuilds every live slot next eviction anyway.
         if not self.source.slots_persist_across_steps:
             return
-        rows = self._cluster_members_cpu[cluster_id]
-        if (rows < 0).any():
-            if (rows < 0).all():
-                return  # Empty cluster: no member holds these slots.
-            # A member left behind would keep discarded scores.
-            raise RuntimeError(
-                f"compact_cluster: cluster {cluster_id} holds members in some "
-                f"columns but not others ({rows.tolist()}); a cluster map must "
-                "leave a cluster either full or empty.")
+        rows = cluster_member_rows(
+            self._cluster_members_cpu, cluster_id, caller="compact_cluster")
+        if rows is None:
+            return
         # Not in place: a permuted gather would read what it overwrote.
         self._flat[rows, :kept_length] = self._flat[rows].gather(
             1, keep_positions)

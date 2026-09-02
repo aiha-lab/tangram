@@ -101,6 +101,28 @@ class KVCacheView:
         )
 
 
+def cluster_member_rows(
+    cluster_members_cpu: np.ndarray, cluster_id: int, *, caller: str
+) -> np.ndarray | None:
+    """Member rows holding one cluster's slots, or ``None`` if it holds none.
+
+    A cluster map assigns whole clusters, so a cluster is either fully occupied
+    or entirely unused. A partly occupied one is rejected rather than skipped:
+    its occupied members would be rewritten while the rest kept scores from
+    before the eviction, and those stale scores would then compete for
+    retention. ``caller`` names the operation in that error.
+    """
+    rows = cluster_members_cpu[cluster_id]
+    if not (rows < 0).any():
+        return rows
+    if (rows < 0).all():
+        return None
+    raise RuntimeError(
+        f"{caller}: cluster {cluster_id} holds members in some columns but "
+        f"not others ({rows.tolist()}); a cluster map must leave a cluster "
+        "either full or empty.")
+
+
 @dataclass
 class ChunkScoreInputs:
     """Everything a score source may read for one chunk."""
@@ -250,15 +272,10 @@ class RecomputedCacheScores(SlotScoreSource):
         for static_idx in range(target.num_layers):
             for group_idx in range(target.num_groups):
                 cluster_id = static_idx * target.num_groups + group_idx
-                rows = target.cluster_members_cpu[cluster_id]
-                if (rows < 0).any():
-                    if (rows < 0).all():
-                        continue  # Empty cluster: no member holds these slots.
-                    # An unscored member would rank on stale scores.
-                    raise RuntimeError(
-                        f"fill: cluster {cluster_id} holds members in some "
-                        f"columns but not others ({rows.tolist()}); a cluster "
-                        "map must leave a cluster either full or empty.")
+                rows = cluster_member_rows(
+                    target.cluster_members_cpu, cluster_id, caller="fill")
+                if rows is None:
+                    continue
                 num_positions = int(live_lens[static_idx, group_idx])
                 if num_positions == 0:
                     flat[rows] = neg_inf
