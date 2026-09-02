@@ -445,6 +445,52 @@ def layer_overlay(
     return overlay
 
 
+def build_decode_layer_overlays(
+    metadata,
+    views: "RaggedStepViews",
+    *,
+    num_reqs: int,
+    num_kv_heads_per_layer: int,
+    page_group_size: int,
+) -> list:
+    """One metadata overlay per layer, for the uniform-decode layout.
+
+    Uniform decode is one query token per (request, KV-head) member, so a
+    layer's shapes are known as soon as the step's views are: building all of
+    them up front lets the attention forward pick its layer with a list lookup
+    instead of assembling an overlay inside the per-layer call.
+
+    Only valid when ``views.ragged_decode_layout`` is set -- that is what puts
+    ``seq_lens_grouped`` / ``slot_mapping_grouped`` in the
+    ``[num_layers, num_reqs, num_kv_heads]`` form indexed here.
+    """
+    assert views.ragged_decode_layout, (
+        "decode overlays need the uniform-decode layout; the member-major "
+        "layout builds its overlay per call instead.")
+    num_virtual_seqs = num_reqs * num_kv_heads_per_layer
+    overlays = []
+    for layer_idx in range(views.num_layers_local):
+        # This layer's virtual block table, built on demand:
+        # [num_reqs, num_kv_heads, max_blocks] ->
+        # [num_reqs * num_kv_heads, max_blocks].
+        block_table_layer = member_virtual_block_table(
+            views.cluster_block_table,
+            views.clusters_per_layer[layer_idx],
+            views.cols_per_layer[layer_idx],
+            page_group_size,
+            cluster_axis=1,
+        ).reshape(num_virtual_seqs, -1)
+        overlays.append(layer_overlay(
+            metadata,
+            num_actual_tokens=num_virtual_seqs,
+            block_table=block_table_layer,
+            seq_lens=views.seq_lens_grouped[layer_idx].view(num_virtual_seqs),
+            slot_mapping=views.slot_mapping_grouped[layer_idx].reshape(-1),
+            query_start_loc=views.query_start_loc_grouped,
+        ))
+    return overlays
+
+
 def build_ragged_step_views(
     *,
     block_table_tensor: torch.Tensor,
