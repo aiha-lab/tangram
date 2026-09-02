@@ -172,6 +172,120 @@ def _apportion_blocks(
     return k
 
 
+def kept_lengths_from_demand(
+    *,
+    decision: KeepDecision,
+    total_seen: np.ndarray,
+    locked_counts: np.ndarray,
+    k_new_counts: np.ndarray | None,
+    real_eval_lens: np.ndarray,
+    block_size: int,
+    floor_min: int,
+    pooled_span: str | None,
+    per_group_capacity: int,
+) -> np.ndarray:
+    """Per-(layer, group) post-evict kept lengths, ``[num_layers, num_groups]``.
+
+    Three passes, because a pooling scope shares one total over a span:
+    collect each entry's block-rounded demand, enforce the budget (per span
+    when the scope pools, else per entry), turn the counts back into lengths.
+
+    Pure arithmetic over the arrays handed in -- no KV cache, no request state.
+    ``pooled_span`` is ``None`` under the ratio regime and whenever the scope
+    does not pool; ``per_group_capacity`` is the workspace's physical ceiling,
+    which is the budget itself under ``uniform`` and larger when pooling.
+    """
+    num_layers, num_groups = total_seen.shape
+    sink_size = decision.sink_size
+    tail_size = decision.tail_size
+    budget_tokens = decision.budget_tokens
+
+
+    # Pass 1 — per entry: block-rounded demand, floor, dropped remainder.
+    want = np.zeros((num_layers, num_groups), dtype=np.int64)
+    base = np.zeros((num_layers, num_groups), dtype=np.int64)
+    remainder = np.zeros((num_layers, num_groups), dtype=np.int64)
+    for layer_idx in range(num_layers):
+        for group_idx in range(num_groups):
+            total_seen_g = int(total_seen[layer_idx, group_idx])
+            locked_count = int(locked_counts[layer_idx, group_idx])
+            eval_len_g = int(real_eval_lens[layer_idx, group_idx])
+            if eval_len_g <= 0:
+                continue
+            # adjusted_ratio == 0 ⇒ no sort cached, keep none.
+            k_new = (int(k_new_counts[layer_idx, group_idx])
+                     if k_new_counts is not None else 0)
+            kept_now = (
+                sink_size + locked_count + k_new + tail_size)
+            # A floor cannot exceed what the cache holds, nor the budget.
+            target_floor = min(floor_min, total_seen_g)
+            if budget_tokens is not None:
+                target_floor = min(target_floor, budget_tokens)
+            if kept_now < target_floor:
+                extra = min(
+                    target_floor - kept_now,
+                    eval_len_g - k_new)
+                if extra > 0:
+                    k_new += extra
+            k_aligned = (
+                ((k_new + block_size - 1) // block_size)
+                * block_size)
+            k_aligned = min(k_aligned, eval_len_g)
+            if budget_tokens is not None:
+                # The selection rounds UP for page contiguity, so the
+                # ceiling rounds DOWN rather than cutting mid-block. Under
+                # ``uniform`` the capacity IS the budget; under a pooling
+                # scope it is the physical ceiling and pass 2 enforces the
+                # budget.
+                room_g = (per_group_capacity - sink_size - locked_count
+                          - tail_size)
+                k_aligned = min(
+                    k_aligned, max(0, (room_g // block_size) * block_size))
+            want[layer_idx, group_idx] = k_aligned
+            base[layer_idx, group_idx] = min(
+                (k_new // block_size) * block_size, k_aligned)
+            remainder[layer_idx, group_idx] = (
+                k_new - base[layer_idx, group_idx])
+
+    # Pass 2 — per span: the total sums what the BUDGET, not the capacity,
+    # leaves each entry, so one wanting less leaves the rest. The pooling.
+    if pooled_span is None:
+        keep_counts = want
+    else:
+        budget_room = np.maximum(
+            budget_tokens - sink_size - locked_counts - tail_size, 0)
+        flat_shape = num_layers * num_groups
+        spans = (
+            [np.arange(flat_shape)] if pooled_span == "global"
+            else [np.arange(l * num_groups, (l + 1) * num_groups)
+                  for l in range(num_layers)])
+        flat_want = want.reshape(-1)
+        flat_base = base.reshape(-1)
+        flat_remainder = remainder.reshape(-1)
+        flat_room = budget_room.reshape(-1)
+        keep_counts = np.zeros(flat_shape, dtype=np.int64)
+        for members in spans:
+            keep_counts[members] = _apportion_blocks(
+                flat_want[members], flat_base[members],
+                flat_remainder[members],
+                int(flat_room[members].sum()), block_size)
+        keep_counts = keep_counts.reshape(num_layers, num_groups)
+
+    # Pass 3 — per entry: counts back to lengths.
+    kept_lengths = np.zeros(
+        (num_layers, num_groups), dtype=np.int32)
+    for layer_idx in range(num_layers):
+        for group_idx in range(num_groups):
+            new_locked = (int(locked_counts[layer_idx, group_idx])
+                          + int(keep_counts[layer_idx, group_idx]))
+            kept_length = sink_size + new_locked + tail_size
+            total_seen_g = int(total_seen[layer_idx, group_idx])
+            if kept_length > total_seen_g:
+                kept_length = total_seen_g
+            kept_lengths[layer_idx, group_idx] = kept_length
+    return kept_lengths
+
+
 class KVCompressor:
     """One instance per model; per-request state held in ``req_state``.
 
@@ -622,132 +736,44 @@ class KVCompressor:
                 "cross_layer_decision missing — prepare_keep_decision "
                 "must run first.")
         keep_dec = req.cross_layer_decision
-        sink_size = keep_dec.sink_size
-        tail_size = keep_dec.tail_size
-        adjusted_ratio = keep_dec.adjusted_ratio
-        eval_len = keep_dec.eval_len
         budget_tokens = keep_dec.budget_tokens
 
-        num_layers = self.num_layers
-        num_groups = self.num_head_groups_per_layer
-        block_size = self.block_size
-        floor_min_int = int(floor_min)
-
-        prev_lens = eff_seq_lens_row.astype(
-            np.int64, copy=False).reshape(num_layers, num_groups)
+        prev_lens = eff_seq_lens_row.astype(np.int64, copy=False).reshape(
+            self.num_layers, self.num_head_groups_per_layer)
         total_seen = prev_lens + chunk_len
 
         # Keep everything; under a budget, the "cache still fits" path.
-        if adjusted_ratio >= 1.0:
+        if keep_dec.adjusted_ratio >= 1.0:
             kept_lengths = total_seen.astype(np.int32)
             req.cached_kept_lengths_cpu = kept_lengths
             return kept_lengths
 
-        locked_cpu = req.locked_count_cpu
-        k_new_cpu = req.cached_k_new_cpu
-        real_eval_len = req.real_eval_len_cpu
-
-        # The workspace's ceiling, not the raw budget: reading back the width
-        # a pooling scope was sized for is what keeps the two agreeing.
-        pooled_span = (self.scope.pooled_span
-                       if budget_tokens is not None else None)
-        per_group_capacity = (self.workspace.spec.per_group_capacity
-                              if budget_tokens is not None else 0)
-
-        # Pass 1 — per entry: block-rounded demand, floor, dropped remainder.
-        want = np.zeros((num_layers, num_groups), dtype=np.int64)
-        base = np.zeros((num_layers, num_groups), dtype=np.int64)
-        remainder = np.zeros((num_layers, num_groups), dtype=np.int64)
-        for layer_idx in range(num_layers):
-            for group_idx in range(num_groups):
-                total_seen_g = int(total_seen[layer_idx, group_idx])
-                locked_count = int(locked_cpu[layer_idx, group_idx])
-                eval_len_g = int(real_eval_len[layer_idx, group_idx])
-                if eval_len_g <= 0:
-                    continue
-                # adjusted_ratio == 0 ⇒ no sort cached, keep none.
-                k_new = (int(k_new_cpu[layer_idx, group_idx])
-                         if k_new_cpu is not None else 0)
-                kept_now = (
-                    sink_size + locked_count + k_new + tail_size)
-                # A floor cannot exceed what the cache holds, nor the budget.
-                target_floor = min(floor_min_int, total_seen_g)
-                if budget_tokens is not None:
-                    target_floor = min(target_floor, budget_tokens)
-                if kept_now < target_floor:
-                    extra = min(
-                        target_floor - kept_now,
-                        eval_len_g - k_new)
-                    if extra > 0:
-                        k_new += extra
-                k_aligned = (
-                    ((k_new + block_size - 1) // block_size)
-                    * block_size)
-                k_aligned = min(k_aligned, eval_len_g)
-                if budget_tokens is not None:
-                    # The selection rounds UP for page contiguity, so the
-                    # ceiling rounds DOWN rather than cutting mid-block. Under
-                    # ``uniform`` the capacity IS the budget; under a pooling
-                    # scope it is the physical ceiling and pass 2 enforces the
-                    # budget.
-                    room_g = (per_group_capacity - sink_size - locked_count
-                              - tail_size)
-                    k_aligned = min(
-                        k_aligned, max(0, (room_g // block_size) * block_size))
-                want[layer_idx, group_idx] = k_aligned
-                base[layer_idx, group_idx] = min(
-                    (k_new // block_size) * block_size, k_aligned)
-                remainder[layer_idx, group_idx] = (
-                    k_new - base[layer_idx, group_idx])
-
-        # Pass 2 — per span: the total sums what the BUDGET, not the capacity,
-        # leaves each entry, so one wanting less leaves the rest. The pooling.
-        if pooled_span is None:
-            keep_counts = want
-        else:
-            budget_room = np.maximum(
-                budget_tokens - sink_size - locked_cpu - tail_size, 0)
-            flat_shape = num_layers * num_groups
-            spans = (
-                [np.arange(flat_shape)] if pooled_span == "global"
-                else [np.arange(l * num_groups, (l + 1) * num_groups)
-                      for l in range(num_layers)])
-            flat_want = want.reshape(-1)
-            flat_base = base.reshape(-1)
-            flat_remainder = remainder.reshape(-1)
-            flat_room = budget_room.reshape(-1)
-            keep_counts = np.zeros(flat_shape, dtype=np.int64)
-            for members in spans:
-                keep_counts[members] = _apportion_blocks(
-                    flat_want[members], flat_base[members],
-                    flat_remainder[members],
-                    int(flat_room[members].sum()), block_size)
-            keep_counts = keep_counts.reshape(num_layers, num_groups)
-
-        # Pass 3 — per entry: counts back to lengths.
-        kept_lengths = np.zeros(
-            (num_layers, num_groups), dtype=np.int32)
-        for layer_idx in range(num_layers):
-            for group_idx in range(num_groups):
-                new_locked = (int(locked_cpu[layer_idx, group_idx])
-                              + int(keep_counts[layer_idx, group_idx]))
-                kept_length = sink_size + new_locked + tail_size
-                total_seen_g = int(total_seen[layer_idx, group_idx])
-                if kept_length > total_seen_g:
-                    kept_length = total_seen_g
-                kept_lengths[layer_idx, group_idx] = kept_length
+        kept_lengths = kept_lengths_from_demand(
+            decision=keep_dec,
+            total_seen=total_seen,
+            locked_counts=req.locked_count_cpu,
+            k_new_counts=req.cached_k_new_cpu,
+            real_eval_lens=req.real_eval_len_cpu,
+            block_size=self.block_size,
+            floor_min=int(floor_min),
+            # The workspace's ceiling, not the raw budget: reading back the
+            # width a pooling scope was sized for keeps the two agreeing.
+            pooled_span=(self.scope.pooled_span
+                         if budget_tokens is not None else None),
+            per_group_capacity=(self.workspace.spec.per_group_capacity
+                                if budget_tokens is not None else 0),
+        )
         req.cached_kept_lengths_cpu = kept_lengths
         if self.keep_decision_observer is not None:
             self.keep_decision_observer.record(
                 req_id,
                 kept_lengths=kept_lengths,
                 total_seen=total_seen,
-                sink_size=sink_size,
-                win_size=tail_size,
-                eval_len=eval_len,
+                sink_size=keep_dec.sink_size,
+                win_size=keep_dec.tail_size,
+                eval_len=keep_dec.eval_len,
             )
         return kept_lengths
-
     def compact_cluster_stats(
         self,
         req_id: str,
