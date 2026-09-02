@@ -41,6 +41,7 @@ from vllm.model_executor.layers.batch_invariant import (
 )
 from vllm.platforms.interface import DeviceCapability
 from vllm.utils.math_utils import cdiv
+from vllm.v1.attention.backends.layer_split import split_attention_layers
 from vllm.v1.attention.backends.ragged_layout import (
     RaggedStepViews,
     as_virtual_block_view,
@@ -56,7 +57,6 @@ from vllm.v1.attention.backends.utils import (
     AttentionCGSupport,
     AttentionMetadataBuilder,
     CommonAttentionMetadata,
-    full_attention_layer_indices,
     get_dcp_local_seq_lens,
     get_kv_cache_layout,
 )
@@ -447,9 +447,10 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
         """Physical indices of the full-attention (compressible) layers in this
         KV cache group.
 
-        Uses the shared ``full_attention_layer_indices`` so this set is the SAME
-        one the compression engine compresses (``gpu_model_runner.
-        _init_compression``) — the two cannot drift. The cluster map's layer
+        Uses the shared ``split_attention_layers`` so this set is the SAME one
+        the compression engine compresses
+        (``CompressionModelRunnerMixin._init_compression``) — the two cannot
+        drift. The cluster map's layer
         axis is physical-major, so each layer's position in ``self.layer_names``
         must equal its physical index; that is asserted here so any reordering
         surfaces loudly instead of silently mis-mapping KV."""
@@ -462,7 +463,7 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
                     f"ragged KV group layer order mismatch: position "
                     f"{pos} is physical layer {phys}. The cluster map's layer "
                     f"axis assumes position == physical layer index.")
-        return [i for i in full_attention_layer_indices(self.vllm_config)
+        return [i for i in split_attention_layers(self.vllm_config).full
                 if i < num_layers_local]
 
     def _assert_static_layer_ids_match_map(

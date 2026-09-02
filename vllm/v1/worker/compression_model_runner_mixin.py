@@ -28,10 +28,7 @@ from vllm.distributed.parallel_state import (
     get_tp_group,
 )
 from vllm.logger import init_logger
-from vllm.v1.attention.backends.utils import (
-    full_attention_layer_indices,
-    sliding_window_layers,
-)
+from vllm.v1.attention.backends.layer_split import split_attention_layers
 from vllm.v1.attention.compression import (
     ChunkParams,
     CompressionExecutor,
@@ -120,10 +117,10 @@ class CompressionModelRunnerMixin:
             )
 
         # Ascending, the order the gate checkpoint stores its modules in.
-        # Shared with the ragged builder through
-        # ``full_attention_layer_indices``, so the two cannot disagree about
-        # which layers are compressed.
-        static_layer_ids = full_attention_layer_indices(self.vllm_config)
+        # Shared with the ragged builder through ``split_attention_layers``, so
+        # the two cannot disagree about which layers are compressed.
+        layers = split_attention_layers(self.vllm_config)
+        static_layer_ids = layers.full
         if not static_layer_ids:
             raise RuntimeError(
                 "Compression: model has no full-attention layers; FastKVZip "
@@ -137,10 +134,9 @@ class CompressionModelRunnerMixin:
         # The sliding layers' out-of-window front blocks go back to the pool
         # at every boundary, or concurrent long-context requests thrash: ragged
         # paging otherwise holds full KV for every layer. Empty when dense.
-        sliding_ids, sliding_window = sliding_window_layers(self.vllm_config)
         self.compression_sliding_layer_ids = np.array(
-            sliding_ids, dtype=np.int64)
-        self.compression_sliding_window = sliding_window
+            layers.sliding, dtype=np.int64)
+        self.compression_sliding_window = layers.sliding_window
 
         # A hybrid's cluster map is authored over compressible layers only.
         # The compressor consumes it as-is, its layer axis BEING that space;
