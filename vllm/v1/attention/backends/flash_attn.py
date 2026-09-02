@@ -676,7 +676,7 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
             scheduler_metadata = self.scheduler_metadata[:n]
 
         # Precompute the ragged-paging per-step views consumed by
-        # ``layer.py::_ragged_attention_impl`` (the body of the
+        # ``_ragged_attention_impl`` (the body of the
         # ``vllm::unified_attention_ragged`` custom op). The layout arithmetic
         # lives in ``ragged_layout.build_ragged_step_views`` so a second
         # attention backend can reuse it; the builder supplies only its cached
@@ -1103,9 +1103,8 @@ class FlashAttentionImpl(AttentionImpl):
             # member-major, so a row encodes (kv_head, token) and a column is
             # the query head within that group; the global query head is
             # ``kv_head * query_heads_per_kv + column``. The row→kv_head map
-            # depends on how
-            # vllm/attention/layer.py::_ragged_attention_impl
-            # flattened the tensors:
+            # depends on how ``_ragged_attention_impl`` flattened the
+            # tensors:
             #   - uniform decode fast path: row = token * num_kv_heads + kv_head
             #     (kv_head varies fastest)        -> tile the [kv, head] grid
             #   - prefill / mixed member-major  : row = kv_head * tokens + token
