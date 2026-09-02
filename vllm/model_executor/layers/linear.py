@@ -945,6 +945,26 @@ class QKVParallelLinear(ColumnParallelLinear):
             disable_tp=disable_tp,
         )
 
+    def forward_qkv(
+        self, input_: torch.Tensor, num_groups_per_layer: int
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Q, K, V for one attention layer, contiguous when paging needs it.
+
+        Ragged paging (``num_groups_per_layer > 0``) merges the token and
+        KV-head dimensions with a single ``.view()`` on its decode fast path,
+        which needs each of Q, K and V contiguous. Slicing one fused matmul
+        yields wider-stride views instead, so that case takes three matmuls;
+        every other case keeps the fused one.
+        """
+        if num_groups_per_layer > 0:
+            return self.forward_split(input_)
+
+        qkv, _ = self(input_)
+        q_size = self.num_heads * self.head_size
+        kv_size = self.num_kv_heads * self.head_size
+        q, k, v = qkv.split([q_size, kv_size, kv_size], dim=-1)
+        return q, k, v
+
     def forward_split(
         self, input_: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
