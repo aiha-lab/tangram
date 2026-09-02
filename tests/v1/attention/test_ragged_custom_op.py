@@ -16,11 +16,11 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from vllm.attention.layer import _ragged_attention_impl
 from ragged_reference import (
     identity_member_clusters,
     identity_member_columns,
 )
+from vllm.v1.attention.backends.ragged_forward import _ragged_attention_impl
 
 NUM_REQS = 3
 NUM_KV_HEADS = 4
