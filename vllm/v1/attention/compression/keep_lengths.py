@@ -2,18 +2,16 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """How many slots each (layer, head group) keeps after an eviction.
 
-The single source of truth for that number, and pure arithmetic: it reads the
-arrays handed to it and touches neither the KV cache nor request state. The
-compressor caches what this returns and the executor reads the cache back, so
-the two agree by construction.
+The single source of truth for that number, and pure arithmetic over the arrays
+handed in -- no KV cache, no request state. The compressor caches the result and
+the executor reads that cache, so the two agree by construction.
 
-Four rules shape every count, each a correctness rule rather than a preference.
-A kept length is block-aligned, because a page is the unit of reclamation. The
-floor cannot exceed what the cache holds nor the budget. A budget ceiling rounds
-DOWN where the selection rounds UP, so a page is never cut in half. And a
-pooling scope shares one total over its span, so a group wanting less leaves the
-rest to its neighbours -- the point of pooling, and why block quantisation has
-to be settled per span rather than per entry.
+Four rules shape every count, and each is correctness, not preference. A kept
+length is block-aligned, a page being the unit of reclamation. The floor cannot
+exceed what the cache holds nor the budget. A budget ceiling rounds DOWN where
+the selection rounds UP, so a page is never cut in half. And a pooling scope
+shares one total over its span, which is why block quantisation is settled per
+span rather than per entry.
 """
 from __future__ import annotations
 
@@ -50,13 +48,8 @@ def _apportion_blocks(
 ) -> np.ndarray:
     """Share one pooled ``total`` over a span's (layer, group) entries.
 
-    A pooled scope hands out uneven counts on purpose, but the selection must
-    be block quantized and the span's total must hold. Capping each entry
-    separately satisfies both and destroys the unevenness, so quantization is
-    per entry and the budget per span.
-
     Largest-remainder apportionment: each entry takes the block FLOOR of its
-    demand (``base``, from ``want``), then the leftover blocks go to whoever
+    demand (``base``, from ``want``), then leftover blocks go to whoever
     flooring shortchanged most (``remainder``, which is the hand-out order).
     Flooring rather than rounding up is what makes ``sum <= total``
     structural -- rounding up needs the same amount taken back, with no rule
@@ -113,14 +106,13 @@ def kept_lengths_from_demand(
 ) -> np.ndarray:
     """Per-(layer, group) post-evict kept lengths, ``[num_layers, num_groups]``.
 
-    Three passes, because a pooling scope shares one total over a span:
-    collect each entry's block-rounded demand, enforce the budget (per span
-    when the scope pools, else per entry), turn the counts back into lengths.
+    Three passes, because a pooling scope shares one total over a span: collect
+    each entry's block-rounded demand, enforce the budget (per span when the
+    scope pools, else per entry), turn the counts back into lengths.
 
-    Pure arithmetic over the arrays handed in -- no KV cache, no request state.
     ``pooled_span`` is ``None`` under the ratio regime and whenever the scope
-    does not pool; ``per_group_capacity`` is the workspace's physical ceiling,
-    which is the budget itself under ``uniform`` and larger when pooling.
+    does not pool. ``per_group_capacity`` is the workspace's physical ceiling --
+    the budget itself under ``uniform``, larger when pooling.
     """
     num_layers, num_groups = total_seen.shape
     sink_size = decision.sink_size

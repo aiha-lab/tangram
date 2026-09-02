@@ -4,7 +4,8 @@
 
 Owns the keep decision and holds no policy of its own: the budget scope
 (axis 1), the scorer (axis 2) and the eviction regime (axis 3) supply all
-three. KV writes and block-table updates live in the FlashAttention backend.
+three. How many slots survive is ``keep_lengths``; KV writes and block-table
+updates live in the FlashAttention backend.
 """
 from __future__ import annotations
 
@@ -531,15 +532,11 @@ class KVCompressor:
         chunk_len: int,
         floor_min: int,
     ) -> np.ndarray:
-        """Compute this chunk's per-(layer, group) post-evict kept_lengths.
+        """Compute and cache this chunk's per-(layer, group) kept_lengths.
 
-        The single source of truth for how many slots each entry keeps. Three
-        passes, because a pooling scope shares one total over a span: collect
-        each entry's block-rounded demand, enforce the budget (per span when the
-        scope pools, else per entry), turn the counts back into lengths.
-
-        Touches no KV cache. ``run_request`` reads the cached result back rather
-        than recomputing, so the two agree by construction. Under TP the caller
+        The arithmetic and its rules live in ``kept_lengths_from_demand``; this
+        supplies the request's state and caches the answer, which
+        ``run_request`` reads back rather than recomputing. Under TP the caller
         may MAX-reduce it across ranks first, to keep the block pool
         consistent."""
         req = self.req_state.get(req_id)
