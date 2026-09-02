@@ -137,6 +137,43 @@ def test_compression_requires_ragged_paging():
         CacheConfig(compression_ratio=0.3, page_group_size=None)
 
 
+# --- Prefix caching -------------------------------------------------------
+
+
+def test_prefix_caching_is_disabled_and_the_warning_says_how_to_keep_it(monkeypatch):
+    """Prefix caching cannot represent ragged paging's per-(layer, group) block
+    layout, so enabling either turns it off.
+
+    It stays a warning rather than an error: page_group_size defaults to 4, so
+    raising would fail startup for everyone who passes --enable-prefix-caching
+    without also turning ragged paging off. The warning therefore has to name
+    the setting that would keep prefix caching, or the reader is told what was
+    taken away and not how to get it back.
+
+    The warning is read off the logger call rather than through caplog: vLLM's
+    loggers do not propagate to the root logger caplog installs on.
+    """
+    from vllm.config import compression
+
+    warnings: list[str] = []
+    monkeypatch.setattr(
+        compression.logger,
+        "warning",
+        lambda message, *args: warnings.append(message % args),
+    )
+
+    config = CacheConfig(page_group_size=4, enable_prefix_caching=True)
+
+    assert config.enable_prefix_caching is False
+    assert any("--page-group-size=None" in text for text in warnings), warnings
+
+
+def test_prefix_caching_survives_without_ragged_paging():
+    config = CacheConfig(page_group_size=None, enable_prefix_caching=True)
+
+    assert config.enable_prefix_caching is True
+
+
 # --- The model allowlist ---------------------------------------------------
 
 

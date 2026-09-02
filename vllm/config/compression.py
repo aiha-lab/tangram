@@ -288,6 +288,12 @@ def validate_extended_fields(cfg: "CacheConfig") -> None:
     # per-(layer, group) block layout or compression's in-place block
     # mutation, so it is disabled. Warn (not info): it is on by default and
     # this affects throughput.
+    #
+    # Disabling rather than rejecting, even when the user asked for prefix
+    # caching explicitly: page_group_size defaults to 4, so raising would fail
+    # startup for every --enable-prefix-caching run that did not also turn
+    # ragged paging off. The message therefore has to name that setting -- a
+    # warning that only says what was taken away leaves no way to get it back.
     if (cfg.compression_enabled or cfg.page_group_size is not None) and (
         cfg.enable_prefix_caching
     ):
@@ -296,8 +302,11 @@ def validate_extended_fields(cfg: "CacheConfig") -> None:
             else "ragged paging")
         logger.warning(
             "Disabling prefix caching: it is incompatible with %s, which "
-            "is enabled. Prefix caching will not be used for this run.",
-            feature,
+            "is enabled. Prefix caching will not be used for this run. To "
+            "keep prefix caching instead, run without %s "
+            "(--page-group-size=None, and leave --compression-ratio and "
+            "--compression-budget-tokens unset).",
+            feature, feature,
         )
         cfg.enable_prefix_caching = False
 
