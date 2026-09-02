@@ -221,6 +221,33 @@ def _download_or_local(model_name: str, gate_path: str) -> str:
             or _hf_download_gate_path(resolved, gate_path))
 
 
+# Gate parameters whose leading axis is ``num_heads x per_head`` flattened, and
+# so are sliced per rank rather than passed through.
+HEAD_MAJOR_GATE_PARAMS = frozenset(
+    {"q_proj.weight", "q_proj.bias", "k_proj.weight", "k_proj.bias"}
+)
+
+
+def _shard_head_major(
+    value: torch.Tensor,
+    num_heads_total: int,
+    head_start: int,
+    head_end: int,
+) -> torch.Tensor:
+    """Take one head range out of a tensor whose leading axis is head-major.
+
+    A projection's rows are ``num_heads x per_head`` flattened whatever the
+    tensor's rank -- a weight carries an input axis after that, a bias carries
+    nothing -- so splitting the leading axis, slicing heads and flattening back
+    is the same operation for both.
+    """
+    per_head = value.shape[0] // num_heads_total
+    trailing = value.shape[1:]
+    sliced = value.reshape(num_heads_total, per_head, *trailing)
+    sliced = sliced[head_start:head_end]
+    return sliced.reshape((head_end - head_start) * per_head, *trailing)
+
+
 def _shard_gate_state_dict(
     state_dict: dict,
     num_heads_total: int,
@@ -243,27 +270,9 @@ def _shard_gate_state_dict(
     head_end = head_start + num_heads_per_rank
     out: dict = {}
     for key, value in state_dict.items():
-        if key == "q_proj.weight":
-            inner = value.shape[0] // num_heads_total
-            value = value.reshape(
-                num_heads_total, inner, value.shape[1])[head_start:head_end]
-            value = value.reshape(num_heads_per_rank * inner, -1)
-        elif key == "q_proj.bias":
-            inner = value.shape[0] // num_heads_total
-            value = value.reshape(
-                num_heads_total, inner)[head_start:head_end].reshape(
-                    num_heads_per_rank * inner)
-        elif key == "k_proj.weight":
-            output_dim = value.shape[0] // num_heads_total
-            value = value.reshape(
-                num_heads_total, output_dim,
-                value.shape[1])[head_start:head_end]
-            value = value.reshape(num_heads_per_rank * output_dim, -1)
-        elif key == "k_proj.bias":
-            output_dim = value.shape[0] // num_heads_total
-            value = value.reshape(
-                num_heads_total, output_dim)[head_start:head_end].reshape(
-                    num_heads_per_rank * output_dim)
+        if key in HEAD_MAJOR_GATE_PARAMS:
+            value = _shard_head_major(
+                value, num_heads_total, head_start, head_end)
         elif key in ("k_base", "b"):
             value = value[head_start:head_end]
         # q_norm / k_norm weights are output_dim only — pass through.

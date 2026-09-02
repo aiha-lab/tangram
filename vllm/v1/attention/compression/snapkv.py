@@ -23,9 +23,6 @@ class SnapKVScorer(QKScorer):
     """Accepts the token-major flattened query/key or the equivalent 3-D
     views."""
 
-    # Axis-2 dispatch: this scorer reads the inner ``Attention``'s q/k,
-    # not the outer block's hidden_states.
-    consumes = "qk"
     name = "snapkv"
 
     OPTIONS = (

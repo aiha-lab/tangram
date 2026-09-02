@@ -26,9 +26,6 @@ class StreamingLLMScorer(QKScorer):
     chunk's first token; query/key/value are accepted to match the shared
     contract. Higher score = more recent, hence kept."""
 
-    # Axis-2 dispatch: this scorer uses the query/key delivery path, so it
-    # shares the call signature even though it reads neither q nor k.
-    consumes = "qk"
     name = "streamingllm"
 
     def __init__(

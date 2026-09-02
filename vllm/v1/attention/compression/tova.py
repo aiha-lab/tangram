@@ -24,9 +24,6 @@ from vllm.v1.attention.compression.qk_scorer_base import QKScorer
 class TOVAScorer(QKScorer):
     """Scores are identical across heads: TOVA is head-uniform."""
 
-    # Axis-2 dispatch: this scorer reads the inner ``Attention``'s q/k,
-    # not the outer block's hidden_states.
-    consumes = "qk"
     name = "tova"
 
     def __init__(

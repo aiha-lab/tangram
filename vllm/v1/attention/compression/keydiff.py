@@ -28,9 +28,6 @@ class KeyDiffScorer(QKScorer):
     """Reads ``key`` only; ``query`` is accepted to match the shared contract.
     Higher score = more distinctive, hence kept."""
 
-    # Axis-2 dispatch: this scorer reads the inner ``Attention``'s q/k,
-    # not the outer block's hidden_states.
-    consumes = "qk"
     name = "keydiff"
     # A function of the cached keys alone, so every live position can be
     # rescored at every eviction -- what the paper's Eq. (8) asks for.

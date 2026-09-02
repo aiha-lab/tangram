@@ -44,7 +44,6 @@ class ExpectedAttentionScorer(QKScorer):
     reweighting, ``module`` for its ``rotary_emb``, and ``position_offset`` to
     un-rotate the queries at their true global positions."""
 
-    consumes = "qk"
     name = "expected_attention"
 
     #: First queries of each chunk dropped from the mean/covariance estimate as
