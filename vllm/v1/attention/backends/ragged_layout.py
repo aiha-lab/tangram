@@ -82,14 +82,6 @@ def cluster_pages_token_major(
         0, 1, 3, 2, 4)
 
 
-# --- Identity-map addressing API (cluster-map tooling and tests only) --------
-#
-# These address the cache under the identity cluster map and are NOT on the
-# engine path: the runtime uses the cluster-map-driven helpers further down,
-# which subsume identity as one instance. The two must stay numerically
-# consistent -- a change here must hold for those under an identity map.
-
-
 def identity_member_columns(
     num_kv_heads: int,
     page_group_size: int,
