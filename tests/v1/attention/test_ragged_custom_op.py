@@ -17,7 +17,7 @@ import pytest
 import torch
 
 from vllm.attention.layer import _ragged_attention_impl
-from vllm.v1.attention.backends.ragged_layout import (
+from ragged_reference import (
     identity_member_clusters,
     identity_member_columns,
 )

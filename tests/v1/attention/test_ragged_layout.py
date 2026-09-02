@@ -16,15 +16,17 @@ import numpy as np
 from vllm.v1.attention.backends.ragged_layout import (
     as_virtual_block_view,
     column_major_cache_shape,
-    expand_member_seq_lens,
-    identity_member_clusters,
-    identity_member_columns,
     identity_member_maps,
     load_cluster_map,
     member_maps_from_cluster_map,
     member_seq_lens,
     member_virtual_block_table,
     member_virtual_slots,
+)
+from ragged_reference import (
+    expand_member_seq_lens,
+    identity_member_clusters,
+    identity_member_columns,
     physical_to_virtual_block_table,
     physical_to_virtual_slots,
 )
