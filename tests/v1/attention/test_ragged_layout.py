@@ -379,6 +379,8 @@ def _decode_views(num_layers: int, num_reqs: int, num_kv_heads: int,
     members = torch.arange(num_layers * num_kv_heads, dtype=torch.int64)
     return RaggedStepViews(
         num_layers_local=num_layers,
+        num_head_groups_per_layer=num_clusters_per_layer,
+        page_group_size=page_group_size,
         ragged_decode_layout=True,
         # Distinct ids so a mis-indexed layer is visible, not merely wrong.
         cluster_block_table=torch.arange(
@@ -410,7 +412,6 @@ def test_decode_overlays_give_each_layer_its_own_five_fields():
         metadata, views,
         num_reqs=num_reqs,
         num_kv_heads_per_layer=num_kv_heads,
-        page_group_size=g,
     )
 
     assert len(overlays) == num_layers
@@ -442,7 +443,6 @@ def test_decode_overlay_block_table_matches_the_member_expansion():
         _StepMetadata(), views,
         num_reqs=num_reqs,
         num_kv_heads_per_layer=num_kv_heads,
-        page_group_size=g,
     )
 
     for layer_idx, overlay in enumerate(overlays):
@@ -450,7 +450,7 @@ def test_decode_overlay_block_table_matches_the_member_expansion():
             views.cluster_block_table,
             views.clusters_per_layer[layer_idx],
             views.cols_per_layer[layer_idx],
-            g,
+            views.page_group_size,
             cluster_axis=1,
         ).reshape(num_reqs * num_kv_heads, -1)
         assert torch.equal(overlay.block_table, expected), layer_idx
@@ -469,7 +469,6 @@ def test_decode_overlays_reject_the_member_major_layout():
             _StepMetadata(), views,
             num_reqs=num_reqs,
             num_kv_heads_per_layer=num_kv_heads,
-            page_group_size=g,
         )
         raise AssertionError("accepted the member-major layout")
     except AssertionError as error:

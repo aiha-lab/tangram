@@ -93,11 +93,14 @@ def _ragged_attention_impl(
         output.fill_(0)
         return
 
-    assert (getattr(attn_metadata, "num_head_groups_per_layer", 0)
-            == num_groups), (
-        "FlashAttentionMetadata.num_head_groups_per_layer "
-        f"({getattr(attn_metadata, 'num_head_groups_per_layer', 0)}) "
-        f"does not match layer's num_groups_per_layer ({num_groups}).")
+    ragged = attn_metadata.ragged
+    assert ragged is not None, (
+        "ragged paging is active on this layer but the step's attention "
+        "metadata carries no ragged views.")
+    assert ragged.num_head_groups_per_layer == num_groups, (
+        f"the step's num_head_groups_per_layer "
+        f"({ragged.num_head_groups_per_layer}) does not match the layer's "
+        f"num_groups_per_layer ({num_groups}).")
 
     # Actual (unpadded) token count. Slicing before the member-major
     # reshapes both keeps the layout math correct under padding and bounds
@@ -105,7 +108,7 @@ def _ragged_attention_impl(
     num_actual = attn_metadata.num_actual_tokens
     output_2d = output.view(-1, hidden)
 
-    if attn_metadata.ragged_decode_layout:
+    if ragged.ragged_decode_layout:
         _ragged_decode_forward(
             layer, query, key, value, output_2d, kv_cache, attn_metadata,
             num_actual=num_actual, num_kv_heads=num_kv_heads,
@@ -192,18 +195,13 @@ def _ragged_member_major_forward(
     k_token_major = key[:num_actual].view(-1, num_kv_heads, head_size)
     v_token_major = value[:num_actual].view(-1, num_kv_heads, head_size)
 
-    cluster_block_table = attn_metadata.cluster_block_table
-    clusters_per_layer = attn_metadata.clusters_per_layer
-    cols_per_layer = attn_metadata.cols_per_layer
-    seq_lens_grouped = attn_metadata.seq_lens_grouped
-    slot_mapping_grouped = attn_metadata.slot_mapping_grouped
-    query_start_loc_grouped = attn_metadata.query_start_loc_grouped
-    assert cluster_block_table is not None
-    assert clusters_per_layer is not None
-    assert cols_per_layer is not None
-    assert seq_lens_grouped is not None
-    assert slot_mapping_grouped is not None
-    assert query_start_loc_grouped is not None
+    ragged = attn_metadata.ragged
+    cluster_block_table = ragged.cluster_block_table
+    clusters_per_layer = ragged.clusters_per_layer
+    cols_per_layer = ragged.cols_per_layer
+    seq_lens_grouped = ragged.seq_lens_grouped
+    slot_mapping_grouped = ragged.slot_mapping_grouped
+    query_start_loc_grouped = ragged.query_start_loc_grouped
 
     def to_member_major(
         x: torch.Tensor, sub_heads: int,
@@ -238,7 +236,7 @@ def _ragged_member_major_forward(
     # max_blocks].
     block_table_layer = member_virtual_block_table(
         cluster_block_table, clusters_per_layer[layer.layer_idx],
-        cols_per_layer[layer.layer_idx], attn_metadata.page_group_size,
+        cols_per_layer[layer.layer_idx], ragged.page_group_size,
         cluster_axis=1,
     ).permute(1, 0, 2).reshape(num_kv_heads * num_reqs, -1)
     seq_lens_layer = seq_lens_grouped[layer_start:layer_end].reshape(

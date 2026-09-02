@@ -396,6 +396,10 @@ class RaggedStepViews:
     then ``seq_lens_grouped`` / ``slot_mapping_grouped`` carry the
     ``[num_layers, num_reqs, num_kv_heads]`` decode overlay rather than the
     member-major ``[num_members_total, ...]`` prefill/mixed layout.
+    ``num_head_groups_per_layer`` and ``page_group_size`` are the layout
+    constants the forward path needs alongside the views: they are fixed for the
+    model, and travel here so the attention metadata carries one ragged field
+    rather than a dozen.
     ``cluster_block_table`` is ``[num_reqs, num_clusters_total, max_blocks]``
     trimmed to what this batch occupies, ``clusters_per_layer`` and
     ``cols_per_layer`` are the ``[num_layers, num_kv_heads]`` member maps, and
@@ -404,6 +408,8 @@ class RaggedStepViews:
     """
 
     num_layers_local: int
+    num_head_groups_per_layer: int
+    page_group_size: int
     ragged_decode_layout: bool
     cluster_block_table: torch.Tensor
     clusters_per_layer: torch.Tensor
@@ -451,7 +457,6 @@ def build_decode_layer_overlays(
     *,
     num_reqs: int,
     num_kv_heads_per_layer: int,
-    page_group_size: int,
 ) -> list:
     """One metadata overlay per layer, for the uniform-decode layout.
 
@@ -477,7 +482,7 @@ def build_decode_layer_overlays(
             views.cluster_block_table,
             views.clusters_per_layer[layer_idx],
             views.cols_per_layer[layer_idx],
-            page_group_size,
+            views.page_group_size,
             cluster_axis=1,
         ).reshape(num_virtual_seqs, -1)
         overlays.append(layer_overlay(
@@ -641,6 +646,8 @@ def build_ragged_step_views(
 
     return RaggedStepViews(
         num_layers_local=num_layers_local,
+        num_head_groups_per_layer=num_head_groups_per_layer,
+        page_group_size=page_group_size,
         ragged_decode_layout=ragged_decode_layout,
         cluster_block_table=cluster_block_table,
         clusters_per_layer=clusters_per_layer,

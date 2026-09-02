@@ -21,6 +21,7 @@ from ragged_reference import (
     identity_member_columns,
 )
 from vllm.v1.attention.backends.ragged_forward import _ragged_attention_impl
+from vllm.v1.attention.backends.ragged_layout import RaggedStepViews
 
 NUM_REQS = 3
 NUM_KV_HEADS = 4
@@ -39,27 +40,40 @@ PADDED_TOKENS = 8  # capture-size padding applied on top of the actual tokens
 class _FakeMetadata:
     """Just the fields ``_ragged_attention_impl`` reads.
 
-    A dataclass because the member-major path rebuilds per-layer metadata via
-    ``dataclasses.replace``.
+    A dataclass because the member-major path takes a shallow copy of it per
+    layer and overwrites the four fields at the bottom.
     """
 
     num_actual_tokens: int
-    num_head_groups_per_layer: int
-    page_group_size: int
-    ragged_decode_layout: bool
+    ragged: RaggedStepViews | None = None
     per_layer_md: list | None = None
-    cluster_block_table: torch.Tensor | None = None
-    clusters_per_layer: torch.Tensor | None = None
-    cols_per_layer: torch.Tensor | None = None
-    seq_lens_grouped: torch.Tensor | None = None
-    slot_mapping_grouped: torch.Tensor | None = None
-    query_start_loc_grouped: torch.Tensor | None = None
-    # Overwritten per layer by ``dataclasses.replace`` on the member-major
-    # path; never read before being replaced.
+    # Overwritten per layer by ``ragged_layout.layer_overlay`` on the
+    # member-major path; never read before being replaced.
     block_table: torch.Tensor | None = None
     seq_lens: torch.Tensor | None = None
     slot_mapping: torch.Tensor | None = None
     query_start_loc: torch.Tensor | None = None
+
+
+def _views(*, ragged_decode_layout: bool, **tensors) -> RaggedStepViews:
+    """A RaggedStepViews with placeholder tensors for anything unspecified."""
+    empty = torch.empty(0)
+    fields = dict(
+        cluster_block_table=empty,
+        clusters_per_layer=empty,
+        cols_per_layer=empty,
+        seq_lens_grouped=empty,
+        slot_mapping_grouped=empty,
+        query_start_loc_grouped=empty,
+    )
+    fields.update(tensors)
+    return RaggedStepViews(
+        num_layers_local=NUM_LAYERS,
+        num_head_groups_per_layer=NUM_KV_HEADS // PAGE_GROUP_SIZE,
+        page_group_size=PAGE_GROUP_SIZE,
+        ragged_decode_layout=ragged_decode_layout,
+        **fields,
+    )
 
 
 class _RecordingImpl:
@@ -144,11 +158,11 @@ def _decode_metadata() -> _FakeMetadata:
                                              dtype=torch.int32),
             )
         )
+    # The decode path reads only the discriminator and the overlays; the
+    # grouped views it would index are already baked into per_layer_md.
     return _FakeMetadata(
         num_actual_tokens=NUM_REQS,
-        num_head_groups_per_layer=NUM_KV_HEADS // PAGE_GROUP_SIZE,
-        page_group_size=PAGE_GROUP_SIZE,
-        ragged_decode_layout=True,
+        ragged=_views(ragged_decode_layout=True),
         per_layer_md=per_layer_md,
     )
 
@@ -187,15 +201,15 @@ def _member_major_metadata(num_actual_tokens: int) -> _FakeMetadata:
     )
     return _FakeMetadata(
         num_actual_tokens=num_actual_tokens,
-        num_head_groups_per_layer=num_clusters_per_layer,
-        page_group_size=PAGE_GROUP_SIZE,
-        ragged_decode_layout=False,
-        cluster_block_table=cluster_block_table,
-        clusters_per_layer=clusters.view(NUM_LAYERS, NUM_KV_HEADS),
-        cols_per_layer=cols.view(NUM_LAYERS, NUM_KV_HEADS),
-        seq_lens_grouped=seq_lens_grouped,
-        slot_mapping_grouped=slot_mapping_grouped,
-        query_start_loc_grouped=query_start_loc_grouped,
+        ragged=_views(
+            ragged_decode_layout=False,
+            cluster_block_table=cluster_block_table,
+            clusters_per_layer=clusters.view(NUM_LAYERS, NUM_KV_HEADS),
+            cols_per_layer=cols.view(NUM_LAYERS, NUM_KV_HEADS),
+            seq_lens_grouped=seq_lens_grouped,
+            slot_mapping_grouped=slot_mapping_grouped,
+            query_start_loc_grouped=query_start_loc_grouped,
+        ),
     )
 
 
@@ -256,16 +270,17 @@ def test_member_major_layer_slice():
     """The backend must see layer ``LAYER_IDX``'s slice of the member-major
     precomputes, with the virtual block id folding in the member's column."""
     metadata = _member_major_metadata(NUM_REQS)
+    views = metadata.ragged
     call, _, _ = _run(metadata, NUM_REQS, NUM_REQS)
 
     layer_start = LAYER_IDX * NUM_KV_HEADS
     layer_end = layer_start + NUM_KV_HEADS
     assert torch.equal(
         call.seq_lens,
-        metadata.seq_lens_grouped[layer_start:layer_end].reshape(-1))
+        views.seq_lens_grouped[layer_start:layer_end].reshape(-1))
     assert torch.equal(
         call.slot_mapping,
-        metadata.slot_mapping_grouped[layer_start:layer_end].reshape(-1))
+        views.slot_mapping_grouped[layer_start:layer_end].reshape(-1))
     assert call.num_actual_tokens == NUM_KV_HEADS * NUM_REQS
 
     # Independent virtual-block-table reconstruction for one (member, req):
@@ -273,10 +288,10 @@ def test_member_major_layer_slice():
     # folds its column: ``physical * page_group_size + column``.
     member = 3
     req = 1
-    cluster = metadata.clusters_per_layer[LAYER_IDX, member].item()
-    col = metadata.cols_per_layer[LAYER_IDX, member].item()
+    cluster = views.clusters_per_layer[LAYER_IDX, member].item()
+    col = views.cols_per_layer[LAYER_IDX, member].item()
     expected_row = (
-        metadata.cluster_block_table[req, cluster].to(torch.int64)
+        views.cluster_block_table[req, cluster].to(torch.int64)
         * PAGE_GROUP_SIZE + col
     )
     # Backend row order is member-major reshaped to (kv_head, req):
