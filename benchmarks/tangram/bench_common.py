@@ -217,8 +217,18 @@ def add_engine_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--num-gpu-blocks-override", type=int, default=None,
         help="Fix the KV cache at this many blocks instead of profiling for "
-             "it. A pool too small to hold every admitted request forces "
-             "preemption, otherwise hard to reach under compression.",
+             "it. On its own a small pool only serializes admission (see "
+             "--no-scheduler-reserve-full-isl); it bounds how much KV the "
+             "run may hold.",
+    )
+    parser.add_argument(
+        "--no-scheduler-reserve-full-isl", dest="scheduler_reserve_full_isl",
+        action="store_false", default=True,
+        help="Admit a request when its next chunk fits instead of when its "
+             "whole input fits. Combined with a small "
+             "--num-gpu-blocks-override this over-admits and is what forces "
+             "preemption; with the reservation on, a small pool admits one "
+             "request at a time and never preempts.",
     )
     parser.add_argument(
         "--max-num-batched-tokens", type=int, default=None,
@@ -360,6 +370,7 @@ def build_llm(args: argparse.Namespace) -> LLM:
         "enable_prefix_caching": args.enable_prefix_caching,
         "disable_log_stats": not args.enable_log_stats,
         "disable_custom_all_reduce": args.disable_custom_all_reduce,
+        "scheduler_reserve_full_isl": args.scheduler_reserve_full_isl,
         "page_group_size": args.page_group_size,
         "head_group_cluster_map": args.head_group_cluster_map,
         # Only the SCBench driver needs it, and it is inert without

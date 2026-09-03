@@ -75,8 +75,11 @@ flag --skip-existing "${RESUME:-0}"
 # vLLM's periodic stats logger — the "Preemptions: N" line.
 flag --enable-log-stats "${LOG_STATS:-0}"
 opt --tasks "${TASKS:-}"
-# A KV pool too small to hold every admitted request forces preemption.
+# A KV pool bound; on its own it serializes admission rather than preempting.
 opt --num-gpu-blocks-override "${NUM_GPU_BLOCKS:-}"
+# 1 = admit on the next chunk instead of the whole input. With a small
+# NUM_GPU_BLOCKS this over-admits, which is what forces preemption.
+flag --no-scheduler-reserve-full-isl "${NO_RESERVE_FULL_ISL:-0}"
 # fastkvzip only; unset lets the engine auto-resolve the gate.
 opt --compression-gate-path "${GATE_PATH:-}"
 # The bench defaults (chunk 8192 / window 4096 / floor 512 / sink 32) are tuned
