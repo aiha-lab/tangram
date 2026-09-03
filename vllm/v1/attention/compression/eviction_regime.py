@@ -528,6 +528,11 @@ class BudgetRegime(EvictionRegime):
             "BudgetRegime requires compression_budget_tokens.")
         budget = int(params.budget_tokens)
         total_seen = prev_lens + chunk_len
+        # One sink and one tail for every entry, so they can be no wider than
+        # the SHORTEST entry holds -- protecting a position that does not exist
+        # would put its kept length above what it has seen. Binding here means
+        # nothing has been evicted yet: an evicted entry keeps sink + tail, so
+        # by the time lengths can differ they are all past this clamp.
         min_total = int(total_seen.min())
         sink_size = min(params.n_sink_tokens, min_total)
         evictable = max(0, min_total - sink_size)
