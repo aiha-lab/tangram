@@ -118,6 +118,21 @@ def run_task(
     elapsed_seconds = time.perf_counter() - start
     print(f"  Generation took {elapsed_seconds:.2f}s")
 
+    # Preemption count, so a result file says whether the run went through the
+    # preempt-and-refill paths at all. ``get_metrics`` asserts when stats are
+    # off, so a run without --enable-log-stats records None rather than a
+    # misleading zero. The counter spans the whole engine, and one engine
+    # serves every task of a sweep, so the value is cumulative.
+    preemptions = None
+    if args.enable_log_stats:
+        preemptions = next(
+            (int(getattr(metric, "value", 0)) for metric in llm.get_metrics()
+             if metric.name == "vllm:num_preemptions"),
+            0,
+        )
+    if preemptions is not None:
+        print(f"  Preemptions so far this engine: {preemptions}")
+
     scores: list[float] = []
     per_sample: list[dict[str, Any]] = []
     e2el_series: list[float] = []
@@ -239,6 +254,9 @@ def run_task(
         "num_samples": len(per_sample),
         "avg_score": round(avg_score, 4),
         "generation_time_sec": round(elapsed_seconds, 4),
+        # None when the run disabled stats; otherwise cumulative over every
+        # task this engine has served (see where it is read).
+        "preemptions_cumulative": preemptions,
         "benchmark": benchmark,
         "scores": [float(s) for s in scores],
         "per_sample": per_sample,
