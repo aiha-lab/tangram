@@ -66,15 +66,20 @@ class BudgetScope(ABC):
 class _ClusterCalibratedScope(BudgetScope):
     """Shared machinery for the threshold-based scopes (``global`` / ``layer``).
 
-    Both threshold at CLUSTER granularity: per position the cluster score is
-    the MAX over its members, the threshold keeps the top ``adjusted_ratio``
-    fraction of (cluster, position) cells, and a cluster's kept COUNT IS its
-    physical length -- so the total physical KV is exactly ``adjusted_ratio``
-    of the context, sink and block alignment aside, while strong clusters keep
-    more. The subclasses differ only in where the threshold spans.
+    Two steps. A threshold over the scope's span gives every MEMBER the count
+    it would keep on its own, then a cluster's kept COUNT is the MEAN of its
+    members' -- the only rule that spends the budget exactly, a page holding no
+    padding::
 
-    TP=1 only: member heads are sharded across ranks, so the max-pool would need
-    a cross-rank gather first. Config validation rejects TP>1; this is the
+        sum(cluster count x page_group_size) = sum(member count) = the budget
+
+    So the total physical KV is ``adjusted_ratio`` of the context however the
+    members are grouped, and what grouping changes is which members are averaged
+    together -- a cluster of demanding heads keeps more, and one of quiet heads
+    less. The subclasses differ only in where the threshold spans.
+
+    TP=1 only: member heads are sharded across ranks, so the mean would need a
+    cross-rank gather first. Config validation rejects TP>1; this is the
     runtime backstop.
     """
 
@@ -90,94 +95,98 @@ class _ClusterCalibratedScope(BudgetScope):
         if get_tensor_model_parallel_world_size() > 1:
             raise NotImplementedError(
                 f"{self.name} is implemented for TP=1 only; TP>1 needs a "
-                "cross-rank gather of each cluster's member scores before the "
-                "per-position max-pool.")
+                "cross-rank gather of each cluster's member counts before the "
+                "mean.")
         eval_len = eval_scores.shape[-1]
-        num_clusters_total = num_layers * num_groups
         flat = eval_scores.reshape(num_layers * num_kv_heads, eval_len)
-        # Per-(cluster, position) score = MAX over the cluster's members.
-        cluster_scores = flat.new_full(
-            (num_clusters_total, eval_len), float("-inf"))
-        idx = member_to_cluster.to(torch.int64).unsqueeze(1).expand(-1, eval_len)
-        cluster_scores.scatter_reduce_(
-            0, idx, flat, reduce="amax", include_self=True)
-        counts = self._counts_from_cluster_scores(
-            cluster_scores, adjusted_ratio, num_layers, num_groups)
-        return counts.cpu().numpy().astype(np.int64)
+        member_counts = self._member_counts(
+            flat, adjusted_ratio, num_layers, num_kv_heads)
+        totals = torch.zeros(
+            num_layers * num_groups, dtype=torch.int64, device=flat.device)
+        totals.index_add_(
+            0, member_to_cluster.to(torch.int64), member_counts)
+        # A remainder rounds DOWN, as every budget ceiling here does: rounding
+        # up hands the cluster ``page_group_size`` slots the budget does not
+        # hold, and there is no rule for whom to take them back from.
+        page_group_size = num_kv_heads // num_groups
+        counts = torch.div(totals, page_group_size, rounding_mode="floor")
+        return counts.view(
+            num_layers, num_groups).cpu().numpy().astype(np.int64)
 
     @abstractmethod
-    def _counts_from_cluster_scores(
+    def _member_counts(
         self,
-        cluster_scores: torch.Tensor,
+        flat: torch.Tensor,
         adjusted_ratio: float,
         num_layers: int,
-        num_groups: int,
+        num_kv_heads: int,
     ) -> torch.Tensor:
-        """Kept COUNT ``[num_layers, num_groups]`` from the max-pooled
-        ``[num_layers * num_groups, eval_len]`` scores. The count above the
-        threshold IS the cluster's physical length."""
+        """Per-member kept count as int64 ``[num_layers * num_kv_heads]``, from
+        the ``[num_layers * num_kv_heads, eval_len]`` scores: how many positions
+        this member would keep were it free to choose its own length."""
 
 
 class GlobalScope(_ClusterCalibratedScope):
     """One threshold over EVERY layer at once, so strong layers keep more and
     weak ones less.
 
-    The threshold spans all clusters together, so cluster ids need not encode
-    their layer: this pairs with a cross-layer map (``--cluster-scope global``).
-    Sensitive to cross-layer score-scale disparity -- a scorer giving one layer
-    systematically larger scores lets it monopolise the budget."""
+    The threshold spans every layer's members together, so a cluster may draw
+    its members from anywhere: this pairs with a cross-layer map
+    (``--cluster-scope global``). Sensitive to cross-layer score-scale
+    disparity -- a scorer giving one layer systematically larger scores lets it
+    monopolise the budget."""
 
     name = "global"
     cluster_map_scope = "global"
     pooled_span = "global"
 
-    def _counts_from_cluster_scores(
+    def _member_counts(
         self,
-        cluster_scores: torch.Tensor,
+        flat: torch.Tensor,
         adjusted_ratio: float,
         num_layers: int,
-        num_groups: int,
+        num_kv_heads: int,
     ) -> torch.Tensor:
         # ``topk(n+1).min`` is O(N) vs a full sort: the smallest of the
-        # top-(n+1) cells is the cut. Empty clusters stay at -inf.
-        flat = cluster_scores.reshape(-1)
-        n = max(int(flat.numel() * adjusted_ratio) - 1, 0)
-        threshold = torch.topk(flat, k=n + 1).values.min()
-        return (
-            cluster_scores > threshold
-        ).sum(dim=-1).view(num_layers, num_groups)  # [num_layers, num_groups]
+        # top-(n+1) cells is the cut.
+        cells = flat.reshape(-1)
+        n = max(int(cells.numel() * adjusted_ratio) - 1, 0)
+        threshold = torch.topk(cells, k=n + 1).values.min()
+        return (flat > threshold).sum(dim=-1)
 
 
 class LayerScope(_ClusterCalibratedScope):
     """One threshold PER layer, so no layer can monopolise the budget. Immune
     to cross-layer score-scale disparity.
 
-    Clusters are bucketed by ``cluster_id // num_groups``, which REQUIRES a
-    within-layer map (``--cluster-scope per_layer``) for that expression to be
-    the physical layer. A cross-layer map numbers clusters by global score
-    fill-order with no layer correspondence, so the bucketing would group
-    unrelated clusters."""
+    A member's count comes from its own layer's threshold, so averaging members
+    of different layers would mix counts calibrated on different scales. That
+    REQUIRES a within-layer map (``--cluster-scope per_layer``); a cross-layer
+    map numbers clusters by global score fill-order with no layer
+    correspondence, so a cluster would straddle thresholds."""
 
     name = "layer"
     cluster_map_scope = "per_layer"
     pooled_span = "layer"
 
-    def _counts_from_cluster_scores(
+    def _member_counts(
         self,
-        cluster_scores: torch.Tensor,
+        flat: torch.Tensor,
         adjusted_ratio: float,
         num_layers: int,
-        num_groups: int,
+        num_kv_heads: int,
     ) -> torch.Tensor:
-        cluster_scores = cluster_scores.view(num_layers, num_groups, -1)
-        # One threshold per output layer over its (cluster, position) cells.
-        per_layer = cluster_scores.reshape(num_layers, -1)
+        # One threshold per layer over its own (member, position) cells.
+        # ``reshape``, not ``view``: the eval scores are a workspace slice and
+        # need not be contiguous.
+        per_layer = flat.reshape(num_layers, -1)
         n = max(int(per_layer.shape[1] * adjusted_ratio) - 1, 0)
         thresholds = torch.topk(
             per_layer, k=n + 1, dim=1).values.min(dim=1).values  # [num_layers]
         return (
-            cluster_scores > thresholds.view(num_layers, 1, 1)
-        ).sum(dim=-1)  # [num_layers, num_groups]
+            flat.reshape(num_layers, num_kv_heads, -1)
+            > thresholds.view(num_layers, 1, 1)
+        ).sum(dim=-1).reshape(-1)
 
 
 class UniformScope(BudgetScope):
