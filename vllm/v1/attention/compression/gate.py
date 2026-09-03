@@ -147,14 +147,6 @@ def _resolve_gate_filename(model_name: str, gate_path: str) -> str:
     return os.path.join(short, fname + ".pt")
 
 
-def _local_gate_path(resolved: str) -> str | None:
-    # Local Fast-KVzip output dir, checked before any network so air-gapped
-    # deployments work. None when absent.
-    candidate = os.path.expanduser(
-        os.path.join("~", "FastKVzip", "result_gate", resolved))
-    return candidate if os.path.exists(candidate) else None
-
-
 def _hf_cached_gate_path(resolved: str) -> str | None:
     # HF cache lookup only, no network (local_files_only); None on a miss.
     from huggingface_hub import hf_hub_download
@@ -212,12 +204,13 @@ def _hf_download_gate_path(resolved: str, gate_path: str) -> str:
 
 def _download_or_local(model_name: str, gate_path: str) -> str:
     # Try every offline source before the network, in order:
-    # (1) absolute path, (2) local FastKVzip dir, (3) HF cache, (4) download.
+    # (1) an absolute path, which is how a checkpoint is staged for an
+    # air-gapped host, (2) the HF cache, (3) download. Nothing may shadow the
+    # pinned revision: a gate that loads must be the one the results used.
     if os.path.isabs(gate_path) and os.path.exists(gate_path):
         return gate_path
     resolved = _resolve_gate_filename(model_name, gate_path)
-    return (_local_gate_path(resolved)
-            or _hf_cached_gate_path(resolved)
+    return (_hf_cached_gate_path(resolved)
             or _hf_download_gate_path(resolved, gate_path))
 
 
