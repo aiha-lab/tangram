@@ -171,6 +171,97 @@ def test_add_row_resets_the_row_first():
     np.testing.assert_array_equal(table.block_table.np[2, :, 0], [5, 6, 7, 8])
 
 
+# --- append_row with a target: the depths a compressed row must reach ------
+
+
+def test_ragged_append_row_fills_each_group_to_its_target():
+    """Compression leaves the groups at different depths and they must STAY
+    there: the caller names the depth per group instead of a shared one."""
+    table = make_ragged()
+    table.append_row([1, 2, 3, 4], row_idx=0)
+
+    # Shortfall is [2, 0, 1, 1]: group 0 takes two ids, group 1 none.
+    table.append_row([20, 21, 22, 23], row_idx=0, target_depth=[3, 1, 2, 2])
+
+    np.testing.assert_array_equal(table.num_blocks_per_row[0], [3, 1, 2, 2])
+    np.testing.assert_array_equal(table.block_table.np[0, 0, :3], [1, 20, 21])
+    np.testing.assert_array_equal(table.block_table.np[0, 2, :2], [3, 22])
+    np.testing.assert_array_equal(table.block_table.np[0, 3, :2], [4, 23])
+
+
+def test_ragged_append_row_leaves_a_satisfied_group_untouched():
+    """A group already at its target takes no ids -- this is the page that
+    used to come straight back after compression freed it."""
+    table = make_ragged()
+    table.append_row([1, 2, 3, 4], row_idx=0)
+
+    table.append_row([30], row_idx=0, target_depth=[1, 1, 2, 1])
+
+    np.testing.assert_array_equal(table.num_blocks_per_row[0], [1, 1, 2, 1])
+    np.testing.assert_array_equal(table.block_table.np[0, 2, :2], [3, 30])
+
+
+def test_ragged_append_row_target_may_ask_for_nothing():
+    table = make_ragged()
+    table.append_row([1, 2, 3, 4], row_idx=0)
+
+    table.append_row([], row_idx=0, target_depth=[1, 1, 1, 1])
+
+    np.testing.assert_array_equal(table.num_blocks_per_row[0], [1, 1, 1, 1])
+
+
+def test_ragged_append_row_rejects_a_total_that_misses_the_target():
+    """The count is the contract between the allocator and this table; a
+    mismatch means one of them is on the wrong rule, so it must not be
+    absorbed silently."""
+    table = make_ragged()
+    table.append_row([1, 2, 3, 4], row_idx=0)
+
+    with pytest.raises(RuntimeError, match="target"):
+        table.append_row([20, 21], row_idx=0, target_depth=[3, 1, 2, 2])
+
+
+def test_ragged_append_row_target_refuses_to_shrink():
+    table = make_ragged()
+    table.append_row([1, 2, 3, 4], row_idx=0)
+
+    with pytest.raises(RuntimeError, match="cannot shrink"):
+        table.append_row([], row_idx=0, target_depth=[0, 1, 1, 1])
+
+
+def test_ragged_append_row_target_needs_one_entry_per_group():
+    table = make_ragged()
+
+    with pytest.raises(RuntimeError, match="num_head_groups"):
+        table.append_row([1, 2], row_idx=0, target_depth=[1, 1])
+
+
+def test_ragged_restore_then_targeted_append_keeps_the_layout():
+    """The re-add path: a row that left the batch comes back through
+    ``restore_row`` at its compacted depths and then takes this step's ids.
+    Levelling it here would undo the restore."""
+    table = make_ragged()
+    table.append_row([1, 2, 3, 4], row_idx=0)
+    table.num_blocks_per_row[0] = [3, 1, 2, 1]
+    snapshot = table.snapshot_row(row_idx=0)
+    table.clear()
+
+    table.restore_row(0, snapshot)
+    table.append_row([50, 51], row_idx=0, target_depth=[4, 1, 3, 1])
+
+    np.testing.assert_array_equal(table.num_blocks_per_row[0], [4, 1, 3, 1])
+
+
+def test_ragged_append_row_without_a_target_still_levels_the_groups():
+    """The uniform rule stays for callers that have no per-group lengths --
+    a fresh prefill, where every group holds the same tokens."""
+    table = make_ragged()
+
+    table.append_row([100, 101, 102, 103], row_idx=0)
+
+    np.testing.assert_array_equal(table.num_blocks_per_row[0], [1, 1, 1, 1])
+
+
 # --- move / swap: whole rows, group axis included -------------------------
 
 
@@ -516,6 +607,20 @@ def test_multi_group_ragged_routes_rows_to_the_single_table():
     multi.append_row(([1, 2, 3, 4],), row_idx=0)
 
     np.testing.assert_array_equal(multi[0].block_table.np[0, :, 0], [1, 2, 3, 4])
+
+
+def test_multi_group_ragged_forwards_the_target_depth():
+    """The runner reaches the ragged table only through this wrapper, so the
+    per-group target has to survive the hop."""
+    multi = make_multi(
+        num_head_groups=NUM_HEAD_GROUPS,
+        num_head_groups_per_layer=GROUPS_PER_LAYER,
+    )
+    multi.append_row(([1, 2, 3, 4],), row_idx=0)
+
+    multi.append_row(([20, 21, 22, 23],), row_idx=0, target_depth=[3, 1, 2, 2])
+
+    np.testing.assert_array_equal(multi[0].num_blocks_per_row[0], [3, 1, 2, 2])
 
 
 def test_multi_group_plain_fans_rows_out_per_group():

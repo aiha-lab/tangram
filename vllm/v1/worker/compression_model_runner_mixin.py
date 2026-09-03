@@ -44,6 +44,7 @@ from vllm.v1.attention.compression.workspace import (
     CompressionWorkspace,
     WorkspaceSpec,
 )
+from vllm.v1.core.ragged_allocation import group_block_depths
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import (
@@ -505,6 +506,48 @@ class CompressionModelRunnerMixin:
 
             self._evict_sliding_window_blocks(
                 block_table, row_idx, kept_lengths_phys)
+
+    def ragged_append_target(
+        self, row: int, num_new_tokens: int
+    ) -> np.ndarray | None:
+        """Block depth each head group of ``row`` must reach once this step's
+        ``num_new_tokens`` are written; ``None`` with ragged paging off, which
+        leaves the block table on its uniform rule.
+
+        Rebuilds what the scheduler priced the allocation with rather than
+        receiving it, from the same kept lengths and the same new tokens. A
+        drift between the two is caught by the block table, not absorbed.
+        """
+        eff = self.input_batch.effective_seq_lens_cpu
+        if eff is None:
+            return None
+        return self._depths_for(eff[row], num_new_tokens)
+
+    def ragged_readd_target(
+        self, kept_lengths: np.ndarray | None, num_new_tokens: int
+    ) -> np.ndarray | None:
+        """Same depths for a row that is re-entering the batch.
+
+        Its lengths are still in the snapshot taken when it left; the batch row
+        has not been restored yet at the point the increment is recorded.
+        """
+        if kept_lengths is None:
+            return None
+        return self._depths_for(kept_lengths, num_new_tokens)
+
+    def _depths_for(
+        self, kept_lengths: np.ndarray, num_new_tokens: int
+    ) -> np.ndarray:
+        # The scheduler reserves an eagle proposer's lookahead on top of the
+        # scheduled tokens; every other setting reserves nothing.
+        spec = self.speculative_config
+        lookahead = (spec.num_speculative_tokens
+                     if spec is not None and spec.use_eagle() else 0)
+        needed = np.minimum(
+            kept_lengths.astype(np.int64) + num_new_tokens + lookahead,
+            self.max_model_len)
+        return group_block_depths(
+            needed, self.input_batch.block_table[0].block_size, needed.size)
 
     def _postprocess_compress_updates(
         self,

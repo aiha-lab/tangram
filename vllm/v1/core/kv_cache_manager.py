@@ -342,7 +342,7 @@ class KVCacheManager:
         num_lookahead_tokens: int = 0,
         delay_cache_blocks: bool = False,
         num_encoder_tokens: int = 0,
-        effective_num_cached_tokens: int | None = None,
+        effective_num_cached_tokens: np.ndarray | None = None,
         full_sequence_must_fit: bool = False,
         has_scheduled_reqs: bool = False,
     ) -> KVCacheBlocks | None:
@@ -421,7 +421,9 @@ class KVCacheManager:
         # against post-compression occupancy rather than the model-side
         # ``num_computed_tokens``. Pre-compression they coincide.
         if effective_num_cached_tokens is not None:
-            num_tokens_need_slot = min(
+            # One kept length per head group, so the clamp is elementwise;
+            # every group stores every new token.
+            num_tokens_need_slot = np.minimum(
                 effective_num_cached_tokens + num_new_tokens + num_lookahead_tokens,
                 self.max_model_len,
             )

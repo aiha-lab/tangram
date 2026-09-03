@@ -109,10 +109,18 @@ class RaggedBlockTable(BlockTable):
             dtype=torch.int64,
         )
 
-    def append_row(self, block_ids: list[int], row_idx: int) -> None:
-        if not block_ids:
+    def append_row(
+        self,
+        block_ids: list[int],
+        row_idx: int,
+        target_depth: np.ndarray | list[int] | None = None,
+    ) -> None:
+        # A target of all-zero shortfall is still work: it has to be checked
+        # against what the row holds, so only a caller with no target at all
+        # gets the empty-list shortcut.
+        if not block_ids and target_depth is None:
             return
-        self._append_row_grouped(block_ids, row_idx)
+        self._append_row_grouped(block_ids, row_idx, target_depth)
 
     def add_row(self, block_ids: list[int], row_idx: int) -> None:
         self.num_blocks_per_row[row_idx, :] = 0
@@ -147,56 +155,76 @@ class RaggedBlockTable(BlockTable):
             self.slot_mapping.cpu[:, :num_tokens], non_blocking=True
         )
 
-    def _append_row_grouped(self, block_ids: list[int], row_idx: int) -> None:
+    def _append_row_grouped(
+        self,
+        block_ids: list[int],
+        row_idx: int,
+        target_depth: np.ndarray | list[int] | None,
+    ) -> None:
         """Ragged append.
 
-        ``block_ids`` is a flat sequence sized by
-        ``num_required_blocks × num_head_groups − len(req_blocks)``. With
-        pre-append per-group counts ``starts[g]``, the target is a
-        uniform per-group depth ``num_required = (sum(starts) + total) /
-        num_head_groups``. We fill groups in order — group 0 takes its
-        ``num_required − starts[0]`` ids first, then group 1, etc. Block
-        ids are interchangeable, so the per-group order is purely an
-        accounting choice; only the uniqueness of (row, group, slot) →
-        id matters.
+        ``block_ids`` is a flat sequence sized by the allocator as the total
+        shortfall across groups. ``target_depth`` names the block depth each
+        group must reach — the same ``ceil(len_g / block_size)`` the allocator
+        priced the request with, so the two cannot drift.
+
+        Without a target the groups all hold the same tokens (a request that
+        has not been compressed yet), and the depth is recovered by levelling:
+        ``(sum(starts) + total) / num_head_groups``.
+
+        Groups are filled in order — group 0 takes its shortfall first, then
+        group 1, and so on. Block ids are interchangeable, so the per-group
+        order is purely an accounting choice; only the uniqueness of
+        (row, group, slot) → id matters.
         """
         assert self.num_head_groups is not None
         num_groups = self.num_head_groups
         total = len(block_ids)
-
         starts = self.num_blocks_per_row[row_idx]
-        sum_starts = int(starts.sum())
-        # ``num_required`` must be an integer; otherwise allocator and
-        # append are out of sync (e.g. stale ``num_required_blocks``).
-        if (sum_starts + total) % num_groups != 0:
+
+        if target_depth is None:
+            sum_starts = int(starts.sum())
+            # A uniform depth must come out an integer; otherwise allocator
+            # and append are out of sync (e.g. stale ``num_required_blocks``).
+            if (sum_starts + total) % num_groups != 0:
+                raise RuntimeError(
+                    f"ragged append_row: total {total} + existing "
+                    f"{sum_starts} not divisible by num_head_groups "
+                    f"({num_groups}); uniform per-group target unrecoverable.")
+            target = np.full(
+                num_groups, (sum_starts + total) // num_groups, dtype=np.int64)
+        else:
+            target = np.asarray(target_depth, dtype=np.int64)
+            if target.size != num_groups:
+                raise RuntimeError(
+                    f"ragged append_row: target_depth has {target.size} "
+                    f"entries but num_head_groups is {num_groups}.")
+
+        shortfall = target - starts
+        if int(shortfall.min()) < 0:
             raise RuntimeError(
-                f"ragged append_row: total {total} + existing "
-                f"{sum_starts} not divisible by num_head_groups "
-                f"({num_groups}); uniform per-group target unrecoverable.")
-        num_required = (sum_starts + total) // num_groups
-        if num_required < int(starts.max()):
+                f"ragged append_row: target depth {target.tolist()} is below "
+                f"the blocks a group already holds {starts.tolist()}; cannot "
+                "shrink groups via append.")
+        if int(shortfall.sum()) != total:
             raise RuntimeError(
-                f"ragged append_row: num_required {num_required} < "
-                f"max(starts) {int(starts.max())}; cannot shrink groups "
-                "via append.")
+                f"ragged append_row: received {total} block ids but the "
+                f"target depth needs {int(shortfall.sum())}; the allocator "
+                "and the block table are on different rules and the KV block "
+                "table would be corrupted.")
 
         block_ids_np = np.asarray(block_ids, dtype=np.int32)
         pos = 0
         for group_idx in range(num_groups):
-            start = int(starts[group_idx])
-            num_new = num_required - start
+            num_new = int(shortfall[group_idx])
             if num_new <= 0:
                 continue
+            start = int(starts[group_idx])
             self.block_table.np[
                 row_idx, group_idx, start : start + num_new
             ] = block_ids_np[pos : pos + num_new]
             pos += num_new
-        if pos != total:
-            raise RuntimeError(
-                f"ragged append_row: consumed {pos} block ids but received "
-                f"{total}; per-group block counts are inconsistent and the "
-                "KV block table would be corrupted.")
-        self.num_blocks_per_row[row_idx, :] = num_required
+        self.num_blocks_per_row[row_idx, :] = target
 
     def _compute_slot_mapping_grouped(
         self, req_indices: np.ndarray, positions: np.ndarray

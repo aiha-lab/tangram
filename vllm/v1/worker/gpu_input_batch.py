@@ -61,8 +61,10 @@ class CachedRequestState:
     # compacted request's KV). None when ragged paging is off.
     block_table_snapshot: tuple[np.ndarray, np.ndarray] | None = None
     # Ragged paging: this step's newly allocated block ids for a
-    # request being re-added, appended after ``restore_row``.
+    # request being re-added, appended after ``restore_row``, and the
+    # per-group depths they bring the restored row to.
     block_table_readd_increment: tuple[list[int], ...] | None = None
+    block_table_readd_target: np.ndarray | None = None
 
     def __post_init__(self):
         self.num_prompt_tokens = length_from_prompt_token_ids_or_embeds(
@@ -88,7 +90,7 @@ class CachedRequestState:
     def drop_readd_snapshot(self) -> None:
         """Clear the ragged verbatim re-add snapshot as one unit.
 
-        The three fields are captured together when a request leaves the
+        The four fields are captured together when a request leaves the
         InputBatch and are all stale once it is resumed from preemption (which
         re-prefills from scratch). Clearing them as a unit avoids forgetting a
         field and leaking a stale value into the rebuilt row.
@@ -96,6 +98,7 @@ class CachedRequestState:
         self.eff_seq_lens_snapshot = None
         self.block_table_snapshot = None
         self.block_table_readd_increment = None
+        self.block_table_readd_target = None
 
 
 class InputBatch:
@@ -400,9 +403,12 @@ class InputBatch:
             )
             increment = request.block_table_readd_increment
             if increment is not None and increment[0]:
-                self.block_table.append_row(increment, req_index)
+                self.block_table.append_row(
+                    increment, req_index,
+                    target_depth=request.block_table_readd_target)
             request.block_table_snapshot = None
             request.block_table_readd_increment = None
+            request.block_table_readd_target = None
         else:
             self.block_table.add_row(request.block_ids, req_index)
 

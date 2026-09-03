@@ -10,6 +10,7 @@ import numpy as np
 from vllm.utils.math_utils import cdiv
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_utils import BlockHash, KVCacheBlock
+from vllm.v1.core.ragged_allocation import blocks_for
 from vllm.v1.kv_cache_interface import (
     ChunkedLocalAttentionSpec,
     CrossAttentionSpec,
@@ -91,7 +92,7 @@ class SingleTypeKVCacheManager(ABC):
     def get_num_blocks_to_allocate(
         self,
         request_id: str,
-        num_tokens: int,
+        num_tokens: int | np.ndarray,
         new_computed_blocks: Sequence[KVCacheBlock] | np.ndarray,
     ) -> int:
         """
@@ -100,7 +101,9 @@ class SingleTypeKVCacheManager(ABC):
         Args:
             request_id: The request ID.
             num_tokens: The total number of tokens that need a slot (including
-                tokens that are already allocated).
+                tokens that are already allocated). On the ragged path this may
+                be one length per head group, which is what compression leaves;
+                see ``ragged_allocation``.
             new_computed_blocks: The new computed blocks just hitting the
                 prefix caching. Accepts ``Sequence[KVCacheBlock]`` (base
                 path) or ``np.ndarray`` of block ids (ragged path
@@ -110,7 +113,6 @@ class SingleTypeKVCacheManager(ABC):
             The number of blocks.
         """
 
-        num_required_blocks = cdiv(num_tokens, self.block_size)
         num_groups = self.num_head_groups_total
         is_ndarray = isinstance(new_computed_blocks, np.ndarray)
         num_computed = (int(new_computed_blocks.size) if is_ndarray
@@ -118,10 +120,12 @@ class SingleTypeKVCacheManager(ABC):
         if self.ragged:
             ids = self.req_to_block_ids.get(request_id)
             existing_len = 0 if ids is None else int(ids.size)
+            num_required_blocks = blocks_for(
+                num_tokens, self.block_size, num_groups)
         else:
             existing_len = len(self.req_to_blocks[request_id])
-        num_new_blocks = (
-            num_required_blocks * num_groups - num_computed - existing_len)
+            num_required_blocks = cdiv(num_tokens, self.block_size) * num_groups
+        num_new_blocks = num_required_blocks - num_computed - existing_len
         # If a computed block is an eviction candidate (ref_cnt == 0), it
         # will be revived during allocation so it counts as new. The
         # ndarray branch carries no per-block ref_cnt (ragged caching
@@ -178,7 +182,7 @@ class SingleTypeKVCacheManager(ABC):
             assert num_computed == 0
 
     def allocate_new_blocks(
-        self, request_id: str, num_tokens: int
+        self, request_id: str, num_tokens: int | np.ndarray
     ) -> list[KVCacheBlock] | np.ndarray:
         """
         Allocate new blocks for the request to give it at least `num_tokens`
@@ -187,18 +191,20 @@ class SingleTypeKVCacheManager(ABC):
         Args:
             request_id: The request ID.
             num_tokens: The total number of tokens that need a slot (including
-                tokens that are already allocated).
+                tokens that are already allocated). On the ragged path this may
+                be one length per head group, which is what compression leaves;
+                see ``ragged_allocation``.
 
         Returns:
             ``list[KVCacheBlock]`` for the base path,
             ``np.ndarray[int32]`` of block ids for the ragged path.
         """
-        num_required_blocks = cdiv(num_tokens, self.block_size)
         num_groups = self.num_head_groups_total
         if self.ragged:
             existing = self.req_to_block_ids.get(request_id)
             existing_len = 0 if existing is None else int(existing.size)
-            num_new_blocks = num_required_blocks * num_groups - existing_len
+            num_new_blocks = blocks_for(
+                num_tokens, self.block_size, num_groups) - existing_len
             if num_new_blocks <= 0:
                 return np.empty(0, dtype=np.int32)
             # Pull new ids directly from the ring buffer; the int32 array
@@ -213,7 +219,8 @@ class SingleTypeKVCacheManager(ABC):
                 )
             return new_ids
         req_blocks = self.req_to_blocks[request_id]
-        num_new_blocks = num_required_blocks * num_groups - len(req_blocks)
+        num_new_blocks = (
+            cdiv(num_tokens, self.block_size) * num_groups - len(req_blocks))
         if num_new_blocks <= 0:
             return []
         else:

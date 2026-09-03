@@ -960,6 +960,11 @@ class GPUModelRunner(
                     req_state.drop_readd_snapshot()
                 elif req_state.block_table_snapshot is not None:
                     req_state.block_table_readd_increment = new_block_ids
+                    req_state.block_table_readd_target = (
+                        self.ragged_readd_target(
+                            req_state.eff_seq_lens_snapshot,
+                            scheduler_output.num_scheduled_tokens[req_id],
+                        ))
 
                 if self.use_async_scheduling and num_output_tokens > 0:
                     # We must recover the output token ids for resumed requests in the
@@ -973,7 +978,16 @@ class GPUModelRunner(
             # Update the persistent batch.
             self.input_batch.num_computed_tokens_cpu[req_index] = num_computed_tokens
             if new_block_ids is not None:
-                self.input_batch.block_table.append_row(new_block_ids, req_index)
+                # Ragged paging: each head group keeps its own depth, so the
+                # flat ids are placed against the depths the scheduler priced.
+                self.input_batch.block_table.append_row(
+                    new_block_ids,
+                    req_index,
+                    target_depth=self.ragged_append_target(
+                        req_index,
+                        scheduler_output.num_scheduled_tokens[req_id],
+                    ),
+                )
 
             # For the last rank, we don't need to update the token_ids_cpu
             # because the sampled tokens are already cached.

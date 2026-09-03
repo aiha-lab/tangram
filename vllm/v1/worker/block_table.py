@@ -349,12 +349,21 @@ class MultiGroupBlockTable:
             for block_size, kernel_block_size in zip(block_sizes, kernel_block_sizes)
         ]
 
-    def append_row(self, block_ids: tuple[list[int], ...], row_idx: int) -> None:
+    def append_row(
+        self,
+        block_ids: tuple[list[int], ...],
+        row_idx: int,
+        target_depth: np.ndarray | None = None,
+    ) -> None:
         # Ragged paging holds exactly one table (it absorbs the layer axis into
         # the flat group index), so the loop below already routes its single
-        # entry -- the caller's ``num_head_groups × num_new`` ids, group-major,
-        # from one ``BlockPool.get_new_blocks`` call covering every
-        # (layer, head-group) pair.
+        # entry -- the caller's ids, group-major, from one
+        # ``BlockPool.get_new_blocks`` call covering every (layer, head-group)
+        # pair. ``target_depth`` is the per-group depth compression left, and
+        # only that single table can honour it.
+        if target_depth is not None:
+            self.block_tables[0].append_row(block_ids[0], row_idx, target_depth)
+            return
         for i, block_table in enumerate(self.block_tables):
             block_table.append_row(block_ids[i], row_idx)
 
