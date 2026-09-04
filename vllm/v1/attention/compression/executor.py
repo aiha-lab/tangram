@@ -14,7 +14,6 @@ from dataclasses import dataclass
 import numpy as np
 import torch
 
-from vllm.v1.attention.backends.ragged_layout import cluster_pages_token_major
 from vllm.v1.attention.compression.compressor import KVCompressor
 from vllm.v1.worker.block_table import BlockTable
 
@@ -262,11 +261,10 @@ class CompressionExecutor:
     ) -> torch.Tensor:
         """Evict one (layer, group): gather the kept KV positions, write back.
 
-        The column-major page is viewed token-major -- a free permute -- so the
-        kept positions gather directly and the full slab is never materialised,
-        which a ``.reshape`` of the permuted tensor would force at
-        O(total_seen). The result is written back block-aligned into the same
-        blocks, trailing partial block zero-padded.
+        The gather indexes the pages directly, so it costs O(kept) and never
+        builds the cluster's KV as one slab -- an intermediate that would cost
+        O(total_seen) however little survives. The result is written back
+        block-aligned into the same blocks, trailing partial block zero-padded.
 
         The kept positions form a ``[page_group_size, kept_length]`` matrix in
         which every column keeps the SAME sink / locked / tail and only the
@@ -279,9 +277,6 @@ class CompressionExecutor:
         block_size = self.block_size
         head_size = self.head_size
         sink_size = int(sink_idx.numel())
-
-        # Token t then lives at block t // block_size, offset t % block_size.
-        slab_view = cluster_pages_token_major(kv_cache, block_ids)
 
         col_parts: list[torch.Tensor] = []
         if sink_size > 0:
@@ -310,9 +305,14 @@ class CompressionExecutor:
         col_ix = torch.arange(
             page_group_size, device=device, dtype=torch.long
         ).unsqueeze(1).expand_as(keep_mat)
-        # (block, offset, column) -> [2, page_group_size, kept, head_size].
-        kept_kv = slab_view[
-            :, keep_block, keep_offset, col_ix
+        # Straight from the pages: ``block_ids[keep_block]`` picks the page,
+        # ``col_ix`` the column, ``keep_offset`` the token within the block.
+        # Going through a token-major view of the cluster instead would read
+        # every page it holds, kept or not -- that view is an advanced index,
+        # so it copies -- and this reads only what survives.
+        # -> [2, page_group_size, kept, head_size].
+        kept_kv = kv_cache[
+            :, block_ids[keep_block], col_ix, keep_offset
         ].permute(0, 2, 1, 3).contiguous()
 
         # Write back block-aligned; zero-pad the trailing partial block.
