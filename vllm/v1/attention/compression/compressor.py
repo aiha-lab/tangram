@@ -585,11 +585,13 @@ class KVCompressor:
             )
         return kept_lengths
 
-    def follows_kept_positions(self, req_id: str) -> bool:
-        """Whether ``compact_cluster_stats`` will read the kept positions for
-        this request, so the executor can skip building them otherwise."""
+    def compaction_target(self, req_id: str):
+        """The request's per-slot score memory the KV write-back must compact
+        in step with the KV, or ``None`` when its regime keeps none."""
         req = self.req_state.get(req_id)
-        return req is not None and req.score_store.follows_positions
+        if req is None:
+            return None
+        return req.score_store.compaction_target()
 
     def compact_cluster_stats(
         self,

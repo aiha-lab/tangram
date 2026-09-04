@@ -127,6 +127,11 @@ class RegimeScoreStore(ABC):
     #: not, the executor need not materialise them.
     follows_positions: bool = False
 
+    def compaction_target(self) -> "SlotCompactionTarget | None":
+        """The score memory the write-back must compact alongside the KV, or
+        ``None`` when nothing here outlives the eviction."""
+        return None
+
     @abstractmethod
     def compact_cluster(
         self,
@@ -325,6 +330,16 @@ class _SlotScoreStore(RegimeScoreStore):
         # Only a score that will be read again must follow the KV; a
         # recomputing source rebuilds every live slot next eviction anyway.
         return self.source.slots_persist_across_steps
+
+    def compaction_target(self) -> "SlotCompactionTarget | None":
+        if not self.follows_positions:
+            return None
+        from vllm.v1.attention.compression.eviction_writeback import (
+            SlotCompactionTarget)
+        return SlotCompactionTarget(
+            flat=self._flat,
+            cluster_members_cpu=self._cluster_members_cpu,
+            neg_inf=self.neg_inf)
 
     def compact_cluster(
         self,

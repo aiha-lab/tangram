@@ -8,10 +8,16 @@ one :class:`EvictionPlan`:
 * :class:`TorchWriteback` -- the reference. One cluster at a time, plain
   torch indexing, runs anywhere. This is the behaviour every other backend
   must reproduce bit for bit.
-* :class:`TritonWriteback` -- four launches for the whole boundary, however
-  many clusters it has. A sort kernel orders each column's top-k positions in
-  place, then three write-back kernels compact the kept KV inside its own
-  pages, with no temporary copy of the KV.
+* :class:`TritonWriteback` -- a handful of launches for the whole boundary,
+  however many clusters it has. A sort kernel orders each column's top-k
+  positions in place, then three write-back kernels compact the kept KV
+  inside its own pages, with no temporary copy of the KV.
+
+When the regime keeps a per-slot score for every live position (the budget
+regime), that score memory must follow the same positions, so both backends
+also compact a :class:`SlotCompactionTarget` when given one. The Triton
+backend reuses the write-back kernels for it: a slot buffer is a "cache"
+whose pages are the identity and whose head size is one.
 
 Why the in-place kernels are safe. Within one column the kept positions are
 strictly increasing, so the j-th kept position is >= j: a destination slot
@@ -19,7 +25,7 @@ never lies past its source. Every destination is below ``kept``, so a source
 at or past ``kept`` can never be overwritten -- those are moved by a fully
 parallel kernel. The sources below ``kept`` are the ENDANGERED ones; because
 the positions ascend they feed a prefix of the destination, and one program
-per (cluster, column, K|V) walks that prefix in ascending tiles, reading a
+per (cluster, column, plane) walks that prefix in ascending tiles, reading a
 whole tile before writing it: later tiles' sources are >= the tile's end. The
 prefix goes first, the parallel remainder second, and the zero padding of the
 last block last, since a padded slot may itself be a source. Programs never
@@ -37,6 +43,7 @@ import numpy as np
 import torch
 
 from vllm.triton_utils import tl, triton
+from vllm.v1.attention.compression.slot_scores import cluster_member_rows
 
 
 class PlanCol(IntEnum):
@@ -75,10 +82,19 @@ class EvictionPlan:
         return int(self.table.shape[0])
 
 
-class PositionReport(IntEnum):
-    """Whether ``run`` returns each cluster's kept positions."""
-    SKIP = 0
-    RETURN = 1
+@dataclass(frozen=True)
+class SlotCompactionTarget:
+    """Per-slot score memory that must follow the kept positions.
+
+    ``flat[member_row, slot]`` holds the score of whatever that member's slot
+    currently holds; the executor's cluster ``c``, column ``col`` is member
+    row ``cluster_members_cpu[c, col]`` (``-1`` when the column is unfilled).
+    Slots from ``kept`` on are blanked to ``neg_inf`` so an evicted score is
+    never read again.
+    """
+    flat: torch.Tensor
+    cluster_members_cpu: np.ndarray
+    neg_inf: float
 
 
 def gather_and_writeback_kept_kv(
@@ -156,6 +172,30 @@ def gather_and_writeback_kept_kv(
     return keep_mat
 
 
+def compact_slot_scores(
+    target: SlotCompactionTarget,
+    cluster_id: int,
+    keep_positions: torch.Tensor,
+    kept_length: int,
+) -> None:
+    """Follow one cluster's eviction in its score memory: the reference.
+
+    ``keep_positions`` is the ``[page_group_size, kept_length]`` matrix the KV
+    write-back used, so a score lands in the same slot as its KV. A cluster
+    with no members is skipped; a partly filled one is an invalid map.
+    """
+    rows = cluster_member_rows(
+        target.cluster_members_cpu, cluster_id, caller="compact_cluster")
+    if rows is None:
+        return
+    flat = target.flat
+    # Not in place: a permuted gather would read what it overwrote.
+    flat[rows, :kept_length] = flat[rows].gather(1, keep_positions)
+    # An evicted token's score must not be readable by a later chunk.
+    if kept_length < flat.shape[1]:
+        flat[rows, kept_length:] = target.neg_inf
+
+
 class KeptKVWriteback:
     """Interface both backends implement."""
 
@@ -165,40 +205,37 @@ class KeptKVWriteback:
         layer_kv_caches: list[torch.Tensor],
         block_table_gpu: torch.Tensor,
         sorted_idx: torch.Tensor,
-        report: PositionReport,
-    ) -> list[torch.Tensor] | None:
-        """Apply ``plan`` to the caches.
+        scores: SlotCompactionTarget | None,
+    ) -> None:
+        """Apply ``plan`` to the caches, and to ``scores`` when given.
 
         ``sorted_idx`` is ``[num_clusters_total, page_group_size, width]``
         with each cluster's top-k positions first, in score order; a backend
-        may reorder those first ``K_ALIGNED`` entries. With
-        ``PositionReport.RETURN`` the result holds, per plan row, the
-        ``[page_group_size, KEPT]`` int64 source positions the write-back
-        used, in slot order.
+        may reorder those first ``K_ALIGNED`` entries.
         """
         raise NotImplementedError
 
 
 class TorchWriteback(KeptKVWriteback):
     """Reference: one cluster at a time through
-    :func:`gather_and_writeback_kept_kv`."""
+    :func:`gather_and_writeback_kept_kv` and :func:`compact_slot_scores`."""
 
     def __init__(self, block_size: int) -> None:
         self.block_size = block_size
 
-    def run(self, plan, layer_kv_caches, block_table_gpu, sorted_idx, report):
+    def run(self, plan, layer_kv_caches, block_table_gpu, sorted_idx, scores):
         block_size = self.block_size
         device = layer_kv_caches[0].device
         sink_idx = torch.arange(plan.sink_size, device=device, dtype=torch.long)
         tail_idx = torch.arange(plan.tail_size, device=device, dtype=torch.long)
         bt_flat = block_table_gpu.reshape(-1)
-        positions: list[torch.Tensor] = []
 
         for row in plan.table:
             kept = int(row[PlanCol.KEPT])
             kept_lo = int(row[PlanCol.KEPT_LO])
             k_aligned = int(row[PlanCol.K_ALIGNED])
             tail_lo = int(row[PlanCol.TAIL_LO])
+            cluster = int(row[PlanCol.CLUSTER])
             total_seen = tail_lo + plan.tail_size
             n_blocks = (total_seen + block_size - 1) // block_size
             bt_offset = int(row[PlanCol.BT_OFFSET])
@@ -213,16 +250,13 @@ class TorchWriteback(KeptKVWriteback):
                 k_aligned=k_aligned,
                 kept_lo=kept_lo,
                 sorted_idx_group=(
-                    sorted_idx[int(row[PlanCol.CLUSTER])]
-                    if k_aligned > 0 else None),
+                    sorted_idx[cluster] if k_aligned > 0 else None),
                 tail_idx=tail_idx,
                 tail_lo=tail_lo,
                 kept_length=kept,
             )
-            if report == PositionReport.RETURN:
-                positions.append(keep_mat)
-
-        return positions if report == PositionReport.RETURN else None
+            if scores is not None:
+                compact_slot_scores(scores, cluster, keep_mat, kept)
 
 
 # --- Triton -----------------------------------------------------------------
@@ -237,6 +271,11 @@ _TOKEN_TILE = 32
 _HEAD_TILE = 128
 #: Warps per program of the write-back kernels.
 _NUM_WARPS = 1
+#: The score buffer has one value per slot; wider token tiles pay for that.
+_SCORE_PREFIX_TOKEN_TILE = 32
+_SCORE_TOKEN_TILE = 256
+#: int64 elements per 16-byte alignment unit.
+_ALIGN_INT64 = 2
 
 
 # ``eval_len`` and ``num_tiles`` change from boundary to boundary; specialising
@@ -310,27 +349,38 @@ def _sort_kept_positions_kernel(
 
 @triton.jit
 def _cluster_column(
-    plan_ptr, kv_ptrs, kv_dtype_ptr, sorted_ptr, bt_ptr, endangered_ptr,
-    width, stride_col, num_tiles,
+    plan_ptr, plane_ptrs, dtype_ptr, sorted_ptr, bt_ptr, endangered_ptr,
+    width, num_tiles,
     PAGE_GROUP_SIZE: tl.constexpr, NUM_COLS: tl.constexpr,
-    LAYER_COL: tl.constexpr, BT_OFFSET_COL: tl.constexpr,
-    CLUSTER_COL: tl.constexpr, KEPT_LO_COL: tl.constexpr,
-    K_ALIGNED_COL: tl.constexpr, TAIL_LO_COL: tl.constexpr,
-    KEPT_COL: tl.constexpr, HEAD_SPLITS: tl.constexpr,
+    BT_OFFSET_COL: tl.constexpr, CLUSTER_COL: tl.constexpr,
+    KEPT_LO_COL: tl.constexpr, K_ALIGNED_COL: tl.constexpr,
+    TAIL_LO_COL: tl.constexpr, KEPT_COL: tl.constexpr,
+    NUM_PLANES: tl.constexpr, HEAD_SPLITS: tl.constexpr,
+    USE_BT_OFFSET: tl.constexpr,
 ):
-    """Resolve this program's (cluster, column, K|V, head slice, tile) from
+    """Resolve this program's (cluster, column, plane, head slice, tile) from
     the grid and the plan. Shared by the three write-back kernels; a grid has
-    three axes, so K|V, head slice and tile share the last one."""
+    three axes, so plane, head slice and tile share the last one.
+
+    ``plane_ptrs[(row * PAGE_GROUP_SIZE + col) * NUM_PLANES + plane]`` is the
+    address of slot 0 of that column's plane: K or V of a KV cache, or a
+    member's row of a score buffer. Handing over addresses rather than a base
+    and strides keeps every integer argument narrow and constant, so the
+    warm-up compiles the variant the real caches will use.
+    """
     row = tl.program_id(0)
     col = tl.program_id(1)
-    kv_and_split = tl.program_id(2) // num_tiles
+    plane_and_split = tl.program_id(2) // num_tiles
     tile = tl.program_id(2) % num_tiles
-    which_kv = kv_and_split // HEAD_SPLITS
-    head_split = kv_and_split % HEAD_SPLITS
+    plane = plane_and_split // HEAD_SPLITS
+    head_split = plane_and_split % HEAD_SPLITS
 
     plan = plan_ptr + row * NUM_COLS
-    layer = tl.load(plan + LAYER_COL)
-    bt = bt_ptr + tl.load(plan + BT_OFFSET_COL)
+    # A score buffer's page table is the identity, shared by every row.
+    if USE_BT_OFFSET:
+        bt = bt_ptr + tl.load(plan + BT_OFFSET_COL)
+    else:
+        bt = bt_ptr
     cluster = tl.load(plan + CLUSTER_COL)
     kept_lo = tl.load(plan + KEPT_LO_COL)
     k_aligned = tl.load(plan + K_ALIGNED_COL)
@@ -338,21 +388,18 @@ def _cluster_column(
     kept = tl.load(plan + KEPT_COL)
     endangered = tl.load(endangered_ptr + row * PAGE_GROUP_SIZE + col)
 
-    # One pointer per (layer, K|V) plane: the plane stride of a large pool
-    # exceeds 32 bits, and an integer argument that changes width between the
-    # warm-up and the real cache would compile a second variant.
-    kv = tl.load(kv_ptrs + layer * 2 + which_kv).to(
-        tl.pointer_type(kv_dtype_ptr.dtype.element_ty))
-    kv = kv + col * stride_col
+    base = tl.load(
+        plane_ptrs + (row * PAGE_GROUP_SIZE + col) * NUM_PLANES + plane
+    ).to(tl.pointer_type(dtype_ptr.dtype.element_ty))
     mid = sorted_ptr + (cluster * PAGE_GROUP_SIZE + col) * width
-    return (kv, bt, mid, kept_lo, k_aligned, tail_lo, kept, endangered,
+    return (base, bt, mid, kept_lo, k_aligned, tail_lo, kept, endangered,
             head_split, tile)
 
 
 @triton.jit
-def _load_tile(kv, bt, mid, kept_lo, mid_end, k_aligned, tail_lo, kept,
+def _load_tile(base, bt, mid, kept_lo, mid_end, k_aligned, tail_lo, kept,
                j, h, h_ok, stride_block, stride_tok, BLOCK_SIZE: tl.constexpr):
-    """The KV that destination slots ``j`` receive; zeros past ``kept``."""
+    """The values that destination slots ``j`` receive; zeros past ``kept``."""
     live = j < kept
     in_mid = j < mid_end
     mid_i = tl.minimum(j - kept_lo, k_aligned - 1)
@@ -361,41 +408,40 @@ def _load_tile(kv, bt, mid, kept_lo, mid_end, k_aligned, tail_lo, kept,
     src_page = tl.load(bt + src // BLOCK_SIZE, mask=live, other=0)
     src_off = (src_page.to(tl.int64) * stride_block
                + (src % BLOCK_SIZE) * stride_tok)
-    return tl.load(kv + src_off[:, None] + h[None, :],
+    return tl.load(base + src_off[:, None] + h[None, :],
                    mask=live[:, None] & h_ok[None, :], other=0)
 
 
 @triton.jit
-def _store_tile(kv, bt, vals, j, j_ok, h, h_ok, stride_block, stride_tok,
+def _store_tile(base, bt, vals, j, j_ok, h, h_ok, stride_block, stride_tok,
                 BLOCK_SIZE: tl.constexpr):
     page = tl.load(bt + j // BLOCK_SIZE, mask=j_ok, other=0)
     off = page.to(tl.int64) * stride_block + (j % BLOCK_SIZE) * stride_tok
-    tl.store(kv + off[:, None] + h[None, :], vals,
+    tl.store(base + off[:, None] + h[None, :], vals,
              mask=j_ok[:, None] & h_ok[None, :])
 
 
 @triton.jit(do_not_specialize=["num_tiles"])
 def _writeback_prefix_kernel(
-    plan_ptr, kv_ptrs, kv_dtype_ptr, sorted_ptr, bt_ptr, endangered_ptr,
-    width, head_size, stride_block, stride_col, stride_tok, num_tiles,
+    plan_ptr, plane_ptrs, dtype_ptr, sorted_ptr, bt_ptr, endangered_ptr,
+    width, head_size, stride_block, stride_tok, num_tiles,
     PAGE_GROUP_SIZE: tl.constexpr, BLOCK_SIZE: tl.constexpr,
-    NUM_COLS: tl.constexpr, LAYER_COL: tl.constexpr,
-    BT_OFFSET_COL: tl.constexpr, CLUSTER_COL: tl.constexpr,
-    KEPT_LO_COL: tl.constexpr, K_ALIGNED_COL: tl.constexpr,
-    TAIL_LO_COL: tl.constexpr, KEPT_COL: tl.constexpr,
-    HEAD_SPLITS: tl.constexpr, TOKEN_TILE: tl.constexpr,
-    HEAD_TILE: tl.constexpr,
+    NUM_COLS: tl.constexpr, BT_OFFSET_COL: tl.constexpr,
+    CLUSTER_COL: tl.constexpr, KEPT_LO_COL: tl.constexpr,
+    K_ALIGNED_COL: tl.constexpr, TAIL_LO_COL: tl.constexpr,
+    KEPT_COL: tl.constexpr, NUM_PLANES: tl.constexpr,
+    HEAD_SPLITS: tl.constexpr, USE_BT_OFFSET: tl.constexpr,
+    TOKEN_TILE: tl.constexpr, HEAD_TILE: tl.constexpr,
 ):
     """Move the endangered prefix ``[kept_lo, kept_lo + endangered)`` of one
-    (cluster, column, K|V, head slice), one ascending tile at a time. Runs
+    (cluster, column, plane, head slice), one ascending tile at a time. Runs
     first and alone; see the module docstring."""
-    (kv, bt, mid, kept_lo, k_aligned, tail_lo, kept, endangered,
+    (base, bt, mid, kept_lo, k_aligned, tail_lo, kept, endangered,
      head_split, tile) = _cluster_column(
-        plan_ptr, kv_ptrs, kv_dtype_ptr, sorted_ptr, bt_ptr, endangered_ptr,
-        width, stride_col, num_tiles,
-        PAGE_GROUP_SIZE, NUM_COLS, LAYER_COL,
-        BT_OFFSET_COL, CLUSTER_COL, KEPT_LO_COL, K_ALIGNED_COL, TAIL_LO_COL,
-        KEPT_COL, HEAD_SPLITS)
+        plan_ptr, plane_ptrs, dtype_ptr, sorted_ptr, bt_ptr, endangered_ptr,
+        width, num_tiles, PAGE_GROUP_SIZE, NUM_COLS, BT_OFFSET_COL,
+        CLUSTER_COL, KEPT_LO_COL, K_ALIGNED_COL, TAIL_LO_COL, KEPT_COL,
+        NUM_PLANES, HEAD_SPLITS, USE_BT_OFFSET)
     mid_end = kept_lo + k_aligned
     h = head_split * HEAD_TILE + tl.arange(0, HEAD_TILE)
     h_ok = h < head_size
@@ -407,34 +453,33 @@ def _writeback_prefix_kernel(
         # The last tile may reach past the prefix; those slots belong to the
         # parallel kernel, so they are loaded (harmless) but not stored.
         j_ok = j < prefix_end
-        vals = _load_tile(kv, bt, mid, kept_lo, mid_end, k_aligned, tail_lo,
+        vals = _load_tile(base, bt, mid, kept_lo, mid_end, k_aligned, tail_lo,
                           kept, j, h, h_ok, stride_block, stride_tok,
                           BLOCK_SIZE)
-        _store_tile(kv, bt, vals, j, j_ok, h, h_ok, stride_block, stride_tok,
+        _store_tile(base, bt, vals, j, j_ok, h, h_ok, stride_block, stride_tok,
                     BLOCK_SIZE)
 
 
 @triton.jit(do_not_specialize=["num_tiles"])
 def _writeback_parallel_kernel(
-    plan_ptr, kv_ptrs, kv_dtype_ptr, sorted_ptr, bt_ptr, endangered_ptr,
-    width, head_size, stride_block, stride_col, stride_tok, num_tiles,
+    plan_ptr, plane_ptrs, dtype_ptr, sorted_ptr, bt_ptr, endangered_ptr,
+    width, head_size, stride_block, stride_tok, num_tiles,
     PAGE_GROUP_SIZE: tl.constexpr, BLOCK_SIZE: tl.constexpr,
-    NUM_COLS: tl.constexpr, LAYER_COL: tl.constexpr,
-    BT_OFFSET_COL: tl.constexpr, CLUSTER_COL: tl.constexpr,
-    KEPT_LO_COL: tl.constexpr, K_ALIGNED_COL: tl.constexpr,
-    TAIL_LO_COL: tl.constexpr, KEPT_COL: tl.constexpr,
-    HEAD_SPLITS: tl.constexpr, TOKEN_TILE: tl.constexpr,
-    HEAD_TILE: tl.constexpr,
+    NUM_COLS: tl.constexpr, BT_OFFSET_COL: tl.constexpr,
+    CLUSTER_COL: tl.constexpr, KEPT_LO_COL: tl.constexpr,
+    K_ALIGNED_COL: tl.constexpr, TAIL_LO_COL: tl.constexpr,
+    KEPT_COL: tl.constexpr, NUM_PLANES: tl.constexpr,
+    HEAD_SPLITS: tl.constexpr, USE_BT_OFFSET: tl.constexpr,
+    TOKEN_TILE: tl.constexpr, HEAD_TILE: tl.constexpr,
 ):
     """Move one tile of the remainder ``[kept_lo + endangered, kept)``: its
     sources are all at or past ``kept``, which no destination touches."""
-    (kv, bt, mid, kept_lo, k_aligned, tail_lo, kept, endangered,
+    (base, bt, mid, kept_lo, k_aligned, tail_lo, kept, endangered,
      head_split, tile) = _cluster_column(
-        plan_ptr, kv_ptrs, kv_dtype_ptr, sorted_ptr, bt_ptr, endangered_ptr,
-        width, stride_col, num_tiles,
-        PAGE_GROUP_SIZE, NUM_COLS, LAYER_COL,
-        BT_OFFSET_COL, CLUSTER_COL, KEPT_LO_COL, K_ALIGNED_COL, TAIL_LO_COL,
-        KEPT_COL, HEAD_SPLITS)
+        plan_ptr, plane_ptrs, dtype_ptr, sorted_ptr, bt_ptr, endangered_ptr,
+        width, num_tiles, PAGE_GROUP_SIZE, NUM_COLS, BT_OFFSET_COL,
+        CLUSTER_COL, KEPT_LO_COL, K_ALIGNED_COL, TAIL_LO_COL, KEPT_COL,
+        NUM_PLANES, HEAD_SPLITS, USE_BT_OFFSET)
     j0 = kept_lo + endangered + tile * TOKEN_TILE
     if j0 >= kept:
         return
@@ -443,43 +488,39 @@ def _writeback_parallel_kernel(
     h_ok = h < head_size
     j = j0 + tl.arange(0, TOKEN_TILE)
     j_ok = j < kept
-    vals = _load_tile(kv, bt, mid, kept_lo, mid_end, k_aligned, tail_lo, kept,
-                      j, h, h_ok, stride_block, stride_tok, BLOCK_SIZE)
-    _store_tile(kv, bt, vals, j, j_ok, h, h_ok, stride_block, stride_tok,
+    vals = _load_tile(base, bt, mid, kept_lo, mid_end, k_aligned, tail_lo,
+                      kept, j, h, h_ok, stride_block, stride_tok, BLOCK_SIZE)
+    _store_tile(base, bt, vals, j, j_ok, h, h_ok, stride_block, stride_tok,
                 BLOCK_SIZE)
 
 
 @triton.jit(do_not_specialize=["num_tiles"])
 def _writeback_pad_kernel(
-    plan_ptr, kv_ptrs, kv_dtype_ptr, sorted_ptr, bt_ptr, endangered_ptr,
-    width, head_size, stride_block, stride_col, stride_tok, num_tiles,
+    plan_ptr, plane_ptrs, dtype_ptr, sorted_ptr, bt_ptr, endangered_ptr,
+    width, head_size, stride_block, stride_tok, num_tiles,
     PAGE_GROUP_SIZE: tl.constexpr, BLOCK_SIZE: tl.constexpr,
-    NUM_COLS: tl.constexpr, LAYER_COL: tl.constexpr,
-    BT_OFFSET_COL: tl.constexpr, CLUSTER_COL: tl.constexpr,
-    KEPT_LO_COL: tl.constexpr, K_ALIGNED_COL: tl.constexpr,
-    TAIL_LO_COL: tl.constexpr, KEPT_COL: tl.constexpr,
-    HEAD_SPLITS: tl.constexpr, HEAD_TILE: tl.constexpr,
+    NUM_COLS: tl.constexpr, BT_OFFSET_COL: tl.constexpr,
+    CLUSTER_COL: tl.constexpr, KEPT_LO_COL: tl.constexpr,
+    K_ALIGNED_COL: tl.constexpr, TAIL_LO_COL: tl.constexpr,
+    KEPT_COL: tl.constexpr, NUM_PLANES: tl.constexpr,
+    HEAD_SPLITS: tl.constexpr, USE_BT_OFFSET: tl.constexpr,
+    HEAD_TILE: tl.constexpr,
 ):
     """Zero ``[kept, next block boundary)`` once every source has been read."""
-    (kv, bt, mid, kept_lo, k_aligned, tail_lo, kept, endangered,
+    (base, bt, mid, kept_lo, k_aligned, tail_lo, kept, endangered,
      head_split, tile) = _cluster_column(
-        plan_ptr, kv_ptrs, kv_dtype_ptr, sorted_ptr, bt_ptr, endangered_ptr,
-        width, stride_col, num_tiles,
-        PAGE_GROUP_SIZE, NUM_COLS, LAYER_COL,
-        BT_OFFSET_COL, CLUSTER_COL, KEPT_LO_COL, K_ALIGNED_COL, TAIL_LO_COL,
-        KEPT_COL, HEAD_SPLITS)
+        plan_ptr, plane_ptrs, dtype_ptr, sorted_ptr, bt_ptr, endangered_ptr,
+        width, num_tiles, PAGE_GROUP_SIZE, NUM_COLS, BT_OFFSET_COL,
+        CLUSTER_COL, KEPT_LO_COL, K_ALIGNED_COL, TAIL_LO_COL, KEPT_COL,
+        NUM_PLANES, HEAD_SPLITS, USE_BT_OFFSET)
     end = ((kept + BLOCK_SIZE - 1) // BLOCK_SIZE) * BLOCK_SIZE
     h = head_split * HEAD_TILE + tl.arange(0, HEAD_TILE)
     h_ok = h < head_size
     j = kept + tl.arange(0, BLOCK_SIZE)
     j_ok = j < end
-    zeros = tl.zeros([BLOCK_SIZE, HEAD_TILE], dtype=kv.dtype.element_ty)
-    _store_tile(kv, bt, zeros, j, j_ok, h, h_ok, stride_block, stride_tok,
+    zeros = tl.zeros([BLOCK_SIZE, HEAD_TILE], dtype=base.dtype.element_ty)
+    _store_tile(base, bt, zeros, j, j_ok, h, h_ok, stride_block, stride_tok,
                 BLOCK_SIZE)
-
-
-#: int64 elements per 16-byte alignment unit.
-_ALIGN_INT64 = 2
 
 
 def _round_up(n: int, unit: int) -> int:
@@ -490,13 +531,34 @@ def _next_pow2(n: int) -> int:
     return 1 << (n - 1).bit_length()
 
 
+@dataclass(frozen=True)
+class _Planes:
+    """One buffer family the write-back kernels address: where each
+    (cluster, column, plane) starts and how a slot maps to an element."""
+    #: ``[n, page_group_size, num_planes]`` int64 device addresses.
+    ptrs: np.ndarray
+    #: Any tensor of the family, for its element dtype.
+    dtype_of: torch.Tensor
+    #: Page lookup: ``page = block_table[bt_offset + slot // block_size]``.
+    block_table: torch.Tensor
+    head_size: int
+    stride_block: int
+    stride_tok: int
+    prefix_token_tile: int
+    token_tile: int
+    #: Whether ``block_table`` is indexed from the plan's ``BT_OFFSET`` (a KV
+    #: cache) or from zero for every row (a score buffer's identity table).
+    use_bt_offset: bool
+
+
 class TritonWriteback(KeptKVWriteback):
-    """Whole-boundary write-back in four launches: sort, endangered prefix,
-    parallel remainder, zero padding.
+    """Whole-boundary write-back in a handful of launches: one sort, then
+    prefix / parallel / pad for the KV and, when a score buffer follows the
+    positions, prefix / parallel plus one blanking fill for it.
 
     ``keep_mask`` is scratch for the sort: ``[num_clusters_total,
     page_group_size, width]`` uint8 matching ``sorted_idx``, allocated once by
-    the caller. A boundary allocates only its few-KB plan table.
+    the caller. A boundary allocates only its few-KB plan tables.
     """
 
     def __init__(
@@ -514,51 +576,42 @@ class TritonWriteback(KeptKVWriteback):
         self.token_tile = _TOKEN_TILE
         self.num_warps = _NUM_WARPS
         self.head_tile = min(_next_pow2(head_size), _HEAD_TILE)
-        self.head_splits = (head_size + self.head_tile - 1) // self.head_tile
+        # A score buffer is addressed as pages of ``block_size`` slots whose
+        # page ids are their own index. Built once per capacity.
+        self._identity_pages: torch.Tensor | None = None
 
-    def run(self, plan, layer_kv_caches, block_table_gpu, sorted_idx, report):
+    def run(self, plan, layer_kv_caches, block_table_gpu, sorted_idx, scores):
         if plan.num_clusters == 0:
-            return [] if report == PositionReport.RETURN else None
+            return
         device = layer_kv_caches[0].device
-        kv0 = layer_kv_caches[0]
         assert sorted_idx.dim() == 3 and sorted_idx.is_contiguous()
         assert self.keep_mask.shape == sorted_idx.shape
-        width = sorted_idx.shape[-1]
         n = plan.num_clusters
         pg = self.page_group_size
         cols = plan.table
 
+        kv = self._kv_planes(plan, layer_kv_caches, block_table_gpu)
+        score_planes = (self._score_planes(plan, scores)
+                        if scores is not None else None)
+
         # Endangered sources start as the tail's share -- the tail positions
         # below ``kept`` -- uniform over columns; the sort adds each column's
-        # selected positions below ``kept``. One transfer carries both tables.
+        # selected positions below ``kept``.
         tail_below_kept = np.clip(
             cols[:, PlanCol.KEPT] - cols[:, PlanCol.TAIL_LO], 0,
             plan.tail_size)
-        # Segments are padded to 16 bytes: Triton compiles a separate variant
-        # per pointer alignment, and one warm-up must cover every boundary.
-        plane_bytes = kv0.stride(0) * kv0.element_size()
-        segments = [
-            cols.reshape(-1),
-            np.repeat(tail_below_kept, pg),
-            np.array([kv.data_ptr() + which * plane_bytes
-                      for kv in layer_kv_caches for which in (0, 1)],
-                     dtype=np.int64),
-        ]
-        starts = []
-        offset = 0
-        for seg in segments:
-            starts.append(offset)
-            offset += _round_up(seg.size, _ALIGN_INT64)
-        host = np.zeros(offset, dtype=np.int64)
-        for seg, start in zip(segments, starts):
-            host[start:start + seg.size] = seg
-        dev = torch.from_numpy(host).to(device, non_blocking=True)
+        segments = [cols.reshape(-1), np.repeat(tail_below_kept, pg),
+                    kv.ptrs.reshape(-1)]
+        if score_planes is not None:
+            segments.append(score_planes.ptrs.reshape(-1))
+        dev, starts = self._upload(segments, device)
         table = dev[starts[0]:starts[0] + n * NUM_PLAN_COLS].view(
             n, NUM_PLAN_COLS)
         endangered = dev[starts[1]:starts[1] + n * pg]
-        kv_ptrs = dev[starts[2]:starts[2] + 2 * len(layer_kv_caches)]
+        kv_ptrs = dev[starts[2]:starts[2] + kv.ptrs.size]
 
         if plan.eval_len > 0:
+            width = sorted_idx.shape[-1]
             _sort_kept_positions_kernel[(n, pg)](
                 table, sorted_idx, self.keep_mask, endangered, width,
                 plan.eval_len,
@@ -569,72 +622,157 @@ class TritonWriteback(KeptKVWriteback):
                 BLOCK=_SORT_BLOCK,
             )
 
+        self._move(plan, kv, kv_ptrs, table, endangered, sorted_idx, pad=True)
+        if score_planes is None:
+            return
+        score_ptrs = dev[starts[3]:starts[3] + score_planes.ptrs.size]
+        self._move(plan, score_planes, score_ptrs, table, endangered,
+                   sorted_idx, pad=False)
+        self._blank_evicted_scores(plan, scores)
+
+    @staticmethod
+    def _upload(
+        segments: list[np.ndarray], device: torch.device,
+    ) -> tuple[torch.Tensor, list[int]]:
+        """One transfer for every int64 table of the boundary. Segments are
+        padded to 16 bytes: Triton compiles a separate variant per pointer
+        alignment, and one warm-up must cover every boundary."""
+        starts = []
+        offset = 0
+        for seg in segments:
+            starts.append(offset)
+            offset += _round_up(seg.size, _ALIGN_INT64)
+        host = np.zeros(offset, dtype=np.int64)
+        for seg, start in zip(segments, starts):
+            host[start:start + seg.size] = seg
+        return torch.from_numpy(host).to(device, non_blocking=True), starts
+
+    def _kv_planes(
+        self,
+        plan: EvictionPlan,
+        layer_kv_caches: list[torch.Tensor],
+        block_table_gpu: torch.Tensor,
+    ) -> _Planes:
+        kv0 = layer_kv_caches[0]
+        elem = kv0.element_size()
+        layer_base = np.array([kv.data_ptr() for kv in layer_kv_caches],
+                              dtype=np.int64)
+        col = np.arange(self.page_group_size, dtype=np.int64)
+        plane = np.arange(2, dtype=np.int64)
+        ptrs = (layer_base[plan.table[:, PlanCol.LAYER]][:, None, None]
+                + col[None, :, None] * (kv0.stride(2) * elem)
+                + plane[None, None, :] * (kv0.stride(0) * elem))
+        return _Planes(
+            ptrs=ptrs, dtype_of=kv0, block_table=block_table_gpu,
+            head_size=self.head_size, stride_block=kv0.stride(1),
+            stride_tok=kv0.stride(3), prefix_token_tile=self.prefix_token_tile,
+            token_tile=self.token_tile, use_bt_offset=True)
+
+    def _score_planes(
+        self, plan: EvictionPlan, scores: SlotCompactionTarget,
+    ) -> _Planes:
+        """The score rows of every planned cluster, as one plane per column.
+
+        A cluster the map left empty has no rows; the reference skips it, and
+        the executor never plans one with nothing kept, so here it is an
+        error, as is a partly filled one.
+        """
+        flat = scores.flat
+        capacity = flat.shape[1]
+        for cluster in plan.table[:, PlanCol.CLUSTER]:
+            rows = cluster_member_rows(scores.cluster_members_cpu,
+                                       int(cluster), caller="compact_cluster")
+            if rows is None:
+                raise RuntimeError(
+                    f"compact_cluster: cluster {cluster} is planned for "
+                    "eviction but holds no members.")
+        members = scores.cluster_members_cpu[
+            plan.table[:, PlanCol.CLUSTER]].astype(np.int64)
+        ptrs = (flat.data_ptr()
+                + members * (flat.stride(0) * flat.element_size()))[:, :, None]
+        pages_needed = (capacity + self.block_size - 1) // self.block_size
+        if (self._identity_pages is None
+                or self._identity_pages.numel() < pages_needed
+                or self._identity_pages.device != flat.device):
+            self._identity_pages = torch.arange(
+                pages_needed, dtype=torch.int32, device=flat.device)
+        return _Planes(
+            ptrs=ptrs, dtype_of=flat, block_table=self._identity_pages,
+            head_size=1, stride_block=self.block_size, stride_tok=1,
+            prefix_token_tile=_SCORE_PREFIX_TOKEN_TILE,
+            token_tile=_SCORE_TOKEN_TILE, use_bt_offset=False)
+
+    def _move(
+        self,
+        plan: EvictionPlan,
+        planes: _Planes,
+        plane_ptrs: torch.Tensor,
+        table: torch.Tensor,
+        endangered: torch.Tensor,
+        sorted_idx: torch.Tensor,
+        *,
+        pad: bool,
+    ) -> None:
+        """Prefix, parallel and (for the KV) pad launches over one family."""
+        n = plan.num_clusters
+        pg = self.page_group_size
+        head_tile = min(_next_pow2(planes.head_size), self.head_tile)
+        head_splits = (planes.head_size + head_tile - 1) // head_tile
+        num_planes = planes.ptrs.shape[2]
+        cols = plan.table
         common = dict(
             PAGE_GROUP_SIZE=pg, BLOCK_SIZE=self.block_size,
             NUM_COLS=NUM_PLAN_COLS,
-            LAYER_COL=int(PlanCol.LAYER), BT_OFFSET_COL=int(PlanCol.BT_OFFSET),
+            BT_OFFSET_COL=int(PlanCol.BT_OFFSET),
             CLUSTER_COL=int(PlanCol.CLUSTER), KEPT_LO_COL=int(PlanCol.KEPT_LO),
             K_ALIGNED_COL=int(PlanCol.K_ALIGNED),
             TAIL_LO_COL=int(PlanCol.TAIL_LO), KEPT_COL=int(PlanCol.KEPT),
-            HEAD_SPLITS=self.head_splits, HEAD_TILE=self.head_tile,
-            num_warps=self.num_warps,
+            NUM_PLANES=num_planes, HEAD_SPLITS=head_splits,
+            USE_BT_OFFSET=planes.use_bt_offset,
+            HEAD_TILE=head_tile, num_warps=self.num_warps,
         )
-        args = (table, kv_ptrs, kv0, sorted_idx, block_table_gpu, endangered,
-                width, self.head_size,
-                kv0.stride(1), kv0.stride(2), kv0.stride(3))
-        planes = 2 * self.head_splits
+        args = (table, plane_ptrs, planes.dtype_of, sorted_idx,
+                planes.block_table, endangered, sorted_idx.shape[-1],
+                planes.head_size, planes.stride_block, planes.stride_tok)
+        programs = num_planes * head_splits
         max_span = int((cols[:, PlanCol.KEPT] - cols[:, PlanCol.KEPT_LO]).max())
-        tiles = (max_span + self.token_tile - 1) // self.token_tile
+        tiles = (max_span + planes.token_tile - 1) // planes.token_tile
 
-        _writeback_prefix_kernel[(n, pg, planes)](
-            *args, 1, TOKEN_TILE=self.prefix_token_tile, **common)
+        _writeback_prefix_kernel[(n, pg, programs)](
+            *args, 1, TOKEN_TILE=planes.prefix_token_tile, **common)
         if tiles > 0:
-            _writeback_parallel_kernel[(n, pg, planes * tiles)](
-                *args, tiles, TOKEN_TILE=self.token_tile, **common)
-        _writeback_pad_kernel[(n, pg, planes)](*args, 1, **common)
+            _writeback_parallel_kernel[(n, pg, programs * tiles)](
+                *args, tiles, TOKEN_TILE=planes.token_tile, **common)
+        if pad:
+            _writeback_pad_kernel[(n, pg, programs)](*args, 1, **common)
 
-        if report == PositionReport.SKIP:
-            return None
-        return self._positions(plan, table, sorted_idx)
+    def _blank_evicted_scores(
+        self, plan: EvictionPlan, scores: SlotCompactionTarget,
+    ) -> None:
+        """``flat[row, kept:] = neg_inf`` for every member row the plan
+        touched, as one elementwise pass over the buffer: rows outside the
+        plan get a threshold of ``capacity`` and are left alone."""
+        flat = scores.flat
+        capacity = flat.shape[1]
+        threshold = np.full(flat.shape[0], capacity, dtype=np.int64)
+        members = scores.cluster_members_cpu[plan.table[:, PlanCol.CLUSTER]]
+        kept = np.repeat(plan.table[:, PlanCol.KEPT], members.shape[1])
+        threshold[members.reshape(-1)] = kept
+        threshold_dev = torch.from_numpy(threshold).to(
+            flat.device, non_blocking=True)
+        slots = torch.arange(capacity, device=flat.device)
+        flat.masked_fill_(slots[None, :] >= threshold_dev[:, None],
+                          scores.neg_inf)
 
-    def _positions(
-        self,
-        plan: EvictionPlan,
-        table: torch.Tensor,
-        sorted_idx: torch.Tensor,
-    ) -> list[torch.Tensor]:
-        """The ``[page_group_size, KEPT]`` source positions per plan row,
-        rebuilt from the sorted middle span with the kernel's arithmetic."""
-        pg = self.page_group_size
-        width = sorted_idx.shape[-1]
-        kept_max = int(plan.table[:, PlanCol.KEPT].max())
-        j = torch.arange(kept_max, device=table.device,
-                         dtype=torch.long).view(1, 1, -1)
-        kept_lo = table[:, PlanCol.KEPT_LO].view(-1, 1, 1)
-        k_aligned = table[:, PlanCol.K_ALIGNED].view(-1, 1, 1)
-        tail_lo = table[:, PlanCol.TAIL_LO].view(-1, 1, 1)
-        mid_end = kept_lo + k_aligned
-
-        # One flat gather; indexing the cluster rows first would copy them.
-        mid_i = torch.minimum((j - kept_lo).clamp(min=0),
-                              (k_aligned - 1).clamp(min=0))
-        col = torch.arange(pg, device=table.device,
-                           dtype=torch.long).view(1, -1, 1)
-        row_base = (table[:, PlanCol.CLUSTER].view(-1, 1, 1) * pg + col) * width
-        mid_pos = sorted_idx.view(-1)[row_base + mid_i] + kept_lo
-        pos = torch.where(j < kept_lo, j,
-                          torch.where(j < mid_end, mid_pos,
-                                      tail_lo + (j - mid_end)))
-        return [pos[i, :, :int(row[PlanCol.KEPT])]
-                for i, row in enumerate(plan.table)]
-
-    def warmup(self, layer_kv_cache: torch.Tensor) -> None:
-        """Compile both kernels now, on a two-block cluster kept whole, so the
+    def warmup(self, layer_kv_cache: torch.Tensor,
+               score_dtype: torch.dtype | None = None) -> None:
+        """Compile every kernel now, on a two-block cluster kept whole, so the
         first real boundary pays no JIT. ``layer_kv_cache`` supplies device,
-        dtype and strides; its first two pages are read and rewritten
-        unchanged."""
+        dtype and page geometry; its first two pages are read and rewritten
+        unchanged. ``score_dtype`` also compiles the score-buffer variants."""
         block_size = self.block_size
         device = layer_kv_cache.device
+        pg = self.page_group_size
         total = 2 * block_size
         table = np.array([[0, 0, 0, 0, total, total, total]], dtype=np.int64)
         plan = EvictionPlan(table=table, sink_size=0, tail_size=0,
@@ -642,8 +780,13 @@ class TritonWriteback(KeptKVWriteback):
         block_table = torch.arange(2, device=device, dtype=torch.int32)
         sorted_idx = torch.empty_like(self.keep_mask, dtype=torch.int64)
         sorted_idx[0, :, :total] = torch.arange(total, device=device).flip(0)
-        self.run(plan, [layer_kv_cache], block_table, sorted_idx,
-                 PositionReport.RETURN)
+        scores = None
+        if score_dtype is not None:
+            scores = SlotCompactionTarget(
+                flat=torch.zeros(pg, total, dtype=score_dtype, device=device),
+                cluster_members_cpu=np.arange(pg).reshape(1, pg),
+                neg_inf=float(torch.finfo(score_dtype).min))
+        self.run(plan, [layer_kv_cache], block_table, sorted_idx, scores)
 
 
 def make_kept_kv_writeback(

@@ -4,10 +4,10 @@
 
 Both backends receive one :class:`EvictionPlan` over several layers and
 head-groups with DIFFERENT kept lengths, locked prefixes, top-k counts and
-tail offsets, on clones of the same cache; afterwards the caches, the sorted
-positions and the reported positions must be identical. The top-k positions
-differ per column so an error that confuses the column axis with the token
-axis cannot pass.
+tail offsets, on clones of the same cache and, when a score buffer follows
+the positions, of the same buffer; afterwards caches and buffer must be
+identical. The top-k positions differ per column so an error that confuses
+the column axis with the token axis cannot pass.
 
 Needs a GPU. Run without the root conftest:
 
@@ -22,9 +22,10 @@ from vllm.v1.attention.compression.eviction_writeback import (
     NUM_PLAN_COLS,
     EvictionPlan,
     PlanCol,
-    PositionReport,
+    SlotCompactionTarget,
     TorchWriteback,
     TritonWriteback,
+    gather_and_writeback_kept_kv,
 )
 
 pytestmark = pytest.mark.skipif(
@@ -91,22 +92,37 @@ def make_case(*, seed, num_layers, num_groups, pg, head, chunk, sink, tail,
     return kv, block_table, sorted_idx, plan
 
 
-def run_both(case, pg, head):
+def make_scores(num_clusters, pg, capacity, dtype, *, shuffle):
+    """A score buffer with one row per member. ``shuffle`` permutes which
+    member row each (cluster, column) owns, as a real cluster map does, and
+    leaves one cluster's worth of rows outside every plan."""
+    rows = num_clusters * pg
+    flat = torch.randn(rows + pg, capacity, dtype=dtype, device=DEV)
+    order = np.random.default_rng(rows).permutation(rows) if shuffle else (
+        np.arange(rows))
+    members = order.reshape(num_clusters, pg)
+    return flat, members
+
+
+def run_both(case, pg, head, scores=None):
     kv, block_table, sorted_idx, plan = case
     kv_ref = [t.clone() for t in kv]
     idx_ref = sorted_idx.clone()
     kv_tri = [t.clone() for t in kv]
     idx_tri = sorted_idx.clone()
+    scores_ref = scores_tri = None
+    if scores is not None:
+        flat, members = scores
+        neg_inf = float(torch.finfo(flat.dtype).min)
+        scores_ref = SlotCompactionTarget(flat.clone(), members, neg_inf)
+        scores_tri = SlotCompactionTarget(flat.clone(), members, neg_inf)
 
-    ref = TorchWriteback(BLOCK)
-    pos_ref = ref.run(plan, kv_ref, block_table, idx_ref,
-                      PositionReport.RETURN)
+    TorchWriteback(BLOCK).run(plan, kv_ref, block_table, idx_ref, scores_ref)
     mask = torch.zeros_like(idx_tri, dtype=torch.uint8)
     tri = TritonWriteback(BLOCK, pg, head, mask)
-    pos_tri = tri.run(plan, kv_tri, block_table, idx_tri,
-                      PositionReport.RETURN)
+    tri.run(plan, kv_tri, block_table, idx_tri, scores_tri)
     torch.cuda.synchronize()
-    return kv_ref, kv_tri, pos_ref, pos_tri, plan
+    return kv_ref, kv_tri, scores_ref, scores_tri, plan
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
@@ -116,14 +132,36 @@ def test_triton_matches_reference(dtype, pg, head, locked_regime):
     case = make_case(seed=pg * 100 + head + int(locked_regime),
                      num_layers=3, num_groups=2, pg=pg, head=head, chunk=512,
                      sink=4, tail=32, dtype=dtype, locked_regime=locked_regime)
-    kv_ref, kv_tri, pos_ref, pos_tri, plan = run_both(case, pg, head)
+    kv_ref, kv_tri, _, _, plan = run_both(case, pg, head)
 
     for layer, (a, b) in enumerate(zip(kv_ref, kv_tri)):
         assert torch.equal(a, b), f"layer {layer} KV differs"
-    assert len(pos_ref) == len(pos_tri) == plan.num_clusters
-    for row, a, b in zip(plan.table, pos_ref, pos_tri):
-        assert a.shape == (pg, int(row[PlanCol.KEPT]))
-        assert torch.equal(a, b), f"positions differ for row {row.tolist()}"
+
+
+@pytest.mark.parametrize("score_dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("shuffle", [False, True])
+def test_score_buffer_follows_the_same_positions(score_dtype, shuffle):
+    """Budget regime: the per-slot scores move with their KV and every slot
+    from ``kept`` on is blanked; rows no plan touches stay as they were."""
+    pg, head, num_layers, num_groups = 4, 64, 3, 2
+    case = make_case(seed=21, num_layers=num_layers, num_groups=num_groups,
+                     pg=pg, head=head, chunk=512, sink=4, tail=32,
+                     dtype=torch.bfloat16, locked_regime=False)
+    scores = make_scores(num_layers * num_groups, pg, capacity=2 * 512 + 64,
+                         dtype=score_dtype, shuffle=shuffle)
+    kv_ref, kv_tri, s_ref, s_tri, plan = run_both(case, pg, head, scores)
+
+    for a, b in zip(kv_ref, kv_tri):
+        assert torch.equal(a, b)
+    assert torch.equal(s_ref.flat, s_tri.flat)
+    # The reference blanked from ``kept``; check the kernel path did the same
+    # and did not touch the spare rows.
+    flat0, members = scores
+    spare = torch.arange(members.size, members.size + pg, device=DEV)
+    assert torch.equal(s_tri.flat[spare], flat0[spare])
+    for row, kept in zip(plan.table, plan.table[:, PlanCol.KEPT]):
+        for member in members[int(row[PlanCol.CLUSTER])]:
+            assert bool((s_tri.flat[member, int(kept):] == s_tri.neg_inf).all())
 
 
 def test_positions_are_strictly_increasing():
@@ -132,8 +170,21 @@ def test_positions_are_strictly_increasing():
     case = make_case(seed=7, num_layers=2, num_groups=2, pg=4, head=64,
                      chunk=256, sink=2, tail=8, dtype=torch.bfloat16,
                      locked_regime=True)
-    _, _, _, pos_tri, _ = run_both(case, 4, 64)
-    for pos in pos_tri:
+    kv, block_table, sorted_idx, plan = case
+    bt_flat = block_table.reshape(-1)
+    for row in plan.table:
+        kept_lo, k, tail_lo, kept = (int(row[c]) for c in (
+            PlanCol.KEPT_LO, PlanCol.K_ALIGNED, PlanCol.TAIL_LO, PlanCol.KEPT))
+        n_blocks = (tail_lo + plan.tail_size + BLOCK - 1) // BLOCK
+        off = int(row[PlanCol.BT_OFFSET])
+        pos = gather_and_writeback_kept_kv(
+            kv_cache=kv[int(row[PlanCol.LAYER])].clone(),
+            block_ids=bt_flat[off:off + n_blocks].long(), block_size=BLOCK,
+            sink_idx=torch.arange(plan.sink_size, device=DEV),
+            locked=kept_lo - plan.sink_size, k_aligned=k, kept_lo=kept_lo,
+            sorted_idx_group=sorted_idx[int(row[PlanCol.CLUSTER])],
+            tail_idx=torch.arange(plan.tail_size, device=DEV),
+            tail_lo=tail_lo, kept_length=kept)
         if pos.shape[1] == 0:
             continue
         assert bool((pos[:, 1:] > pos[:, :-1]).all())
@@ -147,9 +198,8 @@ def test_no_sink_no_tail():
     case = make_case(seed=3, num_layers=1, num_groups=1, pg=2, head=32,
                      chunk=64, sink=0, tail=0, dtype=torch.float16,
                      locked_regime=False)
-    kv_ref, kv_tri, pos_ref, pos_tri, _ = run_both(case, 2, 32)
+    kv_ref, kv_tri, _, _, _ = run_both(case, 2, 32)
     assert torch.equal(kv_ref[0], kv_tri[0])
-    assert torch.equal(pos_ref[0], pos_tri[0])
 
 
 def _compiled_variants() -> int:
@@ -171,13 +221,17 @@ def test_warmup_compiles_every_variant_a_boundary_needs():
                      chunk=512, sink=4, tail=32, dtype=torch.bfloat16,
                      locked_regime=True)
     kv, block_table, sorted_idx, plan = case
+    flat, members = make_scores(6, pg, capacity=1088, dtype=torch.float32,
+                                shuffle=True)
+    scores = SlotCompactionTarget(flat, members, float(torch.finfo(
+        torch.float32).min))
     mask = torch.zeros_like(sorted_idx, dtype=torch.uint8)
     tri = TritonWriteback(BLOCK, pg, head, mask)
     tri.warmup(torch.empty(2, 2, pg, BLOCK, head, dtype=torch.bfloat16,
-                           device=DEV))
+                           device=DEV), score_dtype=torch.float32)
     torch.cuda.synchronize()
 
     before = _compiled_variants()
-    tri.run(plan, kv, block_table, sorted_idx, PositionReport.SKIP)
+    tri.run(plan, kv, block_table, sorted_idx, scores)
     torch.cuda.synchronize()
     assert _compiled_variants() == before

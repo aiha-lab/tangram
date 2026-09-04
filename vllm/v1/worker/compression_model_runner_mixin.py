@@ -224,9 +224,12 @@ class CompressionModelRunnerMixin:
         if isinstance(writeback, TritonWriteback):
             # Compile before the KV pool exists, on a stand-in with the real
             # dtype and page geometry, so no request pays the JIT.
-            writeback.warmup(torch.empty(
-                2, 2, page_group_size, block_size, head_size,
-                dtype=dtype, device=self.device))
+            workspace = self.compressor.workspace
+            writeback.warmup(
+                torch.empty(2, 2, page_group_size, block_size, head_size,
+                            dtype=dtype, device=self.device),
+                score_dtype=(workspace.spec.score_dtype
+                             if workspace.stat_buffer is not None else None))
         self.compression_executor = CompressionExecutor(
             num_layers=num_layers,
             num_kv_heads_per_layer=num_kv_heads_per_rank,

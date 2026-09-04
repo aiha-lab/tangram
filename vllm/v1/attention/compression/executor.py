@@ -20,7 +20,6 @@ from vllm.v1.attention.compression.eviction_writeback import (
     EvictionPlan,
     KeptKVWriteback,
     PlanCol,
-    PositionReport,
     TorchWriteback,
 )
 from vllm.v1.worker.block_table import BlockTable
@@ -212,24 +211,14 @@ class CompressionExecutor:
             )
             # The score store follows the very same positions, so a survivor's
             # statistics move with it and an evicted one's are released.
-            report = (PositionReport.RETURN
-                      if compressor.follows_kept_positions(metadata.req_id)
-                      else PositionReport.SKIP)
-            positions = self.writeback.run(
+            self.writeback.run(
                 plan,
                 layer_kv_caches,
                 block_table_gpu,
                 compressor.workspace.sorted_index.view(
                     num_compressed * num_groups, self.page_group_size, -1),
-                report,
+                compressor.compaction_target(metadata.req_id),
             )
-            if positions is not None:
-                for row, keep_positions in zip(plan.table, positions):
-                    cluster = int(row[PlanCol.CLUSTER])
-                    compressor.compact_cluster_stats(
-                        metadata.req_id, cluster // num_groups,
-                        cluster % num_groups, keep_positions,
-                        int(row[PlanCol.KEPT]))
 
         # The compressor owns this state -- it lives in the preallocated
         # workspace -- so the executor reports rather than writes it.
