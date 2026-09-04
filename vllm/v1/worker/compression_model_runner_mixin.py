@@ -35,6 +35,10 @@ from vllm.v1.attention.compression import (
     CompressionMetadata,
     KVCompressor,
 )
+from vllm.v1.attention.compression.eviction_writeback import (
+    TritonWriteback,
+    make_kept_kv_writeback,
+)
 from vllm.v1.attention.compression.slot_scores import KVCacheView
 from vllm.v1.attention.compression.workspace import (
     CompressionWorkspace,
@@ -207,13 +211,30 @@ class CompressionModelRunnerMixin:
         static_inners = [layer_to_inner[i] for i in static_layer_ids]
         self.compressor.attach_scorers(static_parents, static_inners)
 
+        page_group_size = cache_config.page_group_size
+        writeback = make_kept_kv_writeback(
+            device=self.device,
+            block_size=block_size,
+            page_group_size=page_group_size,
+            head_size=head_size,
+            keep_mask=self.compressor.workspace.keep_mask.view(
+                -1, page_group_size,
+                self.compressor.workspace.spec.eval_capacity),
+        )
+        if isinstance(writeback, TritonWriteback):
+            # Compile before the KV pool exists, on a stand-in with the real
+            # dtype and page geometry, so no request pays the JIT.
+            writeback.warmup(torch.empty(
+                2, 2, page_group_size, block_size, head_size,
+                dtype=dtype, device=self.device))
         self.compression_executor = CompressionExecutor(
             num_layers=num_layers,
             num_kv_heads_per_layer=num_kv_heads_per_rank,
-            page_group_size=cache_config.page_group_size,
+            page_group_size=page_group_size,
             head_size=head_size,
             block_size=block_size,
             compressed_layer_ids=static_layer_ids,
+            writeback=writeback,
         )
 
     def _begin_compression_step(

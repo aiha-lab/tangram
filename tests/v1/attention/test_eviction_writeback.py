@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Behaviour tests for the eviction gather / write-back.
+"""Behaviour tests for the eviction gather / write-back reference.
 
-``_gather_and_writeback_kept_kv`` decides which cached KV survives a chunk
+``gather_and_writeback_kept_kv`` decides which cached KV survives a chunk
 boundary and where it lands. A wrong index here does not crash -- it moves
 another head's KV into this one's slots -- and it had no tests, so any change
 to the indexing was unverifiable.
@@ -20,23 +20,14 @@ imports a package this fork does not install:
 """
 import torch
 
-from vllm.v1.attention.compression.executor import CompressionExecutor
+from vllm.v1.attention.compression.eviction_writeback import (
+    gather_and_writeback_kept_kv,
+)
 
 BLOCK = 4
 PG = 2               # page_group_size
 HEAD = 3
 POOL = 12            # blocks in the pool
-DEV = torch.device("cpu")
-
-
-def make_executor() -> CompressionExecutor:
-    return CompressionExecutor(
-        num_layers=1,
-        num_kv_heads_per_layer=PG,
-        page_group_size=PG,
-        head_size=HEAD,
-        block_size=BLOCK,
-    )
 
 
 def make_cache() -> torch.Tensor:
@@ -51,11 +42,12 @@ def cached(kv: torch.Tensor, block_ids: torch.Tensor, col: int, pos: int):
     return kv[:, block_ids[pos // BLOCK], col, pos % BLOCK]
 
 
-def call(ex, kv, block_ids, *, sink_size, locked, k_aligned, kept_lo,
+def call(kv, block_ids, *, sink_size, locked, k_aligned, kept_lo,
          sorted_idx_group, tail_size, tail_lo, kept_length):
-    return ex._gather_and_writeback_kept_kv(
+    return gather_and_writeback_kept_kv(
         kv_cache=kv,
         block_ids=block_ids,
+        block_size=BLOCK,
         sink_idx=torch.arange(sink_size, dtype=torch.long),
         locked=locked,
         k_aligned=k_aligned,
@@ -64,7 +56,6 @@ def call(ex, kv, block_ids, *, sink_size, locked, k_aligned, kept_lo,
         tail_idx=torch.arange(tail_size, dtype=torch.long),
         tail_lo=tail_lo,
         kept_length=kept_length,
-        device=DEV,
     )
 
 
@@ -74,12 +65,12 @@ def call(ex, kv, block_ids, *, sink_size, locked, k_aligned, kept_lo,
 def test_kept_positions_are_sink_then_locked_then_mid_then_tail():
     """The four spans in order. Only the middle differs per column: sink,
     locked and tail are the same positions for every head in the group."""
-    ex, kv = make_executor(), make_cache()
+    kv = make_cache()
     block_ids = torch.tensor([7, 2, 9, 4], dtype=torch.long)  # 16 positions
     # Column 0 promotes offsets 1 and 3, column 1 promotes 0 and 2.
     sorted_idx = torch.tensor([[1, 3, 0, 2], [0, 2, 1, 3]], dtype=torch.long)
 
-    keep = call(ex, kv, block_ids, sink_size=2, locked=1, k_aligned=2,
+    keep = call(kv, block_ids, sink_size=2, locked=1, k_aligned=2,
                 kept_lo=3, sorted_idx_group=sorted_idx, tail_size=3,
                 tail_lo=13, kept_length=8)
 
@@ -92,11 +83,11 @@ def test_kept_positions_are_sink_then_locked_then_mid_then_tail():
 def test_the_middle_span_is_sorted_before_it_is_offset():
     """``sorted_idx_group`` arrives in score order; the kept run has to come
     out in position order or the write-back reverses time."""
-    ex, kv = make_executor(), make_cache()
+    kv = make_cache()
     block_ids = torch.tensor([1, 5], dtype=torch.long)
     sorted_idx = torch.tensor([[3, 0, 1, 2], [2, 3, 0, 1]], dtype=torch.long)
 
-    keep = call(ex, kv, block_ids, sink_size=1, locked=0, k_aligned=3,
+    keep = call(kv, block_ids, sink_size=1, locked=0, k_aligned=3,
                 kept_lo=1, sorted_idx_group=sorted_idx, tail_size=0,
                 tail_lo=8, kept_length=4)
 
@@ -107,10 +98,10 @@ def test_the_middle_span_is_sorted_before_it_is_offset():
 def test_no_middle_span_never_touches_sorted_idx():
     """``k_aligned == 0`` is the warm-up chunk, where nothing has been scored
     yet and the caller may pass no indices at all."""
-    ex, kv = make_executor(), make_cache()
+    kv = make_cache()
     block_ids = torch.tensor([3, 8], dtype=torch.long)
 
-    keep = call(ex, kv, block_ids, sink_size=2, locked=0, k_aligned=0,
+    keep = call(kv, block_ids, sink_size=2, locked=0, k_aligned=0,
                 kept_lo=2, sorted_idx_group=None, tail_size=2, tail_lo=6,
                 kept_length=4)
 
@@ -124,12 +115,12 @@ def test_no_middle_span_never_touches_sorted_idx():
 def test_the_kept_kv_moves_to_the_front_of_the_same_pages():
     """Each column's surviving KV is compacted to slots ``[0, kept_length)``
     of the cluster's own pages, column by column."""
-    ex, kv = make_executor(), make_cache()
+    kv = make_cache()
     block_ids = torch.tensor([7, 2, 9, 4], dtype=torch.long)
     sorted_idx = torch.tensor([[1, 3, 0, 2], [0, 2, 1, 3]], dtype=torch.long)
     before = kv.clone()
 
-    keep = call(ex, kv, block_ids, sink_size=2, locked=1, k_aligned=2,
+    keep = call(kv, block_ids, sink_size=2, locked=1, k_aligned=2,
                 kept_lo=3, sorted_idx_group=sorted_idx, tail_size=3,
                 tail_lo=13, kept_length=8)
 
@@ -143,12 +134,12 @@ def test_the_kept_kv_moves_to_the_front_of_the_same_pages():
 
 
 def test_pages_past_the_written_blocks_are_untouched():
-    ex, kv = make_executor(), make_cache()
+    kv = make_cache()
     block_ids = torch.tensor([7, 2, 9, 4], dtype=torch.long)
     sorted_idx = torch.tensor([[1, 3, 0, 2], [0, 2, 1, 3]], dtype=torch.long)
     before = kv.clone()
 
-    call(ex, kv, block_ids, sink_size=2, locked=1, k_aligned=2, kept_lo=3,
+    call(kv, block_ids, sink_size=2, locked=1, k_aligned=2, kept_lo=3,
          sorted_idx_group=sorted_idx, tail_size=3, tail_lo=13, kept_length=8)
 
     # kept_length 8 fills blocks 0 and 1 of the cluster; 9 and 4 are untouched.
@@ -162,11 +153,11 @@ def test_pages_past_the_written_blocks_are_untouched():
 def test_a_trailing_partial_block_is_zero_padded():
     """The write-back is block-aligned, so a kept length that stops mid-block
     must leave zeros behind rather than stale KV a later read could pick up."""
-    ex, kv = make_executor(), make_cache()
+    kv = make_cache()
     block_ids = torch.tensor([1, 5, 10], dtype=torch.long)
     sorted_idx = torch.tensor([[2, 0, 1], [1, 2, 0]], dtype=torch.long)
 
-    call(ex, kv, block_ids, sink_size=1, locked=0, k_aligned=2, kept_lo=1,
+    call(kv, block_ids, sink_size=1, locked=0, k_aligned=2, kept_lo=1,
          sorted_idx_group=sorted_idx, tail_size=2, tail_lo=10, kept_length=5)
 
     # 5 kept -> 2 blocks written, slots 5..7 of the second block are padding.
@@ -180,12 +171,12 @@ def test_a_trailing_partial_block_is_zero_padded():
 def test_scattered_pages_are_addressed_through_the_block_table():
     """The cluster's pages are not contiguous in the pool, so the gather has
     to resolve every position through ``block_ids``."""
-    ex, kv = make_executor(), make_cache()
+    kv = make_cache()
     block_ids = torch.tensor([11, 0, 6], dtype=torch.long)
     sorted_idx = torch.tensor([[2, 1, 0], [0, 1, 2]], dtype=torch.long)
     before = kv.clone()
 
-    keep = call(ex, kv, block_ids, sink_size=1, locked=0, k_aligned=2,
+    keep = call(kv, block_ids, sink_size=1, locked=0, k_aligned=2,
                 kept_lo=1, sorted_idx_group=sorted_idx, tail_size=1,
                 tail_lo=11, kept_length=4)
 

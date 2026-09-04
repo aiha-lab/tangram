@@ -584,6 +584,13 @@ class KVCompressor:
                 eval_len=keep_dec.eval_len,
             )
         return kept_lengths
+
+    def follows_kept_positions(self, req_id: str) -> bool:
+        """Whether ``compact_cluster_stats`` will read the kept positions for
+        this request, so the executor can skip building them otherwise."""
+        req = self.req_state.get(req_id)
+        return req is not None and req.score_store.follows_positions
+
     def compact_cluster_stats(
         self,
         req_id: str,

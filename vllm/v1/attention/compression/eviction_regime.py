@@ -123,6 +123,10 @@ class RegimeScoreStore(ABC):
         next request's decision this step.
         """
 
+    #: Whether ``compact_cluster`` reads its positions at all. When it does
+    #: not, the executor need not materialise them.
+    follows_positions: bool = False
+
     @abstractmethod
     def compact_cluster(
         self,
@@ -316,15 +320,19 @@ class _SlotScoreStore(RegimeScoreStore):
         ).view(1, 1, eval_len)
         return out.masked_fill_(positions >= member_real_len, self.neg_inf)
 
+    @property
+    def follows_positions(self) -> bool:
+        # Only a score that will be read again must follow the KV; a
+        # recomputing source rebuilds every live slot next eviction anyway.
+        return self.source.slots_persist_across_steps
+
     def compact_cluster(
         self,
         cluster_id: int,
         keep_positions: torch.Tensor,
         kept_length: int,
     ) -> None:
-        # Only a score that will be read again must follow the KV; a
-        # recomputing source rebuilds every live slot next eviction anyway.
-        if not self.source.slots_persist_across_steps:
+        if not self.follows_positions:
             return
         rows = cluster_member_rows(
             self._cluster_members_cpu, cluster_id, caller="compact_cluster")

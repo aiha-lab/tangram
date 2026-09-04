@@ -233,6 +233,11 @@ class CompressionWorkspace:
         self.sorted_index = torch.empty(
             num_layers, num_groups, spec.page_group_size, spec.eval_capacity,
             dtype=torch.int64, device=device)
+        # Scratch for the write-back kernel's in-place sort of the selected
+        # positions: one byte per ``sorted_index`` cell.
+        self.keep_mask = torch.zeros(
+            num_layers, num_groups, spec.page_group_size, spec.eval_capacity,
+            dtype=torch.uint8, device=device)
 
         # ---- per row, persists across steps ------------------------------
         # The chunk's scores so far, for a chunk the scheduler split over
@@ -296,7 +301,7 @@ class CompressionWorkspace:
     @property
     def shared_bytes(self) -> int:
         tensors = [self.staging, self.eval_scores, self.rank_scores,
-                   self.sorted_index]
+                   self.sorted_index, self.keep_mask]
         # Shared exactly when they hold nothing between steps.
         if self.stat_buffer is not None and self.spec.slot_rows <= 1:
             tensors.append(self.stat_buffer)
