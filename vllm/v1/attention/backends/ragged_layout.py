@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING
 import torch
 
 if TYPE_CHECKING:
+    from vllm.v1.utils import CpuGpuBuffer
     from collections.abc import Callable
 
 
@@ -493,6 +494,7 @@ def build_ragged_step_views(
     query_start_loc_cpu: torch.Tensor,
     effective_seq_lens_cpu,
     num_reqs: int,
+    seq_lens_cluster_staging: "CpuGpuBuffer | None" = None,
     num_actual_tokens: int,
     max_query_len: int,
     max_seq_len: int,
@@ -513,6 +515,10 @@ def build_ragged_step_views(
     ``effective_seq_lens_cpu`` is the post-compression per-cluster length,
     ``[num_reqs, num_clusters_total]``, or None with compression off; when set
     the cache holds ``effective[cluster]`` tokens plus this step's chunk.
+    ``seq_lens_cluster_staging`` is a pinned host / device pair of at least
+    ``num_clusters_total * num_reqs`` int32 the per-cluster lengths travel
+    through; without it they go through a pageable copy, which synchronises
+    the stream every step.
 
     Raises RuntimeError when the incoming shapes or the uniform-decode
     invariant do not match the ragged layout.
@@ -554,8 +560,14 @@ def build_ragged_step_views(
             effective_np[:num_reqs].T.astype(np.int32)
             + num_scheduled_np.astype(np.int32)[None, :]
         )
-        seq_lens_cluster = torch.from_numpy(
-            seq_lens_cluster_np).to(seq_lens.device).contiguous()
+        if seq_lens_cluster_staging is None:
+            seq_lens_cluster = torch.from_numpy(
+                seq_lens_cluster_np).to(seq_lens.device).contiguous()
+        else:
+            count = seq_lens_cluster_np.size
+            seq_lens_cluster_staging.np[:count] = seq_lens_cluster_np.reshape(-1)
+            seq_lens_cluster = seq_lens_cluster_staging.copy_to_gpu(count).view(
+                num_head_groups_total, num_reqs)
     else:
         seq_lens_cluster = (
             seq_lens.unsqueeze(0)

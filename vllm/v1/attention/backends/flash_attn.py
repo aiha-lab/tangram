@@ -33,6 +33,8 @@ if is_flash_attn_varlen_func_available():
         reshape_and_cache_flash,
     )
 from vllm.config import VllmConfig, get_current_vllm_config, get_layers_from_vllm_config
+from vllm.utils.platform_utils import is_pin_memory_available
+from vllm.v1.utils import CpuGpuBuffer
 from vllm.config.cache import CacheDType
 from vllm.distributed.parallel_state import get_dcp_group
 from vllm.logger import init_logger
@@ -383,6 +385,10 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
             )
             self._member_to_cluster: torch.Tensor | None = None
             self._member_to_col: torch.Tensor | None = None
+            # Per-cluster sequence lengths cross to the device through this
+            # pinned pair each step, so the build never waits on the stream.
+            # Sized on the first build, from the block table's cluster axis.
+            self._seq_lens_cluster_buf: CpuGpuBuffer | None = None
         else:
             self._num_head_groups_per_layer = 0
             self._page_group_size = 0
@@ -656,6 +662,13 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
         # member-map resolver and this step's raw tensors.
         views = None
         if self._ragged:
+            needed = (block_table_tensor.shape[1]
+                      * self.vllm_config.scheduler_config.max_num_seqs)
+            if (self._seq_lens_cluster_buf is None
+                    or self._seq_lens_cluster_buf.gpu.numel() < needed):
+                self._seq_lens_cluster_buf = CpuGpuBuffer(
+                    needed, dtype=torch.int32, device=self.device,
+                    pin_memory=is_pin_memory_available())
             views = build_ragged_step_views(
                 block_table_tensor=block_table_tensor,
                 slot_mapping=slot_mapping,
@@ -665,6 +678,7 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
                 effective_seq_lens_cpu=(
                     common_attn_metadata.effective_seq_lens_cpu),
                 num_reqs=num_reqs,
+                seq_lens_cluster_staging=self._seq_lens_cluster_buf,
                 num_actual_tokens=num_actual_tokens,
                 max_query_len=max_query_len,
                 max_seq_len=max_seq_len,

@@ -474,3 +474,46 @@ def test_decode_overlays_reject_the_member_major_layout():
     except AssertionError as error:
         assert "uniform-decode layout" in str(error), error
     print("decode overlays reject the member-major layout")
+
+
+def test_step_views_are_the_same_through_the_pinned_staging():
+    """With compression on, the per-cluster lengths reach the device through a
+    pinned staging pair (no stream-synchronising pageable copy). The views must
+    be identical to the direct-copy path, field by field."""
+    from vllm.v1.attention.backends.ragged_layout import (
+        build_ragged_step_views, identity_member_maps)
+    from vllm.v1.utils import CpuGpuBuffer
+
+    num_layers, kv_heads, pg, block, num_reqs = 2, 4, 2, 4, 3
+    clusters = num_layers * (kv_heads // pg)
+    rng = np.random.default_rng(5)
+    block_table = torch.arange(num_reqs * clusters * 6, dtype=torch.int32).view(
+        num_reqs, clusters, 6)
+    seq_lens = torch.tensor([9, 5, 12], dtype=torch.int32)
+    query_start_loc = torch.tensor([0, 1, 2, 3], dtype=torch.int32)
+    slot_mapping = torch.arange(clusters * num_reqs, dtype=torch.long).view(
+        clusters, num_reqs)
+    effective = rng.integers(0, 8, size=(num_reqs, clusters)).astype(np.int32)
+
+    def build(staging):
+        return build_ragged_step_views(
+            block_table_tensor=block_table, slot_mapping=slot_mapping,
+            seq_lens=seq_lens, query_start_loc=query_start_loc,
+            query_start_loc_cpu=query_start_loc,
+            effective_seq_lens_cpu=effective, num_reqs=num_reqs,
+            seq_lens_cluster_staging=staging, num_actual_tokens=num_reqs,
+            max_query_len=1, max_seq_len=12,
+            num_head_groups_per_layer=kv_heads // pg, page_group_size=pg,
+            block_size=block, num_kv_heads_per_layer=kv_heads,
+            member_maps_fn=lambda layers, device: identity_member_maps(
+                layers, kv_heads, pg, device))
+
+    direct = build(None)
+    staged = build(CpuGpuBuffer(clusters * num_reqs * 2, dtype=torch.int32,
+                                device=torch.device("cpu"), pin_memory=False))
+    for field in dataclasses.fields(direct):
+        a, b = getattr(direct, field.name), getattr(staged, field.name)
+        if isinstance(a, torch.Tensor):
+            assert torch.equal(a, b), field.name
+        else:
+            assert a == b, field.name
