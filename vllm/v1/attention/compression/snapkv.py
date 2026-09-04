@@ -84,13 +84,18 @@ class SnapKVScorer(QKScorer):
         # window to 16, matching the reference's adaptive behaviour.
         window = self.snap_window if chunk_len >= 1000 else min(16, chunk_len)
 
-        # [window, num_kv_heads, num_q_per_kv, d] -> [num_kv_heads, group, w, d]
-        q = q[chunk_len - window:].permute(1, 2, 0, 3)
+        # [window, num_kv_heads, num_q_per_kv, d] -> [num_kv_heads, group * w, d]
+        # The GQA group is folded into the row axis so one batched matmul per
+        # KV head reads K once; broadcasting K over the group axis instead
+        # would copy it ``num_q_per_kv`` times per layer.
+        q = q[chunk_len - window:].permute(1, 2, 0, 3).reshape(
+            num_kv_heads, num_q_per_kv * window, head_size)
         # [num_kv_heads, d, T]
         k_t = k.permute(1, 2, 0)
 
         # [num_kv_heads, group, w, T]; GQA group reduced by amax (reference).
-        attn = torch.matmul(q, k_t.unsqueeze(1)) / self._scale
+        attn = torch.matmul(q, k_t).view(
+            num_kv_heads, num_q_per_kv, window, chunk_len) / self._scale
         attn = attn.amax(dim=1)                              # [num_kv_heads, w, T]
 
         # softmax over key positions, averaged over the query window.
