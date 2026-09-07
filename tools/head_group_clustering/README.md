@@ -20,16 +20,19 @@ residual at the same group size (no attention-kernel performance loss).
 
 ```
 head_group_clustering/
+├── build_profile.py     # CLI: model + scorer -> retention profile (.npz)
+├── build_cluster_map.py # CLI: retention profile (.npz) -> cluster map (.npz)
 ├── clustering.py        # pure: rank_score [L,H] -> ClusterMap (no torch/GPU)
 ├── validate.py          # pure: Spearman rank stability + boundary sensitivity
-├── build_cluster_map.py # CLI: retention profile (.npz) -> cluster map (.npz)
+├── build_all_profiles.sh / build_all_maps.sh  # both stages, every (scorer, model)
 └── tests/test_clustering.py
 ```
 
-Measurement is **not** done here. The tool reuses a per-(layer, head) retention
-profile already produced by `tangram_impl/static_budget_profile/collect.py`
-(FastKVZip cross-layer global-threshold, ~50 pilot samples). `clustering.py` is
-model-independent so it unit-tests without a GPU.
+Two stages, both here: `build_profile.py` measures a per-(layer, head)
+retention profile by running the real engine with `page_group_size=1` and a
+retention observer attached (~50 pilot samples), and `build_cluster_map.py`
+turns that profile into a cluster map. Only the first stage needs a GPU;
+`clustering.py` is model-independent and unit-tests without one.
 
 ## Usage
 
@@ -56,9 +59,9 @@ Key flags:
 - `--page-group-size` — heads per cluster (must divide `num_layers * num_kv_heads`).
 - `--aggregate {stored,mean,median}` — how to reduce per-sample retention into the
   ranking score; `stored` uses the profile's pre-aggregated `ratio_per_head`.
-- `--max-heads-per-layer-per-cluster` — optional cap on heads from one layer
-  sharing a cluster (relevant to the cross-layer write path; see open question
-  Q-B2 in the design tree). Default: unconstrained.
+- `--max-heads-per-layer-per-cluster` — optional cap on how many heads from one
+  layer may share a cluster; `--cluster-scope global` only. Default:
+  unconstrained.
 
 ## Output schema (`.npz`)
 
