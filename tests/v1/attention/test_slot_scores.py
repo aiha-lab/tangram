@@ -28,6 +28,7 @@ from vllm.v1.attention.compression.slot_scores import (
     RecomputedCacheScores,
     SlotFillTarget,
     make_slot_score_source,
+    slot_scores_persist_across_steps,
 )
 from vllm.v1.attention.compression.snapkv import SnapKVScorer
 
@@ -517,3 +518,171 @@ def test_recompute_source_skips_empty_clusters_and_rejects_partial_ones():
     partial[0, 1:] = -1
     with pytest.raises(RuntimeError, match="some columns but not others"):
         fill_with(partial)
+
+
+def _workspace(scorer: str, source: str, max_num_reqs: int = 8):
+    """A budget-regime workspace built the way ``load_model`` builds it."""
+    from vllm.v1.attention.compression.workspace import (
+        CompressionWorkspace,
+        WorkspaceSpec,
+    )
+    spec = WorkspaceSpec.from_config(
+        num_layers=NUM_LAYERS,
+        num_kv_heads=NUM_KV_HEADS,
+        num_groups=NUM_GROUPS,
+        page_group_size=PAGE_GROUP_SIZE,
+        max_num_reqs=max_num_reqs,
+        max_model_len=1 << 20,
+        model_dtype=torch.float32,
+        chunk_size=32,
+        window_size=8,
+        n_sink_tokens=4,
+        budget_tokens=96,
+        evict_current_chunk=False,
+        scorer=scorer,
+        slot_score_source=source,
+    )
+    return CompressionWorkspace(spec, torch.device("cpu"))
+
+
+def test_slot_buffer_rows_follow_the_source_lifetime():
+    """The per-position buffer is the largest term in the reservation, and it is
+    only needed per request when a slot's score has to survive between steps."""
+    max_num_reqs = 8
+
+    # KeyDiff recomputes every live slot at each eviction, so one buffer serves
+    # the whole step.
+    recomputing = _workspace("keydiff", "auto", max_num_reqs)
+    assert recomputing.spec.slot_rows == 1
+    assert recomputing.stat_buffer.shape[0] == 1
+
+    # SnapKV keeps what each chunk produced; every concurrent request needs its
+    # own history.
+    persisting = _workspace("snapkv", "auto", max_num_reqs)
+    assert persisting.spec.slot_rows == max_num_reqs
+    assert persisting.stat_buffer.shape[0] == max_num_reqs
+
+    # Forcing the ablation source brings the per-request rows back.
+    forced = _workspace("keydiff", "persist", max_num_reqs)
+    assert forced.spec.slot_rows == max_num_reqs
+
+    # Sharing is what makes it cheap; the saving is the whole point.
+    assert recomputing.reserved_bytes < persisting.reserved_bytes
+    # And it is reported under the lifetime it actually has, so the startup line
+    # names the right knob.
+    assert recomputing.per_row_bytes < persisting.per_row_bytes
+    assert recomputing.shared_bytes > persisting.shared_bytes
+
+
+def test_shared_slot_buffer_hands_every_request_the_same_row():
+    """With no history to keep, two concurrent requests may use one buffer; with
+    history they must not."""
+    shared = _workspace("keydiff", "auto")
+    assert (shared.stat_buffer_for(0).data_ptr()
+            == shared.stat_buffer_for(3).data_ptr())
+
+    per_row = _workspace("snapkv", "auto")
+    assert (per_row.stat_buffer_for(0).data_ptr()
+            != per_row.stat_buffer_for(3).data_ptr())
+
+
+def test_ratio_regime_reserves_no_slot_buffer():
+    from vllm.v1.attention.compression.workspace import (
+        CompressionWorkspace,
+        WorkspaceSpec,
+    )
+    spec = WorkspaceSpec.from_config(
+        num_layers=NUM_LAYERS,
+        num_kv_heads=NUM_KV_HEADS,
+        num_groups=NUM_GROUPS,
+        page_group_size=PAGE_GROUP_SIZE,
+        max_num_reqs=4,
+        max_model_len=1 << 20,
+        model_dtype=torch.float32,
+        chunk_size=32,
+        window_size=8,
+        n_sink_tokens=4,
+        budget_tokens=None,
+        evict_current_chunk=False,
+        scorer="keydiff",
+        slot_score_source="auto",
+    )
+    assert spec.slot_capacity == 0
+    assert spec.slot_rows == 0
+    workspace = CompressionWorkspace(spec, torch.device("cpu"))
+    assert workspace.stat_buffer is None
+    with pytest.raises(RuntimeError, match="slot_capacity == 0"):
+        workspace.stat_buffer_for(0)
+
+
+@pytest.mark.parametrize("scorer_name", ["keydiff", "snapkv", "fastkvzip"])
+@pytest.mark.parametrize("source", ["auto", "persist"])
+def test_sizing_and_construction_agree_on_the_source(scorer_name, source):
+    """The workspace decides the lifetime from the configuration while the
+    compressor decides it from the scorer instance. One rule, so the two must
+    never disagree — a disagreement would silently share a buffer that has to
+    hold history."""
+    scorers = {
+        "keydiff": KeyDiffScorer(
+            num_kv_heads=NUM_KV_HEADS, head_size=HEAD_SIZE),
+        "snapkv": SnapKVScorer(
+            num_kv_heads=NUM_KV_HEADS, num_q_per_kv=2, head_size=HEAD_SIZE,
+            window=8, kernel=3),
+        # The checkpoint-backed gate scores hidden states, which the cache does
+        # not hold; it is not a member of the scorer registry.
+        "fastkvzip": None,
+    }
+    built = make_slot_score_source(scorers[scorer_name], source)
+    assert (slot_scores_persist_across_steps(scorer_name, source)
+            is built.slots_persist_across_steps)
+
+
+def _slot_store(scorer: str, source: str):
+    """A budget-regime score store wired to the workspace it was sized for."""
+    from vllm.v1.attention.compression.eviction_regime import BudgetRegime
+    workspace = _workspace(scorer, source, max_num_reqs=2)
+    scorers = {
+        "keydiff": KeyDiffScorer(
+            num_kv_heads=NUM_KV_HEADS, head_size=HEAD_SIZE),
+        "snapkv": SnapKVScorer(
+            num_kv_heads=NUM_KV_HEADS, num_q_per_kv=2, head_size=HEAD_SIZE,
+            window=8, kernel=3),
+    }
+    member_to_cluster, cluster_members = identity_cluster_maps()
+    store = BudgetRegime().create_store(
+        workspace, 0, member_to_cluster,
+        torch.from_numpy(cluster_members),
+        make_slot_score_source(scorers[scorer], source))
+    return store
+
+
+def test_score_bookkeeping_is_skipped_when_nothing_is_remembered():
+    """``reset`` and ``compact_cluster`` exist to protect history. A recomputing
+    source has none - and its buffer is shared, so clearing it on one request's
+    arrival would blank what another is using."""
+    marker = 7.0
+
+    recomputing = _slot_store("keydiff", "auto")
+    recomputing.buffer.fill_(marker)
+    recomputing.reset()
+    assert torch.all(recomputing.buffer == marker), (
+        "a shared buffer must not be cleared per request")
+    recomputing.compact_cluster(
+        0, torch.zeros(PAGE_GROUP_SIZE, 4, dtype=torch.long), 4)
+    assert torch.all(recomputing.buffer == marker), (
+        "compaction of scores nothing will read is wasted work")
+
+    # The persisting source keeps history, so both still run.
+    persisting = _slot_store("snapkv", "auto")
+    persisting.buffer.fill_(marker)
+    persisting.reset()
+    assert torch.all(persisting.buffer == persisting.neg_inf), (
+        "a reused row must not start with the previous request's scores")
+    persisting.buffer[:, :, :4] = torch.tensor([1.0, 2.0, 3.0, 4.0])
+    persisting.compact_cluster(
+        0, torch.zeros(PAGE_GROUP_SIZE, 2, dtype=torch.long), 2)
+    members = identity_cluster_maps()[1][0]
+    flat = persisting.buffer.view(NUM_LAYERS * NUM_KV_HEADS, -1)
+    assert torch.all(flat[members, :2] == 1.0), "kept slots follow the KV"
+    assert torch.all(flat[members, 2:] == persisting.neg_inf), (
+        "an evicted position's score dies with its KV")

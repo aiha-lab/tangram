@@ -22,8 +22,7 @@ logger = init_logger(__name__)
 # Hub repo hosting the trained gate checkpoints, laid out as per-model
 # subdirectories (e.g. ``qwen3-4b-instruct-2507/q4_dim16_sink16.pt``).
 _GATE_HF_REPO = "hmkim97/tangram-gate"
-# Pin to an immutable commit so a later push to the repo can't silently swap
-# the weights behind an unchanged filename (reproducibility).
+# Pinned so a later push cannot swap weights behind an unchanged filename.
 _GATE_HF_REVISION = "06a628fab229ff3075f69b61f43fa0ef6631c875"
 _GATE_SHORT_ID_ALIASES = {
     "llama-3.1-8b-instruct": "llama3.1-8b-instruct",
@@ -148,14 +147,6 @@ def _resolve_gate_filename(model_name: str, gate_path: str) -> str:
     return os.path.join(short, fname + ".pt")
 
 
-def _local_gate_path(resolved: str) -> str | None:
-    # Local Fast-KVzip output dir, checked before any network so air-gapped
-    # deployments work. None when absent.
-    candidate = os.path.expanduser(
-        os.path.join("~", "FastKVzip", "result_gate", resolved))
-    return candidate if os.path.exists(candidate) else None
-
-
 def _hf_cached_gate_path(resolved: str) -> str | None:
     # HF cache lookup only, no network (local_files_only); None on a miss.
     from huggingface_hub import hf_hub_download
@@ -174,8 +165,7 @@ def _hf_cached_gate_path(resolved: str) -> str | None:
 
 
 def _hf_download_gate_path(resolved: str, gate_path: str) -> str:
-    # Download from the pinned revision; on failure raise with the cause
-    # distinguished instead of a generic "not found".
+    # From the pinned revision; a failure raises with the cause named.
     from huggingface_hub import hf_hub_download
     from huggingface_hub.utils import (EntryNotFoundError, GatedRepoError,
                                        HfHubHTTPError, OfflineModeIsEnabled,
@@ -214,13 +204,39 @@ def _hf_download_gate_path(resolved: str, gate_path: str) -> str:
 
 def _download_or_local(model_name: str, gate_path: str) -> str:
     # Try every offline source before the network, in order:
-    # (1) absolute path, (2) local FastKVzip dir, (3) HF cache, (4) download.
+    # (1) an absolute path, which is how a checkpoint is staged for an
+    # air-gapped host, (2) the HF cache, (3) download. Nothing may shadow the
+    # pinned revision: a gate that loads must be the one the results used.
     if os.path.isabs(gate_path) and os.path.exists(gate_path):
         return gate_path
     resolved = _resolve_gate_filename(model_name, gate_path)
-    return (_local_gate_path(resolved)
-            or _hf_cached_gate_path(resolved)
+    return (_hf_cached_gate_path(resolved)
             or _hf_download_gate_path(resolved, gate_path))
+
+
+# Sliced per rank rather than passed through: leading axis is head-major.
+HEAD_MAJOR_GATE_PARAMS = frozenset(
+    {"q_proj.weight", "q_proj.bias", "k_proj.weight", "k_proj.bias"}
+)
+
+
+def _shard_head_major(
+    value: torch.Tensor,
+    num_heads_total: int,
+    head_start: int,
+    head_end: int,
+) -> torch.Tensor:
+    """Take one head range out of a tensor whose leading axis is head-major.
+
+    A projection's rows are ``num_heads x per_head`` flattened whatever the
+    rank -- a weight carries an input axis after that, a bias carries nothing --
+    so this is one operation for both.
+    """
+    per_head = value.shape[0] // num_heads_total
+    trailing = value.shape[1:]
+    sliced = value.reshape(num_heads_total, per_head, *trailing)
+    sliced = sliced[head_start:head_end]
+    return sliced.reshape((head_end - head_start) * per_head, *trailing)
 
 
 def _shard_gate_state_dict(
@@ -245,27 +261,9 @@ def _shard_gate_state_dict(
     head_end = head_start + num_heads_per_rank
     out: dict = {}
     for key, value in state_dict.items():
-        if key == "q_proj.weight":
-            inner = value.shape[0] // num_heads_total
-            value = value.reshape(
-                num_heads_total, inner, value.shape[1])[head_start:head_end]
-            value = value.reshape(num_heads_per_rank * inner, -1)
-        elif key == "q_proj.bias":
-            inner = value.shape[0] // num_heads_total
-            value = value.reshape(
-                num_heads_total, inner)[head_start:head_end].reshape(
-                    num_heads_per_rank * inner)
-        elif key == "k_proj.weight":
-            output_dim = value.shape[0] // num_heads_total
-            value = value.reshape(
-                num_heads_total, output_dim,
-                value.shape[1])[head_start:head_end]
-            value = value.reshape(num_heads_per_rank * output_dim, -1)
-        elif key == "k_proj.bias":
-            output_dim = value.shape[0] // num_heads_total
-            value = value.reshape(
-                num_heads_total, output_dim)[head_start:head_end].reshape(
-                    num_heads_per_rank * output_dim)
+        if key in HEAD_MAJOR_GATE_PARAMS:
+            value = _shard_head_major(
+                value, num_heads_total, head_start, head_end)
         elif key in ("k_base", "b"):
             value = value[head_start:head_end]
         # q_norm / k_norm weights are output_dim only — pass through.
@@ -286,11 +284,9 @@ def load_gates(
 ) -> list[CompressionGate]:
     """Load per-layer gate modules from a Fast-KVzip checkpoint.
 
-    Shapes (``num_groups``, ``output_dim``, ``sink_dim``) are inferred
-    from the layer-0 state dict. Under TP, the checkpoint stores
-    global KV heads; each rank slices its own range via
-    ``_shard_gate_state_dict``. Errors out (no random-init fallback) if
-    the checkpoint is missing or shape-mismatched.
+    Shapes are inferred from the layer-0 state dict. The checkpoint stores
+    global KV heads, so under TP each rank slices its own range. A missing or
+    shape-mismatched checkpoint raises: there is no random-init fallback.
     """
     file_path = _download_or_local(model_name, gate_path)
     # full unpickling is trusted here. Only blob["module"] (tensors) is consumed.
@@ -326,9 +322,8 @@ def load_gates(
             f"must be a multiple of num_kv_heads_per_rank "
             f"({num_kv_heads_per_rank}).")
 
-    # k_base's third dim is the authoritative sink count (the gate is built and
-    # weight-loaded against it). A differing filename-encoded count means a
-    # mislabeled checkpoint — fail loudly, like the mismatch checks above.
+    # k_base's third dim is the authoritative sink count, the gate being built
+    # against it; a differing filename count means a mislabeled checkpoint.
     m = re.search(r"sink(\d+)", os.path.basename(file_path))
     if m and int(m.group(1)) != sink_dim:
         raise ValueError(

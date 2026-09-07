@@ -2,26 +2,16 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Self-contained RULER helpers for benchmark_ruler.py.
 
-RULER (https://github.com/NVIDIA/RULER) is a synthetic long-context benchmark:
-needle-in-a-haystack retrieval, variable tracking, word extraction, and QA, each
-generated at a target context length. We load the preprocessed parquets from
-``simonjegou/ruler`` (the same HuggingFace-parquet pattern scbench_local uses for
-SCBench), whose configs are the target context lengths (4096 / 8192 / 16384) and
-whose single ``test`` split holds all 13 tasks. Each row provides:
+RULER (https://github.com/NVIDIA/RULER) is a synthetic long-context suite —
+retrieval, variable tracking, word extraction, QA — generated per target context
+length. Loaded from the preprocessed ``simonjegou/ruler`` parquets, whose configs
+are the lengths (4096 / 8192 / 16384) and whose ``test`` split holds all 13
+tasks. Each row: context, question, answer_prefix (primes the answer, appended
+after the prompt), answer (gold items), task, max_new_tokens.
 
-    context          long task body (instruction + haystack)
-    question         the query
-    answer_prefix    text that primes the answer (appended after the prompt so
-                     the model continues from it -- the RULER reference protocol)
-    answer           list[str] of gold items
-    task             task name (e.g. niah_single_1, vt, cwe, qa_1)
-    max_new_tokens   per-task generation budget
-
-The string-match metrics are adapted from NVIDIA/RULER
-(eval/synthetic/constants.py): ``string_match_all`` (recall over the gold items)
-for the retrieval / tracking / extraction tasks, and ``string_match_part`` (any
-gold item present) for the QA tasks. Scores are reported in [0, 1]; multiply by
-100 for the percentage RULER prints.
+Metrics from NVIDIA/RULER eval/synthetic/constants.py: ``string_match_all``
+(recall over gold items) for retrieval / tracking / extraction,
+``string_match_part`` (any gold item) for QA. Reported in [0, 1].
 """
 
 from typing import Any
@@ -122,20 +112,14 @@ def _is_harmony_model(model_name: str) -> bool:
 def build_prompt(tokenizer: Any, model_name: str, sample: dict[str, Any]) -> str:
     """Build the full RULER prompt string for one sample.
 
-    Follows the kvpress/RULER reference protocol: apply the model's chat template
-    to the user content (context + question) with a generation prompt, then append
-    the sample's ``answer_prefix`` so generation continues from it. Greedy decoding
-    is set by the caller (temperature 0).
+    The kvpress/RULER reference protocol: chat-template the user content
+    (context + question) with a generation prompt, then append ``answer_prefix``
+    so generation continues from it. ``enable_thinking=False`` matches the
+    reference (a no-op for the instruct checkpoints used here).
 
-    Two model-family exceptions keep the prompt clean across our checkpoints:
-      * harmony (gpt-oss): apply_chat_template cannot suppress the reasoning
-        channel and mis-handles the appended answer_prefix, so we use the
-        scbench_local hand-built harmony template, which opens the ``final``
-        channel directly (the equivalent of the reference's thinking-off).
-      * no chat template at all: fall back to scbench_local's family template.
-    The reference disables thinking for reasoning models; we pass
-    ``enable_thinking=False`` (a no-op for the instruct checkpoints used here,
-    which already emit no think block)."""
+    Two families take the hand-built scbench_local template instead: harmony
+    (gpt-oss), whose apply_chat_template cannot suppress the reasoning channel
+    and mis-handles the appended prefix, and any model with no chat template."""
     content = sample["context"] + sample["question"]
     answer_prefix = sample["answer_prefix"]
 

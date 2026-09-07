@@ -2,49 +2,15 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Eviction regime — compression axis 3.
 
-An eviction regime answers three questions for one chunked-prefill step, and
-nothing else:
+A regime decides which cached positions may be evicted this chunk (the eval
+region), what fraction survives, and how long a score lives. Both emit the same
+``ChunkGeometry`` plus eval-score tensor, so the budget scope, the ranking and
+the writeback stay regime-agnostic.
 
-1. **Which cached positions may be evicted this chunk** (the *eval region*)?
-2. **How much of that region survives** (the fraction handed to the budget
-   scope)?
-3. **Where do the per-position scores live** between chunks?
-
-The two shipped regimes answer them in opposite ways, which is exactly why they
-are separate classes rather than flags on one code path:
-
-* :class:`RatioRegime` (``compression_ratio`` set) — the historical Tangram /
-  FastKVzip behaviour. The eval region is CHUNK-LOCAL: only the previous chunk's
-  window plus the fresh chunk are re-ranked, and every position promoted to
-  "kept" by an earlier chunk is *locked in* (never evicted again). The surviving
-  fraction comes from the whole-prompt keep ratio, so the final cache is
-  ``keep_ratio * prompt``, which is only known once the prompt length is. Scores of
-  locked positions are never needed again, so the score memory is a small
-  chunk-sized workspace.
-* :class:`BudgetRegime` (``compression_budget_tokens`` set) — a fixed KV cache
-  budget, matching the KeyDiff / H2O / SnapKV reference formulation
-  (``if cache_len <= budget: no eviction; else keep the top budget - protected``).
-  Eviction fires only once the cache would exceed the budget, and the eval
-  region spans the WHOLE cache except the sink and a protected recent tail, so a
-  position kept by an earlier chunk can still be evicted later. There is no
-  lock-in — the budget is unreachable with it, since a locked prefix only ever
-  grows. Because old positions stay rankable, their scores must survive across
-  chunks: the regime keeps a persistent per-position statistics buffer that is
-  compacted alongside the KV on every eviction.
-
-Both regimes emit the same :class:`ChunkGeometry` + eval-score tensor, so
-everything downstream (budget scope, position ranking, writeback) is shared
-and regime-agnostic.
-
-Terminology used throughout:
-
-* *cache slot* — a position in a (layer, head-group)'s compacted KV, i.e. the
-  index the block table and the executor address. Slot 0 is the first sink
-  token; slot ``kept_length - 1`` the last live position.
-* *member* — one (layer, KV head) pair, row ``layer * num_kv_heads + head``.
-* *cluster* — the set of members sharing one head-group's physical KV blocks.
-  All members of a cluster necessarily share ONE length, but each keeps its own
-  positions inside it.
+The score lifetime is what forces two classes rather than a flag: ``ratio``
+locks earlier keeps in, so their scores are dead and one chunk of memory
+suffices, while ``budget`` keeps every live position rankable and so must hold a
+score for exactly as long as its KV.
 """
 from __future__ import annotations
 
@@ -59,6 +25,7 @@ from vllm.v1.attention.compression.slot_scores import (
     ChunkScoreInputs,
     SlotFillTarget,
     SlotScoreSource,
+    cluster_member_rows,
 )
 
 if TYPE_CHECKING:
@@ -67,11 +34,9 @@ if TYPE_CHECKING:
 
 @dataclass(frozen=True)
 class ChunkParams:
-    """Per-chunk policy inputs, identical for every layer and group.
-
-    Sourced from ``CompressionRequestMetadata`` (global config forwarded by the
-    scheduler) plus the request's own prompt length; a regime reads only the
-    fields its formulation needs.
+    """Per-chunk policy inputs, identical for every layer and group. From
+    ``CompressionRequestMetadata`` plus the request's prompt length; a regime
+    reads only the fields its formulation needs.
     """
     #: Surviving fraction of the prompt (ratio regime): ``1 -
     #: CacheConfig.compression_ratio``. ``1.0`` means keep all.
@@ -85,9 +50,8 @@ class ChunkParams:
     #: Whether the chunk just written is itself an eviction candidate
     #: (budget regime only; see ``CacheConfig.compression_evict_current_chunk``).
     evict_current_chunk: bool
-    #: Prompt length of this request's first prefill cycle. The ratio regime
-    #: needs it to hold one whole-prompt target across chunks; the budget regime
-    #: does not (a budget is absolute).
+    #: Prompt length of this request's first prefill cycle, needed only by the
+    #: ratio regime to hold one whole-prompt target across chunks.
     total_prompt_tokens: int
 
 
@@ -95,21 +59,18 @@ class ChunkParams:
 class ChunkGeometry:
     """Where this chunk's keep decision may act, in cache-slot coordinates.
 
-    Every (layer, group) shares ``sink_size`` and ``tail_size``; the eval region
-    starts at ``sink_size + locked[layer, group]`` and is ``real_eval_len[layer,
-    group]`` positions long. ``eval_len`` is the maximum of those lengths — the
-    rectangular width of the eval-score tensor, which shorter (layer, group)
-    pairs pad with ``-inf`` so no padding cell can ever be selected.
+    Every entry shares ``sink_size`` and ``tail_size``; its eval region starts
+    at ``sink_size + locked`` and runs ``real_eval_len`` positions. ``eval_len``
+    is the maximum of those -- the rectangular tensor width, which shorter
+    entries pad with ``-inf`` so padding is never selected.
 
-    The kept length that follows is
-    ``sink_size + locked + <selected> + tail_size``, so the geometry alone fixes
-    everything except how many of the eval positions survive.
+    The kept length is ``sink_size + locked + <selected> + tail_size``, so the
+    geometry fixes everything but how many eval positions survive.
     """
     #: Leading always-kept positions (never scored, never evicted).
     sink_size: int
-    #: Trailing always-kept positions of this chunk. The recent window in the
-    #: ratio regime; the whole fresh chunk in the budget regime unless
-    #: ``evict_current_chunk`` is set.
+    #: Trailing always-kept positions: the recent window (ratio) or the whole
+    #: fresh chunk (budget, unless ``evict_current_chunk``).
     tail_size: int
     #: ``[num_layers, num_groups]`` positions already promoted to permanently
     #: kept by earlier chunks. Always zero in the budget regime (no lock-in).
@@ -119,21 +80,18 @@ class ChunkGeometry:
     #: ``[num_layers, num_groups]`` genuine eval width per (layer, group); the
     #: selected count is clamped to it so padding is never selected.
     real_eval_len: np.ndarray
-    #: Fraction of the eval region to keep, handed to the budget scope.
-    #: ``>= 1.0`` is the no-eviction fast path, ``<= 0.0`` keeps only the
-    #: sink / locked / tail regions.
+    #: Fraction of the eval region to keep. ``>= 1.0`` is the no-eviction fast
+    #: path, ``<= 0.0`` keeps only sink / locked / tail.
     adjusted_ratio: float
 
 
 class RegimeScoreStore(ABC):
     """Per-request score memory owned by one regime.
 
-    A regime decides not only *which* positions may be evicted but also *how
-    long their scores must live*, so the two are owned together. The memory
-    itself is never allocated here: a store is a set of VIEWS into the
-    preallocated :class:`CompressionWorkspace` (its own row for the parts that
-    outlive a step, the shared slabs for the parts that do not), created by
-    :meth:`EvictionRegime.create_store` and released with the request.
+    A regime decides how long a score must live, so it owns the memory holding
+    it. Nothing is allocated here: a store is VIEWS into the preallocated
+    workspace -- its own row for what outlives a step, shared slabs for what
+    does not -- released with the request.
     """
 
     def __init__(
@@ -159,18 +117,20 @@ class RegimeScoreStore(ABC):
     ) -> torch.Tensor:
         """Bring the score memory up to date and return the eval-region scores.
 
-        Args:
-            inputs: this chunk's scorer output, pre-chunk lengths and (when the
-                regime's score source rescores the cache) read access to it.
-            geometry: this chunk's geometry.
-
-        Returns:
-            ``[num_layers, num_kv_heads, geometry.eval_len]``, padded with the
-            dtype's minimum where a (layer, group) has fewer real eval
-            positions, so a padding cell can never outrank a real one. The
-            returned tensor is a view into shared workspace memory and is only
-            valid until the next request's decision in the same step.
+        ``[num_layers, num_kv_heads, geometry.eval_len]``, padded with the
+        dtype minimum where an entry has fewer real positions so padding cannot
+        outrank a real cell. A view into shared memory, valid only until the
+        next request's decision this step.
         """
+
+    #: Whether ``compact_cluster`` reads its positions at all. When it does
+    #: not, the executor need not materialise them.
+    follows_positions: bool = False
+
+    def compaction_target(self) -> "SlotCompactionTarget | None":
+        """The score memory the write-back must compact alongside the KV, or
+        ``None`` when nothing here outlives the eviction."""
+        return None
 
     @abstractmethod
     def compact_cluster(
@@ -181,29 +141,21 @@ class RegimeScoreStore(ABC):
     ) -> None:
         """Follow one cluster's KV eviction in the score memory.
 
-        Called once per evicted (layer, head-group) with the same
-        ``keep_positions`` matrix the KV writeback gathered with, so a
-        position's statistics land in the same slot as its KV. Storage for
-        evicted positions is released, satisfying the contract that a score
-        entry never outlives the KV entry it describes.
-
-        Args:
-            cluster_id: flat cluster id (the value ``member_to_cluster`` holds).
-            keep_positions: ``[page_group_size, kept_length]`` int64 source cache
-                slots per cluster column, in the writeback's column order.
-            kept_length: number of live slots after this eviction.
+        Called once per evicted entry with the same ``keep_positions``
+        (``[page_group_size, kept_length]`` int64 source slots per column, in
+        the writeback's column order) the KV writeback gathered with, so
+        statistics land in the same slot as their KV and evicted storage is
+        released: a score entry never outlives the KV entry it describes.
         """
 
 
 class _ChunkLocalWorkspace(RegimeScoreStore):
     """Score memory for :class:`RatioRegime` — one chunk wide.
 
-    Under lock-in an earlier chunk's kept positions can never be re-ranked, so
-    their scores are dead the moment they are locked. The only score that must
-    outlive its chunk is the previous chunk's window, which the next chunk
-    re-evaluates. So this store needs just the shared ``[previous window |
-    fresh chunk]`` staging slab plus its row's window carry — no growth with
-    prompt length, and no compaction work at eviction time.
+    Lock-in kills a kept position's score the moment it is locked, so the only
+    score outliving its chunk is the previous window, which the next chunk
+    re-evaluates. Hence the shared ``[previous window | fresh chunk]`` slab plus
+    the row's carry: no growth with prompt length, no compaction on eviction.
     """
 
     def __init__(
@@ -212,14 +164,11 @@ class _ChunkLocalWorkspace(RegimeScoreStore):
         row: int,
     ) -> None:
         super().__init__(workspace, row)
-        # Width of the window the carry was written for. The window grows over
-        # the first chunks of a short prompt; a carry written at a different
-        # width describes different positions, so it is discarded rather than
-        # reinterpreted.
+        # The window grows over a short prompt's first chunks, and a carry of
+        # another width describes other positions, so it is discarded.
         self._carry_width: int = -1
-        # Workspace offset the eval region starts at, set by the regime before
-        # ``build_eval_scores`` (the first chunk skips its own sink + window,
-        # which no previous window occupies).
+        # Where the eval region starts in the slab, set before
+        # ``build_eval_scores``: the first chunk skips its own sink and window.
         self.eval_start: int = 0
 
     def reset(self) -> None:
@@ -230,8 +179,6 @@ class _ChunkLocalWorkspace(RegimeScoreStore):
         inputs: ChunkScoreInputs,
         geometry: ChunkGeometry,
     ) -> torch.Tensor:
-        # Chunk-local layout: kept lengths do not address it, and there is
-        # nothing cached to rescore.
         pending = inputs.pending
         chunk_len = pending.shape[-1]
         win_size = geometry.tail_size
@@ -246,13 +193,10 @@ class _ChunkLocalWorkspace(RegimeScoreStore):
         if win_size > 0 and self._carry_width == win_size:
             staging[:, :, :win_size].copy_(
                 self.workspace.prior_window[self.row, :, :, :win_size])
-        # A width mismatch (or the first chunk) leaves the window slot at the
-        # dtype minimum, which is correct: there is no earlier window to rank.
+        # A mismatch, or the first chunk, correctly leaves it unrankable.
         staging[:, :, win_size:width].copy_(pending)
 
-        # Carry this chunk's own window into the next chunk. Skipped when
-        # nothing is evicted (the no-op path leaves the cache untouched, so no
-        # window changes hands).
+        # Skipped when nothing is evicted: no window changes hands.
         if geometry.adjusted_ratio < 1.0:
             if win_size > 0 and chunk_len >= win_size:
                 self.workspace.prior_window[
@@ -261,8 +205,7 @@ class _ChunkLocalWorkspace(RegimeScoreStore):
                 self._carry_width = win_size
             elif win_size == 0:
                 self._carry_width = 0
-            # A window wider than the chunk is degenerate (config forbids it);
-            # leaving the carry untouched keeps the previous chunk's window.
+            # A window wider than the chunk is degenerate; keep the carry.
 
         return staging[
             :, :, self.eval_start:self.eval_start + geometry.eval_len]
@@ -273,29 +216,23 @@ class _ChunkLocalWorkspace(RegimeScoreStore):
         keep_positions: torch.Tensor,
         kept_length: int,
     ) -> None:
-        # Nothing to compact: the staging slab is rebuilt from scratch next
-        # chunk, and the window carry is taken from ``pending`` (which the
-        # eviction does not touch).
+        # Nothing to compact: the slab is rebuilt and the carry untouched.
         del cluster_id, keep_positions, kept_length
 
 
 class _SlotScoreStore(RegimeScoreStore):
     """Score memory for :class:`BudgetRegime` — one entry per live cache slot.
 
-    Without lock-in every live position stays rankable, so a score must be
-    available for it exactly as long as its KV is. The row's buffer is therefore
-    addressed in CACHE-SLOT coordinates: ``buffer[layer, head, slot]`` describes
-    whatever token that head currently holds in that slot. Two consequences
-    follow, and both are load-bearing:
+    Without lock-in every live position stays rankable, so a score must live
+    exactly as long as its KV. The buffer is therefore addressed in CACHE-SLOT
+    coordinates: ``buffer[layer, head, slot]`` describes whatever token that
+    head currently holds there. Two load-bearing consequences:
 
-    * bringing the buffer up to date each chunk is delegated to a
-      :class:`SlotScoreSource`, because the eviction methods disagree about what
-      "the score of an old position" even means — recompute it from the cached
-      keys (KeyDiff), accumulate it over the queries seen so far (H2O), or keep
-      what its own chunk produced (chunk-local scorers). See ``slot_scores.py``;
-    * every eviction compacts the buffer with the SAME per-column position
-      matrix the KV writeback used, and blanks the slots that fell out, so a
-      score entry can never outlive — or drift away from — its KV entry.
+    * refreshing it each chunk is delegated to a :class:`SlotScoreSource`,
+      because the methods disagree on what an old position's score even means;
+    * every eviction compacts it with the SAME per-column position matrix the KV
+      writeback used and blanks what fell out, so a score entry can neither
+      outlive nor drift away from its KV entry.
     """
 
     def __init__(
@@ -311,8 +248,20 @@ class _SlotScoreStore(RegimeScoreStore):
             raise RuntimeError(
                 "BudgetRegime needs the per-slot score buffer, but the "
                 "workspace was built without one (slot_capacity == 0).")
-        # [num_layers, num_kv_heads, slot_capacity] — this row's slice.
-        self.buffer = workspace.stat_buffer[row]
+        # A source that keeps history needs its own row, or concurrent
+        # requests overwrite each other. Both sides come from one rule.
+        if (source.slots_persist_across_steps
+                and workspace.spec.slot_rows <= 1):
+            raise RuntimeError(
+                f"slot score source '{source.name}' keeps a slot's score "
+                f"between steps, but the workspace reserved "
+                f"{workspace.spec.slot_rows} row(s) for "
+                f"{workspace.spec.max_num_reqs} concurrent requests. The "
+                "workspace and the compressor were configured from different "
+                "compression_scorer / compression_slot_score_source values.")
+        # [num_layers, num_kv_heads, slot_capacity]. Shared with every other
+        # request in the step unless the source keeps scores between steps.
+        self.buffer = workspace.stat_buffer_for(row)
         self.capacity = self.buffer.shape[-1]
         self.source = source
         num_layers, num_kv_heads, _ = self.buffer.shape
@@ -320,12 +269,15 @@ class _SlotScoreStore(RegimeScoreStore):
         self._num_kv_heads = num_kv_heads
         self._flat = self.buffer.view(num_layers * num_kv_heads, self.capacity)
         self._member_to_cluster = member_to_cluster
-        # The per-cluster loops address rows from the CPU so they do not
-        # synchronise on the device once per cluster.
+        # On the CPU so the per-cluster loops do not synchronise per cluster.
         self._cluster_members_cpu = cluster_members.cpu().numpy()
         self._num_groups = self._cluster_members_cpu.shape[0] // num_layers
 
     def reset(self) -> None:
+        # Only history needs clearing: a rewriting source leaves nothing
+        # readable, and blanking its shared buffer would rob another request.
+        if not self.source.slots_persist_across_steps:
+            return
         self.buffer.fill_(self.neg_inf)
 
     def build_eval_scores(
@@ -337,9 +289,9 @@ class _SlotScoreStore(RegimeScoreStore):
         if needed > self.capacity:
             raise RuntimeError(
                 f"BudgetRegime: live cache length {needed} exceeds the reserved "
-                f"slot capacity {self.capacity}. The keep decision caps every "
-                "(layer, group) at the budget, so this means the cap was not "
-                "applied.")
+                f"slot capacity {self.capacity}. The keep decision holds "
+                "every (layer, group) to the workspace's per-group capacity, "
+                "so this means that ceiling was not applied.")
 
         self.source.fill(
             SlotFillTarget(
@@ -355,11 +307,9 @@ class _SlotScoreStore(RegimeScoreStore):
             inputs,
         )
 
-        # The eval region starts at ``sink_size`` for every (layer, group) —
-        # the budget regime has no locked prefix — and ends where that group's
-        # protected tail begins, which differs per group. Copy the rectangle out
-        # (the buffer itself must keep the tail scores) and mask the overhang so
-        # the protected tail can never be selected.
+        # Starts at ``sink_size`` for every entry (no locked prefix here),
+        # ending where that group's tail begins. Copy the rectangle out -- the
+        # buffer keeps the tail scores -- and mask the overhang.
         eval_len = geometry.eval_len
         out = self.workspace.eval_scores[:, :, :eval_len]
         if eval_len == 0:
@@ -375,28 +325,38 @@ class _SlotScoreStore(RegimeScoreStore):
         ).view(1, 1, eval_len)
         return out.masked_fill_(positions >= member_real_len, self.neg_inf)
 
+    @property
+    def follows_positions(self) -> bool:
+        # Only a score that will be read again must follow the KV; a
+        # recomputing source rebuilds every live slot next eviction anyway.
+        return self.source.slots_persist_across_steps
+
+    def compaction_target(self) -> "SlotCompactionTarget | None":
+        if not self.follows_positions:
+            return None
+        from vllm.v1.attention.compression.eviction_writeback import (
+            SlotCompactionTarget)
+        return SlotCompactionTarget(
+            flat=self._flat,
+            cluster_members_cpu=self._cluster_members_cpu,
+            neg_inf=self.neg_inf)
+
     def compact_cluster(
         self,
         cluster_id: int,
         keep_positions: torch.Tensor,
         kept_length: int,
     ) -> None:
-        rows = self._cluster_members_cpu[cluster_id]
-        if (rows < 0).any():
-            if (rows < 0).all():
-                return  # Empty cluster: no member holds these slots.
-            # Score slots follow KV slots per column, so a member left behind
-            # here would keep scores the eviction has already discarded.
-            raise RuntimeError(
-                f"compact_cluster: cluster {cluster_id} holds members in some "
-                f"columns but not others ({rows.tolist()}); a cluster map must "
-                "leave a cluster either full or empty.")
-        # Gather first (a fresh tensor), then write back: an in-place gather
-        # along a permuted index would read slots it has already overwritten.
+        if not self.follows_positions:
+            return
+        rows = cluster_member_rows(
+            self._cluster_members_cpu, cluster_id, caller="compact_cluster")
+        if rows is None:
+            return
+        # Not in place: a permuted gather would read what it overwrote.
         self._flat[rows, :kept_length] = self._flat[rows].gather(
             1, keep_positions)
-        # Blank what fell out, so an evicted token's score can never be read
-        # back by a later chunk (the score entry dies with the KV entry).
+        # An evicted token's score must not be readable by a later chunk.
         if kept_length < self.capacity:
             self._flat[rows, kept_length:] = self.neg_inf
 
@@ -422,18 +382,15 @@ class EvictionRegime(ABC):
     ) -> RegimeScoreStore:
         """Bind this regime's score memory to one reserved workspace row."""
 
-    #: Whether the regime keeps a slot-addressed score buffer, i.e. whether the
-    #: slot score source (``slot_scores.py``) is consumed at all. False for a
+    #: Whether the slot score source is consumed at all. False for a
     #: chunk-local regime, which has no old position to score.
     uses_slot_scores: bool = False
 
     def consumes_chunk_scores(self, source: SlotScoreSource) -> bool:
-        """Whether the per-chunk scorer must run for this regime.
-
-        Always true by default: a chunk-local eval region has nothing but the
-        chunk's own scores to rank. A regime whose score source can reconstruct
-        a position's score from the cache overrides this, and the scorer's
-        forward pass is then skipped entirely.
+        """Whether the per-chunk scorer must run. True by default: a
+        chunk-local eval region has nothing but the chunk's own scores to rank.
+        A regime whose source can reconstruct a score from the cache overrides
+        this, and the scorer forward is then skipped entirely.
         """
         del source
         return True
@@ -451,31 +408,25 @@ class EvictionRegime(ABC):
     ) -> ChunkGeometry:
         """Decide this chunk's geometry.
 
-        Args:
-            store: this request's score memory (a regime may pre-arm it here).
-            prev_lens: ``[num_layers, num_groups]`` int64 pre-chunk kept lengths.
-            chunk_len: tokens written to the cache since the last decision.
-            prev_locked: ``[num_layers, num_groups]`` int64 locked counts carried
-                from the previous chunk, on ``device``.
-            is_first_chunk: whether this is the request's first keep decision.
-            params: per-chunk policy inputs.
-            device: device the returned ``locked`` tensor must live on.
+        ``prev_lens`` and ``prev_locked`` are the ``[num_layers, num_groups]``
+        int64 kept lengths and locked counts the previous chunk left,
+        ``chunk_len`` the tokens written since. A regime may pre-arm ``store``
+        here. ``device`` is where the returned ``locked`` must live.
         """
 
 
 class RatioRegime(EvictionRegime):
     """Keep a fixed FRACTION of the prompt, with lock-in.
 
-    The eval region is the previous chunk's window plus the fresh chunk minus
-    its own new window; everything a previous chunk promoted is locked in and
-    is not re-ranked. The cache therefore only grows, converging on
-    ``keep_ratio * prompt`` — which is why the target is derived from the whole
-    prompt length rather than from what is currently cached.
+    The eval region is the previous window plus the fresh chunk minus its own
+    new window; everything a previous chunk promoted is locked in. The cache
+    therefore only grows, converging on ``keep_ratio * prompt`` -- which is why
+    the target comes from the whole prompt length, not from what is cached.
 
-    ``adjusted_ratio`` reproduces baseline FastKVzip's window correction: the
-    always-kept window is subtracted from both the numerator and the
-    denominator, so the fraction applies to the genuinely evictable region and
-    the end-to-end retention still lands on ``keep_ratio``.
+    ``adjusted_ratio`` is baseline FastKVzip's window correction: the always-kept
+    window leaves both numerator and denominator, so the fraction applies to the
+    genuinely evictable region and end-to-end retention still lands on
+    ``keep_ratio``.
     """
 
     name = "ratio"
@@ -508,8 +459,7 @@ class RatioRegime(EvictionRegime):
         sink_size = min(params.n_sink_tokens, min_total)
         win_size = min(params.window_size, max(0, min_total - sink_size))
 
-        # Positions an earlier chunk promoted, clamped to what this chunk's
-        # cache can actually hold outside the sink and window.
+        # Clamped to what this chunk's cache holds outside sink and window.
         max_locked = torch.from_numpy(
             np.maximum(total_seen - sink_size - win_size, 0)
         ).to(device=device, dtype=torch.long)
@@ -517,9 +467,8 @@ class RatioRegime(EvictionRegime):
 
         adjusted_ratio = self._adjusted_ratio(params, sink_size, win_size)
 
-        # The first chunk has no previous window to re-rank and its own sink is
-        # never scored, so its eval region starts past both; later chunks start
-        # at the carried window, i.e. at workspace offset 0.
+        # The first chunk has no previous window and never scores its own
+        # sink, so it starts past both; later chunks at offset 0.
         store.eval_start = win_size + sink_size if is_first_chunk else 0
         eval_len = max(0, chunk_len - store.eval_start)
         real_eval_len = np.full(prev_lens.shape, eval_len, dtype=np.int64)
@@ -539,9 +488,9 @@ class RatioRegime(EvictionRegime):
         sink_size: int,
         win_size: int,
     ) -> float:
-        """Baseline FastKVzip's window-corrected fraction. ``win_size`` is held
-        fixed (the reference's window-shrink branch instead drops the fraction
-        to zero), and the sink is excluded from the prompt it applies to."""
+        """Baseline FastKVzip's window-corrected fraction. ``win_size`` stays
+        fixed -- the reference's window-shrink branch drops the fraction to zero
+        instead -- and the sink leaves the prompt it applies to."""
         keep = params.keep_ratio
         eff_prompt = max(0, int(params.total_prompt_tokens) - sink_size)
         if keep >= 1.0 or eff_prompt <= win_size:
@@ -555,33 +504,24 @@ class RatioRegime(EvictionRegime):
 class BudgetRegime(EvictionRegime):
     """Hold the cache at a fixed TOKEN BUDGET, with no lock-in.
 
-    Mirrors the reference formulation shared by KeyDiff, H2O and SnapKV: while
-    the cache fits the budget nothing is evicted; once a chunk would overflow
-    it, the cache is cut back to the budget by keeping the top-scoring positions
-    outside the sink and a protected recent tail. Two properties follow that the
-    ratio regime does not have:
+    The reference formulation shared by KeyDiff, H2O and SnapKV: nothing is
+    evicted while the cache fits the budget, and once a chunk would overflow it
+    the cache is cut back to the top-scoring positions outside the sink and a
+    protected tail. Two properties the ratio regime lacks follow: the target is
+    ABSOLUTE, so it holds without knowing the prompt length, and NOTHING is
+    locked in -- an earlier keep competes again every chunk, the only way a
+    bounded cache can admit later, more important tokens, which is why its score
+    must still be available (:class:`_SlotScoreStore`).
 
-    * **the target is absolute**, so it holds without knowing the prompt length
-      and survives a prompt longer than expected;
-    * **nothing is locked in** — a position kept by an earlier chunk competes
-      again every chunk, which is the only way a bounded cache can admit later,
-      more important tokens. Its score must therefore still be available, which
-      is what :class:`_SlotScoreStore` and its score source provide.
-
-    ``budget_tokens`` is the per-(layer, head-group) length; the budget
-    scope decides the range it is shared over, exactly as it does for
-    ``compression_ratio``. See ``CacheConfig.compression_budget_tokens`` and
-    ``CacheConfig.compression_evict_current_chunk`` for the user-facing terms.
+    ``budget_tokens`` is the per-entry length; the scope decides the range it is
+    shared over, exactly as for ``compression_ratio``.
     """
 
     name = "budget"
     uses_slot_scores = True
 
     def consumes_chunk_scores(self, source: SlotScoreSource) -> bool:
-        # Under a budget the eval region spans positions from earlier chunks, so
-        # what the chunk's own scorer produced is only one of several ways to
-        # score them — and a source that recomputes from the cached keys does not
-        # need it at all.
+        # The region spans earlier chunks, which a recomputing source rebuilds.
         return source.needs_chunk_scores
 
     def create_store(
@@ -611,12 +551,16 @@ class BudgetRegime(EvictionRegime):
             "BudgetRegime requires compression_budget_tokens.")
         budget = int(params.budget_tokens)
         total_seen = prev_lens + chunk_len
+        # One sink and one tail for every entry, so they can be no wider than
+        # the SHORTEST entry holds -- protecting a position that does not exist
+        # would put its kept length above what it has seen. Binding here means
+        # nothing has been evicted yet: an evicted entry keeps sink + tail, so
+        # by the time lengths can differ they are all past this clamp.
         min_total = int(total_seen.min())
         sink_size = min(params.n_sink_tokens, min_total)
         evictable = max(0, min_total - sink_size)
         win_size = min(params.window_size, evictable)
-        # Protected tail: the recent window always, widened to the whole fresh
-        # chunk unless that chunk is allowed to compete.
+        # The window, widened to the fresh chunk unless it may compete.
         tail_size = win_size if params.evict_current_chunk else min(
             max(win_size, chunk_len), evictable)
 
@@ -626,13 +570,10 @@ class BudgetRegime(EvictionRegime):
         real_eval_len = np.maximum(total_seen - sink_size - tail_size, 0)
         eval_len = int(real_eval_len.max())
 
-        # How much of the eval region may survive. ``budget - sink - tail`` is
-        # what the budget leaves for it; expressing that as a fraction of the
-        # (rectangular) eval width is what lets every budget scope enforce a
-        # budget without knowing about budgets: a scope keeps that fraction of
-        # its cells, which is exactly ``budget - sink - tail`` positions per
-        # (layer, group) on average, pooled over whatever range the scope
-        # spans. Padding cells hold -inf and so are never among them.
+        # Expressing what the budget leaves as a FRACTION of the rectangular
+        # eval width is what lets a scope enforce a budget without knowing
+        # about budgets: that fraction of its cells is ``budget - sink - tail``
+        # per entry on average, pooled over whatever it spans.
         selectable = budget - sink_size - tail_size
         if eval_len <= 0 or selectable >= eval_len:
             # The cache still fits the budget — nothing to evict this chunk.

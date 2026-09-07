@@ -1,19 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""
-Offline SCBench benchmark for Tangram on vLLM.
+"""Offline SCBench benchmark for Tangram on vLLM — throughput, latency, and
+answer quality under compression.
 
-Measures throughput, per-request latency, and answer quality on SCBench
-datasets while sweeping the FastKVZip compression ratio. Each turn carries
-a single conversation through vLLM's multi-turn auto-advance path; turn 0
-is a prefill-only context turn (one output token, discarded), turn 1 emits
-the answer used for evaluation.
+Each sample is one conversation on vLLM's multi-turn auto-advance path: turn 0
+prefills the context (one discarded token), later turns answer. Data loading,
+prompt templates, output lengths, and metrics come from ``scbench_local``, so no
+FastKVZip checkout is needed.
 
-SCBench data loading, per-model prompt templates, generation-length presets,
-and answer metrics are provided self-contained by ``scbench_local`` (a sibling
-module in this directory), so no external FastKVZip checkout is required.
-
-Example:
     python benchmark_scbench.py -d scbench_kv --num 100 --compression-ratio 0.7 \\
         -m Qwen/Qwen2.5-7B-Instruct-1M --max-model-len 200000 \\
         --single-turn --force-exact-tokens --max-tokens 512
@@ -420,6 +414,18 @@ def run_dataset(
         # The evicted-fraction convention; result files predating the ratio
         # inversion lack this field and read "ratio" as the kept fraction.
         "ratio_semantics": "evicted",
+        "budget_tokens": args.compression_budget_tokens,
+        "evict_current_chunk": args.compression_evict_current_chunk,
+        # Which score the eviction ranked. Recorded because a forced source is
+        # a different experiment, not a different run of the same one.
+        "slot_score_source": args.compression_slot_score_source,
+        # Scorer settings in force; a different anchor is a different algorithm,
+        # so a result file that omitted them could not be compared later.
+        "scorer_options": args.compression_scorer_options,
+        "compression_chunk_size": args.compression_chunk_size,
+        "compression_window_size": args.compression_window_size,
+        "compression_floor_min": args.compression_floor_min,
+        "compression_n_sink_tokens": args.compression_n_sink_tokens,
         "page_group_size": args.page_group_size,
         "max_tokens": max_tokens,
         "num_samples": len(per_sample),
@@ -486,11 +492,9 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--tag", type=str, default="")
     parser.add_argument(
         "--skip-existing", action="store_true",
-        help="Resume mode: skip any dataset whose result JSON already exists "
-             "for this (ratio, page_group). If every dataset for the ratio is "
-             "already done, the model is not even loaded. Lets an interrupted "
-             "sweep be re-run with the same command to fill only the missing "
-             "cells.",
+        help="Skip datasets whose result JSON already exists, so an "
+             "interrupted sweep re-run with the same command fills only the "
+             "missing cells. Nothing pending skips the model load too.",
     )
 
     return parser
@@ -512,13 +516,15 @@ def main() -> None:
     def save_path_for(dataset_name: str) -> str:
         return os.path.join(
             args.output_dir, dataset_name,
-            f"{model_basename}_r{args.compression_ratio}_pg{args.page_group_size}"
-            f"{tag_suffix}.json",
+            # The _b suffix keeps a budget run off the baseline's file, which
+            # --skip-existing would otherwise read as "already done".
+            f"{model_basename}_r{args.compression_ratio}"
+            + (f"_b{args.compression_budget_tokens}"
+               if args.compression_budget_tokens is not None else "")
+            + f"_pg{args.page_group_size}{tag_suffix}.json",
         )
 
-    # Resume mode: drop datasets already computed for this (ratio, page_group)
-    # so an interrupted sweep continues with the same command. When nothing is
-    # pending, skip the model load entirely (it allocates the GPU).
+    # Nothing pending means not loading the model at all — it takes the GPU.
     if args.skip_existing:
         done = [d for d in dataset_names if os.path.exists(save_path_for(d))]
         if done:

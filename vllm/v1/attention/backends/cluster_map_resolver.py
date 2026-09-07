@@ -2,19 +2,16 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Auto-resolution of bundled head-group cluster maps.
 
-Finds the ``.npz`` map shipped under
-``tools/head_group_clustering/cluster_maps/<scorer-dir>/<model-slug>/`` that
-matches the running model, scorer, ``page_group_size``, and budget scope, so
-the default config needs no explicit ``--head-group-cluster-map``. This only
-*locates and identity-checks* a file; ``ragged_layout.load_cluster_map``
-stays the authoritative loader/validator of the array contents. Run once at
-config finalization (``CacheConfig.resolve_head_group_cluster_map``) and frozen
-onto the config, so every consumer reads the same path.
+Finds the ``.npz`` under
+``tools/head_group_clustering/cluster_maps/<scorer-dir>/<model-slug>/`` matching
+the running model, scorer, ``page_group_size`` and budget scope, so the default
+config needs no explicit ``--head-group-cluster-map``. Convention
+``pg<page_group_size>_r<ratio>[_perlayer].npz``, the ratio globbed because the
+runtime ignores ``base_ratio``.
 
-Filename convention (see the cluster_maps README):
-``<scorer-dir>/<model-slug>/pg<page_group_size>_r<ratio>[_perlayer].npz``.
-The ratio is informational (the runtime ignores ``base_ratio``), so it is
-matched with a glob.
+Only locates and identity-checks; ``ragged_layout.load_cluster_map`` remains the
+authoritative validator of the contents. Runs once at config finalization and is
+frozen on, so every consumer reads one path.
 """
 from __future__ import annotations
 
@@ -44,6 +41,31 @@ _SCOPE_FILENAME_SUFFIX = {"global": "", "per_layer": "_perlayer"}
 #: Slug overrides for HF ids whose map directory differs from the natural slug.
 #: Empty today. Kept separate from the gate's alias table (different layout).
 _MODEL_SLUG_ALIASES: dict[str, str] = {}
+
+
+#: Set by the last :func:`resolve_bundled_cluster_map` that fell back, to the
+#: reason it did. ``None`` after a resolution that found a map. Read it to
+#: attribute a result: a log line scrolls away, a published number does not.
+identity_fallback_reason: str | None = None
+
+
+def _fall_back_to_identity(reason: str) -> None:
+    """Record and announce that head-group clustering is not active.
+
+    Losing clustering changes which information survives an eviction at the same
+    total, so a run that falls back is not a slightly different run -- it is a
+    different method. Hence ERROR. The engine continues anyway, because identity
+    grouping is a valid layout and refusing to start would break the
+    configurations that have no map today (tensor parallelism, and any install
+    without the bundled tree).
+    """
+    global identity_fallback_reason
+    identity_fallback_reason = reason
+    logger.error(
+        "Head-group clustering is NOT active: %s. Falling back to identity "
+        "(adjacent-head) grouping. Eviction still works, but which positions "
+        "survive differs from a clustered run, so do not compare this run's "
+        "accuracy against clustered numbers.", reason)
 
 
 def _bundled_maps_base_dir() -> Path | None:
@@ -147,38 +169,47 @@ def resolve_bundled_cluster_map(
     tp_world_size: int,
 ) -> str | None:
     """Path of the bundled cluster map for this run, or ``None`` for identity
-    grouping. Returns ``None`` (logging why) when a map cannot be confidently
-    resolved: TP>1 (maps are TP=1 layouts), a scope with no map
-    (``cluster_map_scope is None``), a scorer/tree with no map, no filename
-    match, or a metadata mismatch. ``cluster_map_scope`` is the budget scope's
+    grouping.
+
+    Five things lose the technique and go through
+    :func:`_fall_back_to_identity`: TP>1, an unknown scope, a scorer that ships
+    no map, no bundled tree, no filename match, and a metadata mismatch. A
+    sixth, ``cluster_map_scope is None``, is the ``uniform`` scope working as
+    configured. ``cluster_map_scope`` is the budget scope's
     ``BudgetScope.cluster_map_scope``."""
+    global identity_fallback_reason
+    identity_fallback_reason = None
+
     if tp_world_size > 1:
-        logger.info(
-            "Tensor parallelism (size %d) in use; cluster maps are TP=1 "
-            "layouts, so using identity grouping.", tp_world_size)
+        _fall_back_to_identity(
+            f"the bundled maps are TP=1 layouts and tensor parallelism "
+            f"(size {tp_world_size}) is in use")
         return None
 
-    if cluster_map_scope is None:  # scope uses no cluster map (uniform)
+    # Not a fallback: the ``uniform`` scope gives every entry the same count,
+    # so there is no cross-entry comparison for a map to inform.
+    if cluster_map_scope is None:
         return None
 
     suffix = _SCOPE_FILENAME_SUFFIX.get(cluster_map_scope)
     if suffix is None:
-        logger.warning(
-            "Unknown cluster map scope %r; using identity grouping.",
-            cluster_map_scope)
+        _fall_back_to_identity(
+            f"cluster map scope {cluster_map_scope!r} is not one of "
+            f"{sorted(_SCOPE_FILENAME_SUFFIX)}")
         return None
 
     scorer_dir = _scorer_dir(scorer)
     if scorer_dir is None:
-        logger.info(
-            "Scorer %r ships no cluster map; using identity grouping.", scorer)
+        _fall_back_to_identity(
+            f"scorer {scorer!r} ships no cluster map (clustering by retention "
+            "is meaningless for a recency or head-uniform scorer)")
         return None
 
     base_dir = _bundled_maps_base_dir()
     if base_dir is None:
-        logger.info(
-            "No bundled cluster map tree found (set %s to override); using "
-            "identity grouping.", _CLUSTER_MAPS_DIR_ENV)
+        _fall_back_to_identity(
+            "no bundled cluster map tree was found -- a wheel install carries "
+            f"no tools/ directory; set {_CLUSTER_MAPS_DIR_ENV} to point at one")
         return None
 
     model_slug = _model_slug(model_name)
@@ -191,11 +222,10 @@ def resolve_bundled_cluster_map(
         matches = [m for m in matches if not m.stem.endswith("_perlayer")]
 
     if not matches:
-        logger.warning(
-            "No bundled cluster map for scorer=%r model=%r page_group_size=%d "
-            "scope=%r (looked for %s under %s); using identity grouping.",
-            scorer, model_name, page_group_size, cluster_map_scope,
-            pattern, map_dir)
+        _fall_back_to_identity(
+            f"no bundled map for scorer={scorer!r} model={model_name!r} "
+            f"page_group_size={page_group_size} scope={cluster_map_scope!r} "
+            f"(looked for {pattern} under {map_dir})")
         return None
 
     if len(matches) > 1:
@@ -211,6 +241,9 @@ def resolve_bundled_cluster_map(
             model_slug=model_slug,
             page_group_size=page_group_size,
             num_kv_heads=num_kv_heads):
+        _fall_back_to_identity(
+            f"the metadata in {path} does not describe this run (the "
+            "mismatched field is named in the warning above)")
         return None
 
     logger.info("Auto-resolved head-group cluster map: %s", path)

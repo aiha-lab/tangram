@@ -2,18 +2,14 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Base contract for gate-free query/key compression scorers (axis 2).
 
-A ``QKScorer`` is a stateless ``nn.Module`` shared across all compressible
-layers. It turns one request-chunk's post-RoPE query/key (and optionally value)
-into per-KV-head importance scores ``[num_kv_heads, T]`` that the compressor
-uses to pick which tokens to keep. Declaring the contract here — rather than in
-prose repeated across each scorer — lets the axis-2 registry key scorers off a
-single ``name`` and lets the delivery dispatch in ``KVCompressor.attach_scorers``
-rely on ``name`` / ``consumes`` being present.
+A ``QKScorer`` is a stateless ``nn.Module`` shared across every compressible
+layer, turning one request-chunk's post-RoPE query/key (and optionally value)
+into ``[num_kv_heads, T]`` importance scores, higher = keep. Declared once here
+so the axis-2 registry can key off ``name`` and ``attach_scorers`` can rely on
+``name`` / ``consumes`` existing.
 
 FastKVZip is deliberately not a ``QKScorer``: it is checkpoint-backed and
-consumes ``hidden_states`` (not post-RoPE q/k), so it is loaded and delivered on
-a separate path. Only the gate-free scorers (SnapKV, KeyDiff, StreamingLLM,
-TOVA, ExpectedAttention) implement this base.
+consumes ``hidden_states``, so it loads and delivers on a separate path.
 """
 from __future__ import annotations
 
@@ -27,13 +23,12 @@ from vllm.v1.attention.compression.scorer_options import ScorerOption
 
 
 class QKScorer(nn.Module, ABC):
-    """Gate-free query/key importance scorer (compression axis 2).
+    """Gate-free query/key importance scorer (axis 2).
 
-    A subclass sets ``name`` (the ``compression_scorer`` value that selects it)
-    and implements ``forward``. ``consumes`` records which forward tensors the
-    scorer reads; ``"qk"`` — the inner ``Attention``'s post-RoPE query/key — is
-    the only value the gate-free scorers use (FastKVZip's ``hidden_states`` path
-    is separate), so it is the default and subclasses need not repeat it.
+    A subclass sets ``name``, the ``compression_scorer`` value that selects it,
+    and implements ``forward``. ``consumes`` names the tensors it reads;
+    ``"qk"`` is the only value a gate-free scorer uses, so it is the default and
+    a subclass need not repeat it.
     """
 
     #: ``compression_scorer`` value that selects this scorer (registry key).
@@ -41,10 +36,8 @@ class QKScorer(nn.Module, ABC):
     #: Forward tensors the scorer reads; ``"qk"`` for every gate-free scorer.
     consumes: str = "qk"
     #: Settings only this scorer understands, declared rather than wired
-    #: through configuration (see scorer_options.py). The declaration owns each
-    #: setting's default, accepted values and help text; the factory resolves
-    #: them and passes them to ``__init__`` as keyword arguments of the declared
-    #: name. A scorer with no settings leaves this empty.
+    #: through configuration: the declaration owns each default, accepted value
+    #: set and help text, and the factory resolves them into keyword arguments.
     OPTIONS: tuple[ScorerOption, ...] = ()
 
     @abstractmethod
@@ -64,45 +57,36 @@ class QKScorer(nn.Module, ABC):
 
     # --- Optional: scoring the whole cache, not just the fresh chunk ---------
     #
-    # ``forward`` scores one chunk as it is written; under a fixed budget an old
-    # position competes again and must be scorable now. A scorer whose score is
-    # a function of the cached keys sets ``rescores_cache`` and implements
-    # ``score_cached``; where every other scorer's score comes from is
-    # ``slot_scores.py``.
+    # ``forward`` scores a chunk as it is written, but under a fixed budget an
+    # old position competes again and must be scorable now. A scorer whose score
+    # is a function of the cached keys sets ``rescores_cache`` and implements
+    # ``score_cached``; ``slot_scores.py`` covers the rest.
 
-    #: Whether the scorer can rescore already-cached positions (``score_cached``
-    #: implemented). Read by ``slot_scores`` to pick the score source under a
-    #: fixed budget.
+    #: Whether ``score_cached`` is implemented, so already-cached positions can
+    #: be rescored. Read by ``slot_scores`` to pick the source under a budget.
     rescores_cache: bool = False
-    #: What ``score_cached`` needs materialised from the cache, as a subset of
-    #: ``RESCORE_INPUTS``. The runner builds exactly these and nothing else, so
-    #: a key-only method (KeyDiff) pays for one read while a method that also
-    #: needs values or positions can be added WITHOUT changing this contract
-    #: again. Empty unless ``rescores_cache`` is set.
+    #: What ``score_cached`` needs materialised, a subset of
+    #: ``RESCORE_INPUTS``. The runner builds exactly these, so a key-only method
+    #: pays for one read and one needing values changes no contract.
     rescore_inputs: tuple[str, ...] = ()
 
     def score_cached(self, cached: "CachedPositions") -> torch.Tensor:
         """Score every live position of ONE head group from the cache.
 
-        Args:
-            cached: the inputs this scorer declared in ``rescore_inputs``,
-                covering one head group's live slots in slot order.
+        ``cached`` holds the inputs this scorer declared in ``rescore_inputs``,
+        in slot order. Returns ``[page_group_size, num_positions]`` float32,
+        higher = keep, on the inputs' device.
 
-        Returns:
-            ``[page_group_size, num_positions]`` float32 scores, higher = more
-            important, on the same device as the inputs.
-
-        Only called when ``rescores_cache`` is set; the base raises so a scorer
-        that advertises the capability without implementing it fails loudly.
+        Called only when ``rescores_cache`` is set; the base raises so a scorer
+        advertising the capability without implementing it fails loudly.
         """
         raise NotImplementedError(
             f"{type(self).__name__} sets rescores_cache but does not implement "
             "score_cached.")
 
 
-#: Everything a rescoring scorer may ask the runner to materialise. Names are
-#: declared here rather than as bare strings at each site so a scorer, the
-#: runner that builds them and the tests agree on one vocabulary.
+#: Everything a rescoring scorer may ask the runner to materialise, named here
+#: rather than as bare strings so scorer, runner and tests share one vocabulary.
 RESCORE_KEYS = "keys"
 RESCORE_VALUES = "values"
 RESCORE_INPUTS: tuple[str, ...] = (RESCORE_KEYS, RESCORE_VALUES)
@@ -112,13 +96,12 @@ RESCORE_INPUTS: tuple[str, ...] = (RESCORE_KEYS, RESCORE_VALUES)
 class CachedPositions:
     """One head group's live cache slots, as a rescoring scorer sees them.
 
-    Only the fields the scorer declared in ``rescore_inputs`` are populated;
-    the rest are ``None``, so reading an undeclared field is a mistake that
-    surfaces immediately rather than a silently wrong score.
+    Only the fields declared in ``rescore_inputs`` are populated and the rest
+    are ``None``, so reading an undeclared one fails immediately instead of
+    scoring wrongly.
 
-    Slot order, not sequence order: eviction compacts survivors towards the
-    front, so slot ``i`` holds whatever token survived into it, and a slot's
-    global sequence position cannot be inferred from its index.
+    Slot order, NOT sequence order: eviction compacts survivors forward, so a
+    slot's global sequence position cannot be inferred from its index.
     """
     #: ``[page_group_size, num_positions, head_size]`` post-RoPE keys, one row
     #: per KV head (cluster column).

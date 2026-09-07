@@ -2,23 +2,18 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Gate-capture custom op for FastKVZip compression scoring.
 
-The FastKVZip gate scores an attention block's *input* hidden_states, but under
-torch.compile the module forward is inlined and its pre-hooks are skipped, so a
-hook cannot see those hidden_states. This module solves that with a custom op:
+The gate scores an attention block's INPUT hidden_states, which no hook can
+see: torch.compile inlines the module forward and skips its pre-hooks.
+``_wrap_forward_with_gate_capture`` therefore overrides the parent block's
+instance-level ``forward`` -- which dynamo does trace -- to call
+``vllm::tangram_gate_capture`` on those hidden_states first, so the call
+survives as an opaque graph node. The op is registered here as a
+piecewise-SPLITTING op, so its side effect runs eagerly between CUDA-graph
+pieces every step; it MUST stay in ``CompilationConfig._attention_ops`` or the
+capture is silently dropped.
 
-* :func:`_wrap_forward_with_gate_capture` overrides a parent attention block's
-  instance-level ``forward`` to call the ``vllm::tangram_gate_capture`` op with
-  the block's input hidden_states before running the real forward. dynamo
-  traces the instance forward (unlike a hook), so the op call survives as an
-  opaque graph node.
-* ``vllm::tangram_gate_capture`` (registered here) is a piecewise-splitting op,
-  so its Python side effect — handing hidden_states to the layer's capture fn —
-  runs eagerly between CUDA-graph pieces on every step. It MUST stay in
-  ``CompilationConfig._attention_ops`` for this to hold.
-
-``KVCompressor.attach_scorers`` wires each compressible layer's capture fn onto
-its inner ``Attention`` and calls :func:`_wrap_forward_with_gate_capture` on the
-outer block. Importing this module from the compressor is what registers the op.
+``KVCompressor.attach_scorers`` wires each layer's capture fn and calls the
+wrapper; importing this module from the compressor registers the op.
 """
 from __future__ import annotations
 
@@ -35,16 +30,15 @@ def _wrap_forward_with_gate_capture(parent: nn.Module, layer_name: str) -> None:
     """Install a ``vllm::tangram_gate_capture`` call in front of ``parent``'s
     forward via an instance-level forward override.
 
-    A forward pre-hook cannot be used: torch.compile inlines module forwards
-    and skips their hooks. An instance-level ``forward`` IS traced by dynamo
-    (``nn.Module.__call__`` resolves ``self.forward`` through the instance),
-    and the op call inside it becomes an opaque graph node that piecewise
-    compilation splits on, so the capture body runs eagerly on every step.
+    A pre-hook cannot work: torch.compile inlines module forwards and skips
+    their hooks. An instance-level ``forward`` IS traced, because
+    ``nn.Module.__call__`` resolves ``self.forward`` through the instance, and
+    the op call inside becomes an opaque node piecewise compilation splits on,
+    so the capture body runs eagerly every step.
 
-    ``layer_name`` identifies the layer's inner ``Attention`` in the forward
-    context; the op body reads the capture fn off it. The hidden_states
-    argument position is resolved once here — attention-block forwards differ
-    across models (e.g. ``(positions, hidden_states)`` for Qwen/Llama).
+    ``layer_name`` identifies the inner ``Attention`` the op body reads the
+    capture fn off. The hidden_states argument position is resolved once here,
+    since attention-block forwards differ across models.
     """
     if getattr(parent, "_tangram_gate_capture_wrapped", False):
         return
@@ -75,15 +69,15 @@ def tangram_gate_capture(hidden_states: torch.Tensor, layer_name: str) -> None:
     """Deliver an attention block's input hidden_states to the compression
     gate scorer (FastKVZip).
 
-    INVARIANT: this op must remain in ``CompilationConfig._attention_ops``
-    (piecewise splitting ops). Its entire purpose is the Python side effect of
-    scoring + stashing; a splitting op executes eagerly between CUDA-graph
-    pieces on every step, whereas an op captured inside a graph would run at
-    capture time only and be silently skipped on every replay.
+    INVARIANT: must remain in ``CompilationConfig._attention_ops``, the
+    piecewise splitting ops. Its whole purpose is the Python side effect of
+    scoring and stashing, and a splitting op runs eagerly between CUDA-graph
+    pieces every step -- one captured inside a graph would run at capture time
+    only and be silently skipped on every replay.
 
-    Declared as mutating ``hidden_states`` (it never actually writes) so the
-    schema neither aliases input to output nor lets the node be eliminated as
-    dead code; ``vllm::maybe_calc_kv_scales`` uses the same pattern.
+    Declared as mutating ``hidden_states``, which it never writes, so the schema
+    neither aliases input to output nor lets the node be dropped as dead code.
+    ``vllm::maybe_calc_kv_scales`` uses the same pattern.
     """
     forward_context = get_forward_context()
     capture = forward_context.no_compile_layers[layer_name].compression_gate_capture

@@ -2,48 +2,25 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """ExpectedAttention scorer — analytic expected-attention score (axis 2).
 
-Produces the same ``[num_kv_heads, chunk_len]`` score contract every scorer
-does. Ported faithfully from NVIDIA KVpress
-(``kvpress/presses/expected_attention_press.py``): it estimates, WITHOUT
-materialising an attention matrix, the attention each key is expected to
-receive from FUTURE (decode) queries, then (optionally) reweights by the value
-norm.
+Estimates the attention each key will draw from FUTURE decode queries without
+materialising an attention matrix. Ported from NVIDIA KVpress
+(``expected_attention_press.py``). Per query head, then averaged over the GQA
+group -- per-head statistics with the group average taken LAST, not one pooled
+per-KV-head distribution, is what matches the reference::
 
-Reference algorithm (per QUERY head, then averaged over the GQA group):
-  1. From the PRE-RoPE queries: mean ``mu`` and covariance ``Sigma`` over the
-     observed query positions (the first few chunk queries are dropped as
-     outliers; covariance is normalised by the number of query positions).
-  2. Apply the average RoPE rotation ``R`` of the next ``n_future_positions``
-     positions to anticipate where future queries sit.
-  3. logit(key) = (R·mu)·k / sqrt(d) + kᵀ(R·Sigma·Rᵀ)k / (2d)   [covariance opt]
-  4. prob = softmax(logit) over keys, then AVERAGE prob across the query heads
-     of each KV group (one score per KV head).
-  5. score = (prob + epsilon) * ||value||                        [vnorm opt]
+    mu, cov   = mean and covariance of the PRE-RoPE chunk queries
+    R         = average RoPE rotation of the next n_future_positions
+    logit(k)  = (R·mu)·k / sqrt(d) + kᵀ(R·cov·Rᵀ)k / (2d)
+    score(k)  = (softmax_k(logit) + eps) * ||v||
 
-The per-query-head statistics + group-averaged scores (NOT a single pooled
-per-KV-head distribution) are essential to match the reference; see kvpress's
-``repeat_kv`` + ``scores.view(...).mean(dim=2)``.
+Two algebraic identities keep this exact on post-RoPE inputs: the pre-RoPE query
+is recovered by un-rotating at the true global position (RoPE is orthogonal, and
+this preserves the model's pre-RoPE q-norm), and the keys are rotated by ``Rᵀ``
+rather than conjugating the covariance, since ``(R·mu)·k == mu·(Rᵀ·k)`` and
+``kᵀ(R·cov·Rᵀ)k == (Rᵀk)ᵀ·cov·(Rᵀk)``.
 
-tangram adaptations (all faithful within the chunk-based constraint):
-* The scorer receives POST-RoPE query/key/value (the reference recomputes
-  pre-RoPE queries from hidden_states). We recover the pre-RoPE query by
-  UN-ROTATING the post-RoPE query at its true global position — exact, since
-  RoPE is orthogonal, and it also preserves the model's q-norm (applied before
-  RoPE), so it is more faithful than re-projecting from hidden_states.
-* Instead of rotating ``mu``/``Sigma`` by ``R`` (which needs a dense [d,d]
-  conjugation of the covariance), we rotate the KEYS by ``Rᵀ`` — algebraically
-  identical because ``(R·mu)·k == mu·(Rᵀ·k)`` and
-  ``kᵀ(R·Sigma·Rᵀ)k == (Rᵀk)ᵀ·Sigma·(Rᵀk)``.
-* "Observed queries" are the current chunk's queries (prior chunks are paged
-  out); within the chunk every query is used (no observation window), matching
-  the reference's full-sequence mean, except the first few are dropped as
-  outliers exactly as the reference does (chunk-relative, ``_QUERY_OUTLIER_SINK``).
-
-RoPE access: the query/key scorer path passes the OUTER attention block as
-``module``; its ``module.rotary_emb`` (a vLLM ``RotaryEmbedding``) provides
-``cos_sin_cache``, ``rotary_dim``, and ``is_neox_style``. Models without that
-standard rotary (e.g. mRoPE / deepseek-scaling) are out of scope for this
-scorer.
+Needs a standard ``module.rotary_emb``; mRoPE and deepseek-scaling are out of
+scope.
 """
 from __future__ import annotations
 
@@ -63,17 +40,10 @@ logger = init_logger(__name__)
 
 
 class ExpectedAttentionScorer(QKScorer):
-    """One (stateless) instance shared across all compressible layers.
+    """Needs every argument of the shared contract: ``value`` for the norm
+    reweighting, ``module`` for its ``rotary_emb``, and ``position_offset`` to
+    un-rotate the queries at their true global positions."""
 
-    Input:  ``query [T, num_kv_heads * num_q_per_kv * head_size]``,
-            ``key   [T, num_kv_heads * head_size]``,
-            ``value [T, num_kv_heads * head_size]`` (post-RoPE, token-major),
-            plus ``module`` (outer attention block, owns ``rotary_emb``) and
-            ``position_offset`` (chunk's global start position).
-    Output: scores ``[num_kv_heads, T]`` (float32), higher = more important.
-    """
-
-    consumes = "qk"
     name = "expected_attention"
 
     #: First queries of each chunk dropped from the mean/covariance estimate as
@@ -187,10 +157,9 @@ class ExpectedAttentionScorer(QKScorer):
 
         # --- 3. average future-position rotation, applied to the keys as Rᵀ ---
         seq_end = position_offset + T
-        # The look-ahead window can run past the rotary cache near the model's
-        # max position; _cos_sin then clamps it, making the averaged future
-        # rotation approximate for the tail. Warn once (computed from ints, no
-        # device sync).
+        # Near the model's max position the look-ahead runs past the rotary
+        # cache and _cos_sin clamps it, so the averaged future rotation is
+        # approximate for the tail. Warned once, from ints, no device sync.
         rope_max = rotary_emb.cos_sin_cache.shape[0]
         if seq_end + self.n_future_positions > rope_max:
             logger.warning_once(

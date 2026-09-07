@@ -2,8 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Attention layer with FlashAttention."""
 
-import copy
-from dataclasses import dataclass, replace as dataclass_replace
+from dataclasses import dataclass
 from typing import ClassVar
 
 import numpy as np
@@ -34,6 +33,8 @@ if is_flash_attn_varlen_func_available():
         reshape_and_cache_flash,
     )
 from vllm.config import VllmConfig, get_current_vllm_config, get_layers_from_vllm_config
+from vllm.utils.platform_utils import is_pin_memory_available
+from vllm.v1.utils import CpuGpuBuffer
 from vllm.config.cache import CacheDType
 from vllm.distributed.parallel_state import get_dcp_group
 from vllm.logger import init_logger
@@ -42,13 +43,15 @@ from vllm.model_executor.layers.batch_invariant import (
 )
 from vllm.platforms.interface import DeviceCapability
 from vllm.utils.math_utils import cdiv
+from vllm.v1.attention.backends.layer_split import split_attention_layers
 from vllm.v1.attention.backends.ragged_layout import (
+    RaggedStepViews,
     as_virtual_block_view,
+    build_decode_layer_overlays,
     build_ragged_step_views,
     identity_member_maps,
     load_cluster_map,
     member_maps_from_cluster_map,
-    member_virtual_block_table,
     physical_member_maps_from_static_cluster_map,
     read_cluster_map_static_layer_ids,
 )
@@ -56,7 +59,6 @@ from vllm.v1.attention.backends.utils import (
     AttentionCGSupport,
     AttentionMetadataBuilder,
     CommonAttentionMetadata,
-    full_attention_layer_indices,
     get_dcp_local_seq_lens,
     get_kv_cache_layout,
 )
@@ -242,42 +244,14 @@ class FlashAttentionMetadata:
 
     causal: bool = True
 
-    # Ragged paging fields. Inactive when
-    # ``num_head_groups_per_layer == 0``. A sequence is one (req, KV-head)
-    # member (member row ``m = L * num_kv_heads + h``), not (req, group).
-    #
-    # Each attention call builds its own layer's virtual block table on demand
-    # (``member_virtual_block_table``); the all-member table is never stored, as
-    # it replicates the physical table page_group_size-fold and dominates peak
-    # memory at long context. Stored inputs:
-    #     cluster_block_table  [num_reqs, num_clusters_total, max_blocks]
-    #     clusters_per_layer   [num_layers, num_kv_heads]  (member -> cluster)
-    #     cols_per_layer       [num_layers, num_kv_heads]  (member -> column)
-    #     layer block table = phys_block[req, cluster] * page_group_size + column
-    #
-    # ``seq_lens_grouped`` / ``slot_mapping_grouped`` have no block axis, so they
-    # keep the all-member form; layout selected by ``ragged_decode_layout``:
-    #   False (prefill / mixed) — member-major:
-    #     seq_lens_grouped     [num_members_total, num_reqs]
-    #     slot_mapping_grouped [num_members_total, num_actual_tokens]
-    #     Per-layer slice ``[L*num_kv_heads : (L+1)*num_kv_heads]`` -> varlen.
-    #   True (uniform decode, ``max_query_len == 1``) — req-major + layer axis:
-    #     seq_lens_grouped     [num_layers, num_reqs, num_kv_heads]
-    #     slot_mapping_grouped [num_layers, num_reqs, num_kv_heads]
-    num_head_groups_per_layer: int = 0
-    cluster_block_table: torch.Tensor | None = None
-    clusters_per_layer: torch.Tensor | None = None
-    cols_per_layer: torch.Tensor | None = None
-    page_group_size: int = 0
-    seq_lens_grouped: torch.Tensor | None = None
-    slot_mapping_grouped: torch.Tensor | None = None
-    # cu_seqlens for the (num_kv_heads × num_reqs) member sequences per
-    # layer; shape ``[num_kv_heads × num_reqs + 1]``.
-    query_start_loc_grouped: torch.Tensor | None = None
-    ragged_decode_layout: bool = False
-    # Per-layer ``FlashAttentionMetadata`` overlays for the decode fast
-    # path; pre-built so attention avoids ``dataclass_replace`` in the
-    # hot loop.
+    # Ragged paging. ``None`` when it is off, and its presence is the
+    # discriminator -- a sequence is then one (req, KV-head) member rather than
+    # one request, and the fields above describe the base layout only. The views
+    # and their layouts are documented on ``RaggedStepViews``.
+    ragged: RaggedStepViews | None = None
+    # Per-layer overlays (``ragged_layout.layer_overlay``) for the decode fast
+    # path, pre-built by the builder so attention picks its layer with a list
+    # lookup.
     per_layer_md: list | None = None
 
 
@@ -411,6 +385,10 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
             )
             self._member_to_cluster: torch.Tensor | None = None
             self._member_to_col: torch.Tensor | None = None
+            # Per-cluster sequence lengths cross to the device through this
+            # pinned pair each step, so the build never waits on the stream.
+            # Sized on the first build, from the block table's cluster axis.
+            self._seq_lens_cluster_buf: CpuGpuBuffer | None = None
         else:
             self._num_head_groups_per_layer = 0
             self._page_group_size = 0
@@ -475,9 +453,10 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
         """Physical indices of the full-attention (compressible) layers in this
         KV cache group.
 
-        Uses the shared ``full_attention_layer_indices`` so this set is the SAME
-        one the compression engine compresses (``gpu_model_runner.
-        _init_compression``) — the two cannot drift. The cluster map's layer
+        Uses the shared ``split_attention_layers`` so this set is the SAME one
+        the compression engine compresses
+        (``CompressionModelRunnerMixin._init_compression``) — the two cannot
+        drift. The cluster map's layer
         axis is physical-major, so each layer's position in ``self.layer_names``
         must equal its physical index; that is asserted here so any reordering
         surfaces loudly instead of silently mis-mapping KV."""
@@ -490,7 +469,7 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
                     f"ragged KV group layer order mismatch: position "
                     f"{pos} is physical layer {phys}. The cluster map's layer "
                     f"axis assumes position == physical layer index.")
-        return [i for i in full_attention_layer_indices(self.vllm_config)
+        return [i for i in split_attention_layers(self.vllm_config).full
                 if i < num_layers_local]
 
     def _assert_static_layer_ids_match_map(
@@ -676,13 +655,20 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
             scheduler_metadata = self.scheduler_metadata[:n]
 
         # Precompute the ragged-paging per-step views consumed by
-        # ``layer.py::_ragged_attention_impl`` (the body of the
+        # ``_ragged_attention_impl`` (the body of the
         # ``vllm::unified_attention_ragged`` custom op). The layout arithmetic
         # lives in ``ragged_layout.build_ragged_step_views`` so a second
         # attention backend can reuse it; the builder supplies only its cached
         # member-map resolver and this step's raw tensors.
-        ragged_decode_layout = False
+        views = None
         if self._ragged:
+            needed = (block_table_tensor.shape[1]
+                      * self.vllm_config.scheduler_config.max_num_seqs)
+            if (self._seq_lens_cluster_buf is None
+                    or self._seq_lens_cluster_buf.gpu.numel() < needed):
+                self._seq_lens_cluster_buf = CpuGpuBuffer(
+                    needed, dtype=torch.int32, device=self.device,
+                    pin_memory=is_pin_memory_available())
             views = build_ragged_step_views(
                 block_table_tensor=block_table_tensor,
                 slot_mapping=slot_mapping,
@@ -692,6 +678,7 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
                 effective_seq_lens_cpu=(
                     common_attn_metadata.effective_seq_lens_cpu),
                 num_reqs=num_reqs,
+                seq_lens_cluster_staging=self._seq_lens_cluster_buf,
                 num_actual_tokens=num_actual_tokens,
                 max_query_len=max_query_len,
                 max_seq_len=max_seq_len,
@@ -701,21 +688,6 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
                 num_kv_heads_per_layer=self._num_kv_heads_per_layer,
                 member_maps_fn=self._member_maps,
             )
-            num_layers_local = views.num_layers_local
-            ragged_decode_layout = views.ragged_decode_layout
-            cluster_block_table = views.cluster_block_table
-            clusters_per_layer = views.clusters_per_layer
-            cols_per_layer = views.cols_per_layer
-            seq_lens_grouped = views.seq_lens_grouped
-            slot_mapping_grouped = views.slot_mapping_grouped
-            query_start_loc_grouped = views.query_start_loc_grouped
-        else:
-            cluster_block_table = None
-            clusters_per_layer = None
-            cols_per_layer = None
-            seq_lens_grouped = None
-            slot_mapping_grouped = None
-            query_start_loc_grouped = None
 
         attn_metadata = FlashAttentionMetadata(
             num_actual_tokens=num_actual_tokens,
@@ -736,44 +708,14 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
             prefix_scheduler_metadata=prefix_scheduler_metadata,
             max_num_splits=max_num_splits,
             causal=causal,
-            num_head_groups_per_layer=self._num_head_groups_per_layer,
-            cluster_block_table=cluster_block_table,
-            clusters_per_layer=clusters_per_layer,
-            cols_per_layer=cols_per_layer,
-            page_group_size=self._page_group_size,
-            seq_lens_grouped=seq_lens_grouped,
-            slot_mapping_grouped=slot_mapping_grouped,
-            query_start_loc_grouped=query_start_loc_grouped,
-            ragged_decode_layout=ragged_decode_layout,
+            ragged=views,
         )
-        if ragged_decode_layout:
-            # Pre-build per-layer overlays so the attention layer picks
-            # the right metadata with a single list lookup. One sequence per
-            # (request, KV-head member) now that members are per-head.
-            num_virtual_seqs = num_reqs * self._num_kv_heads_per_layer
-            # Shallow ``copy.copy`` + field overwrite, not ``dataclass_replace``:
-            # replace() re-runs __init__ over every field, which is pure-Python
-            # overhead paid num_layers times per decode step (on the eager
-            # critical path). copy.copy clones __dict__ and we overwrite only the
-            # five per-layer fields; the rest are shared (read-only) references.
-            per_layer_md = []
-            for layer_idx in range(num_layers_local):
-                layer_md = copy.copy(attn_metadata)
-                layer_md.num_actual_tokens = num_virtual_seqs
-                # This layer's virtual block table, built on demand:
-                # [num_reqs, num_kv_heads, max_blocks] ->
-                # [num_reqs * num_kv_heads, max_blocks].
-                layer_md.block_table = member_virtual_block_table(
-                    cluster_block_table, clusters_per_layer[layer_idx],
-                    cols_per_layer[layer_idx], self._page_group_size,
-                    cluster_axis=1).reshape(num_virtual_seqs, -1)
-                layer_md.seq_lens = seq_lens_grouped[layer_idx].view(
-                    num_virtual_seqs)
-                layer_md.slot_mapping = slot_mapping_grouped[
-                    layer_idx].reshape(-1)
-                layer_md.query_start_loc = query_start_loc_grouped
-                per_layer_md.append(layer_md)
-            attn_metadata.per_layer_md = per_layer_md
+        if views is not None and views.ragged_decode_layout:
+            attn_metadata.per_layer_md = build_decode_layer_overlays(
+                attn_metadata, views,
+                num_reqs=num_reqs,
+                num_kv_heads_per_layer=self._num_kv_heads_per_layer,
+            )
         return attn_metadata
 
     def use_cascade_attention(self, *args, **kwargs) -> bool:
@@ -913,7 +855,7 @@ class FlashAttentionImpl(AttentionImpl):
             )
 
         # For decoder and cross-attention, use KV cache as before
-        if attn_metadata.num_head_groups_per_layer > 0:
+        if attn_metadata.ragged is not None:
             # Ragged column-major page: present the cache as the
             # standard single-KV-head paged layout over virtual blocks
             # (virtual_block = physical_block * page_group_size + column).
@@ -1097,15 +1039,14 @@ class FlashAttentionImpl(AttentionImpl):
         """
         sinks = self.sinks.to(torch.float32)
 
-        if attn_metadata.num_head_groups_per_layer > 0:
+        if attn_metadata.ragged is not None:
             # Head-group (column-major) paging: each varlen sequence is one KV
             # head carrying its GQA group of query heads. ``output`` rows are
             # member-major, so a row encodes (kv_head, token) and a column is
             # the query head within that group; the global query head is
             # ``kv_head * query_heads_per_kv + column``. The row→kv_head map
-            # depends on how
-            # vllm/attention/layer.py::_ragged_attention_impl
-            # flattened the tensors:
+            # depends on how ``_ragged_attention_impl`` flattened the
+            # tensors:
             #   - uniform decode fast path: row = token * num_kv_heads + kv_head
             #     (kv_head varies fastest)        -> tile the [kv, head] grid
             #   - prefill / mixed member-major  : row = kv_head * tokens + token
@@ -1114,7 +1055,7 @@ class FlashAttentionImpl(AttentionImpl):
             num_kv_heads = self.num_kv_heads
             tokens_per_member = num_actual_tokens // num_kv_heads
             sink_grid = sinks.view(num_kv_heads, query_heads)
-            if attn_metadata.ragged_decode_layout:
+            if attn_metadata.ragged.ragged_decode_layout:
                 sink_rows = sink_grid.repeat(tokens_per_member, 1)
             else:
                 sink_rows = sink_grid.repeat_interleave(tokens_per_member, dim=0)

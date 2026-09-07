@@ -216,10 +216,8 @@ hip_compat.h
 benchmarks/**/*.json
 
 # Tangram benchmark result outputs
-benchmarks/tangram/results_*/
+benchmarks/**/results_*/
 benchmarks/tangram/ruler_summary*.txt
-examples/tangram/benchmark_results.jsonl
-examples/tangram/online_serving.sh
 
 # Tangram figure/profile artifacts (plots, scripts, intermediate profiles)
 benchmarks/tangram/data/

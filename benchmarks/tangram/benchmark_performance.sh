@@ -1,32 +1,20 @@
 #!/usr/bin/env bash
-# SCBench performance (throughput / latency) across compression ratios for one
-# method. Sibling of benchmark_scbench.sh — same method-selection knobs, but
-# the performance protocol instead of the accuracy protocol.
+# SCBench throughput / latency for one compression method. Same knobs as
+# benchmark_scbench.sh, performance protocol instead of accuracy: single-turn,
+# every request emitting exactly MAX_TOKENS, so decode work is identical across
+# settings and only engine cost varies. ratio=0 is the uncompressed reference.
 #
-# Performance protocol (apples-to-apples throughput):
-#   * single-turn          — context + first question only (--single-turn)
-#   * exact token budget   — every request emits MAX_TOKENS (--force-exact-tokens)
-#   * fixed --max-tokens   — so decode work is identical across ratios/methods
-#
-# This isolates the engine cost (prefill + decode + compression overhead) from
-# answer-length variance. ratio=0 (evict nothing) is the uncompressed
-# reference; uniform vs non-uniform differ only at ratio>0.
-#
-# Select the method with two knobs:
 #   SCORER  = fastkvzip | snapkv | keydiff | streamingllm | tova | expected_attention
-#   SCOPE   = layer (per-layer budget, pooled across its head groups; default,
-#             needs a per-layer cluster map)
-#           | global (one budget pooled across all layers and head groups;
-#             needs a global cluster map)
-#           | uniform (same kept count per (layer, group))
-# Results land in performance_results/<scorer>_<selection>/ so methods stay
-# separate, mirroring results_accuracy/.
+#   SCOPE   = layer (default) | global | uniform      # axis 1, see budget_scope.py
+#
+# Results land in performance_results/<scorer>_<selection>/, mirroring
+# results_accuracy/.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
-# Force spawn: vLLM V1's engine core forks by default; CUDA touched in the driver
-# makes the fork raise "Cannot re-initialize CUDA".
+
+# The driver touches CUDA, and a forked engine core cannot re-initialize it.
 export VLLM_WORKER_MULTIPROC_METHOD="${VLLM_WORKER_MULTIPROC_METHOD:-spawn}"
 # Prepend the repo root so this checkout shadows any pip-installed vLLM.
 export PYTHONPATH="${REPO_ROOT}:${PYTHONPATH:-}"
@@ -39,7 +27,6 @@ PYTHON=${PYTHON:-python3}
 
 # ---- Method --------------------------------------------------------------
 SCORER=${SCORER:-snapkv}
-# Budget scope (axis 1): uniform | layer | global.
 SCOPE=${SCOPE:-layer}
 
 # ---- Sweep ---------------------------------------------------------------
@@ -48,48 +35,38 @@ RATIOS=${RATIOS:-"0.0 0.7"}
 NUM=${NUM:-10}
 MAX_NUM_SEQS=${MAX_NUM_SEQS:-16}
 MAX_TOKENS=${MAX_TOKENS:-512}
-# Fraction of GPU memory the engine may claim; the leftover after weights is the
-# KV pool. Raise it when a long-context model cannot fit one full-length request
-# (e.g. gemma-3-12b at 124k needs ~46 GiB of KV, just over what 0.90 leaves).
+# Raise it when one full-length request does not fit: gemma-3-12b at 124k needs
+# ~46 GiB of KV, just over what 0.90 leaves.
 GPU_MEM_UTIL=${GPU_MEM_UTIL:-0.90}
 
-# Page-group size is 4 for every method; PAGE_GROUP_SIZE overrides it (the
-# fastkvzip cluster map below must then match the chosen page group).
+# ---- Args ----------------------------------------------------------------
+SELECTION="${SCOPE}"
+# A cluster map must match the page group it was built for.
 PAGE_GROUP_SIZE=${PAGE_GROUP_SIZE:-4}
-
-# ---- Method-specific args ------------------------------------------------
 METHOD_ARGS=(--compression-scorer "${SCORER}"
              --compression-budget-scope "${SCOPE}")
-SELECTION="${SCOPE}"
 
-case "${SCORER}" in
-    fastkvzip)
-        # Gate-based; the gate auto-resolves from the model. The head-group
-        # cluster map (if provided) is applied by the common block below.
-        :
-        ;;
-    snapkv)
-        # Gate-free observation-window attention. SnapKV knobs travel through
-        # the generic channel: SCORER_OPTIONS="window=32,kernel=7".
-        ;;
-    keydiff|streamingllm|tova|expected_attention)
-        # Gate-free, identity adjacency, no extra arguments (the scorer reads
-        # its hyperparameters from the benchmark defaults).
-        ;;
-    *)
-        echo "Unknown SCORER='${SCORER}' (use fastkvzip|snapkv|keydiff|streamingllm|tova|expected_attention)" >&2
-        exit 1
-        ;;
-esac
+# Append "<flag> <value>" only when the value is set. An unknown SCORER needs no
+# check here — argparse rejects it against the same list, and CacheConfig
+# against the scorer registry.
+opt() { if [ -n "${2:-}" ]; then METHOD_ARGS+=("$1" "$2"); fi; }
 
-# Scorer-declared settings as key=value,key=value (see the scorer's OPTIONS).
-if [ -n "${SCORER_OPTIONS:-}" ]; then
-    METHOD_ARGS+=(--compression-scorer-options "${SCORER_OPTIONS}")
+# fastkvzip only; unset lets the engine auto-resolve the gate.
+opt --compression-gate-path "${GATE_PATH:-}"
+opt --compression-scorer-options "${SCORER_OPTIONS:-}"
+# Per-entry keep floor. Unset leaves the engine default; 0 lets a weak head
+# group be emptied, which is what the speedup presets were calibrated with.
+opt --compression-floor-min "${FLOOR_MIN:-}"
+# The engine's periodic stats logger is the only source of the preemption count
+# and the peak KV occupancy -- neither reaches the result JSON. Off by default
+# so a standalone run stays readable; the speedup harness turns it on and reads
+# the captured log back.
+LOG_STATS=${LOG_STATS:-0}
+if [ "${LOG_STATS}" = "1" ]; then
+    METHOD_ARGS+=(--enable-log-stats)
 fi
-
-# Head-group cluster map (applies to ANY scorer). The runner resolves a
-# per-scorer map and exports HEAD_GROUP_CLUSTER_MAP; a missing/sentinel path
-# (file does not exist) falls back to identity adjacency.
+# A .npz from tools/head_group_clustering; unset or missing falls back to
+# identity (adjacent-head) grouping.
 if [ -n "${HEAD_GROUP_CLUSTER_MAP:-}" ] && [ -f "${HEAD_GROUP_CLUSTER_MAP}" ]; then
     METHOD_ARGS+=(--head-group-cluster-map "${HEAD_GROUP_CLUSTER_MAP}")
 fi
@@ -98,25 +75,35 @@ OUTPUT_DIR=${OUTPUT_DIR:-"${SCRIPT_DIR}/performance_results/${SCORER}_${SELECTIO
 # ---- Run -----------------------------------------------------------------
 for RATIO in ${RATIOS}; do
     echo "===== ${SCORER} ${SELECTION}  dataset=${DATASET}  ratio=${RATIO} ====="
-    CUDA_VISIBLE_DEVICES="${GPU_ID}" "$PYTHON" "${SCRIPT_DIR}/benchmark_scbench.py" \
-        -d "${DATASET}" \
-        --num "${NUM}" \
-        --compression-ratio "${RATIO}" \
-        --max-num-seqs "${MAX_NUM_SEQS}" \
-        --gpu-memory-utilization "${GPU_MEM_UTIL}" \
-        --page-group-size "${PAGE_GROUP_SIZE}" \
-        --max-tokens "${MAX_TOKENS}" \
-        --single-turn \
-        --force-exact-tokens \
-        "${METHOD_ARGS[@]}" \
-        -m "${MODEL}" \
-        --max-model-len "${MAX_LEN}" \
-        --output-dir "${OUTPUT_DIR}"
+    RUN=("$PYTHON" "${SCRIPT_DIR}/benchmark_scbench.py"
+         -d "${DATASET}"
+         --num "${NUM}"
+         --compression-ratio "${RATIO}"
+         --max-num-seqs "${MAX_NUM_SEQS}"
+         --gpu-memory-utilization "${GPU_MEM_UTIL}"
+         --page-group-size "${PAGE_GROUP_SIZE}"
+         --max-tokens "${MAX_TOKENS}"
+         --single-turn
+         --force-exact-tokens
+         "${METHOD_ARGS[@]}"
+         -m "${MODEL}"
+         --max-model-len "${MAX_LEN}"
+         --output-dir "${OUTPUT_DIR}")
+
+    # The log lands beside this ratio's result JSON, one file per ratio, so a
+    # reader can attribute preemptions to the ratio that caused them.
+    if [ "${LOG_STATS}" = "1" ]; then
+        mkdir -p "${OUTPUT_DIR}/${DATASET}"
+        CUDA_VISIBLE_DEVICES="${GPU_ID}" "${RUN[@]}" 2>&1 \
+            | tee "${OUTPUT_DIR}/${DATASET}/engine_r${RATIO}.log"
+        continue
+    fi
+
+    CUDA_VISIBLE_DEVICES="${GPU_ID}" "${RUN[@]}"
 done
 
 # ---- Performance summary -------------------------------------------------
-# Compact per-(dataset, ratio) table read back from the saved JSON: wall-clock
-# and total-token throughput.
+# Wall-clock and total-token throughput, read back from the saved JSON.
 echo ""
 echo "===== performance summary: ${SCORER} ${SELECTION} ====="
 "$PYTHON" - "${OUTPUT_DIR}" <<'PY'

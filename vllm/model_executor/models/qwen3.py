@@ -139,15 +139,8 @@ class Qwen3Attention(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
-        # Ragged paging needs contiguous Q/K/V; see
-        # vllm/model_executor/models/llama.py:LlamaAttention.forward.
-        if self.attn.num_groups_per_layer > 0:
-            q, k, v = self.qkv_proj.forward_split(hidden_states)
-        else:
-            qkv, _ = self.qkv_proj(hidden_states)
-            q, k, v = qkv.split(
-                [self.q_size, self.kv_size, self.kv_size], dim=-1
-            )
+        q, k, v = self.qkv_proj.forward_qkv(
+            hidden_states, self.attn.num_groups_per_layer)
         # Add qk-norm
         q_by_head = q.view(*q.shape[:-1], q.shape[-1] // self.head_dim, self.head_dim)
         q_by_head = self.q_norm(q_by_head)

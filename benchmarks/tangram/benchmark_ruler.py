@@ -1,20 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""
-Offline RULER benchmark for Tangram on vLLM.
+"""Offline RULER benchmark for Tangram on vLLM — answer quality under
+compression, plus the SCBench driver's latency/throughput aggregates.
 
-Measures answer quality (and the same latency/throughput aggregates as the
-SCBench driver) on RULER synthetic long-context tasks while sweeping the
-FastKVZip compression ratio. RULER is single-turn: each sample is one
-context+question prompt scored against its gold items with RULER's string-match
-metric (recall for retrieval/tracking/extraction, any-match for QA).
+Single-turn: each sample is one context+question prompt, scored with RULER's
+string-match metric (recall for retrieval/tracking/extraction, any-match for
+QA). Engine construction and reporting are shared with benchmark_scbench.py via
+``bench_common``; data and scoring come from ``ruler_local`` (the preprocessed
+``simonjegou/ruler`` parquets).
 
-The engine construction, compression knobs, and latency/throughput reporting are
-shared with benchmark_scbench.py via ``bench_common``. RULER data loading, prompt
-assembly, and scoring are provided self-contained by ``ruler_local`` (the
-preprocessed ``simonjegou/ruler`` parquets; no external RULER checkout required).
-
-Example:
     python benchmark_ruler.py --length 4096 --num 50 --compression-ratio 0.7 \\
         -m Qwen/Qwen3-4B-Instruct-2507 --max-model-len 40960
 """
@@ -123,6 +117,21 @@ def run_task(
     outputs = llm.generate(prompts, sampling_params)
     elapsed_seconds = time.perf_counter() - start
     print(f"  Generation took {elapsed_seconds:.2f}s")
+
+    # Preemption count, so a result file says whether the run went through the
+    # preempt-and-refill paths at all. ``get_metrics`` asserts when stats are
+    # off, so a run without --enable-log-stats records None rather than a
+    # misleading zero. The counter spans the whole engine, and one engine
+    # serves every task of a sweep, so the value is cumulative.
+    preemptions = None
+    if args.enable_log_stats:
+        preemptions = next(
+            (int(getattr(metric, "value", 0)) for metric in llm.get_metrics()
+             if metric.name == "vllm:num_preemptions"),
+            0,
+        )
+    if preemptions is not None:
+        print(f"  Preemptions so far this engine: {preemptions}")
 
     scores: list[float] = []
     per_sample: list[dict[str, Any]] = []
@@ -236,12 +245,18 @@ def run_task(
         # so a result file that omitted them could not be compared later.
         "scorer_options": args.compression_scorer_options,
         "compression_chunk_size": args.compression_chunk_size,
+        "compression_window_size": args.compression_window_size,
+        "compression_floor_min": args.compression_floor_min,
+        "compression_n_sink_tokens": args.compression_n_sink_tokens,
         "page_group_size": args.page_group_size,
         "max_tokens": max_tokens,
         "metric": metric_name(task),
         "num_samples": len(per_sample),
         "avg_score": round(avg_score, 4),
         "generation_time_sec": round(elapsed_seconds, 4),
+        # None when the run disabled stats; otherwise cumulative over every
+        # task this engine has served (see where it is read).
+        "preemptions_cumulative": preemptions,
         "benchmark": benchmark,
         "scores": [float(s) for s in scores],
         "per_sample": per_sample,
@@ -292,10 +307,9 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--tag", type=str, default="")
     parser.add_argument(
         "--skip-existing", action="store_true",
-        help="Resume mode: skip any task whose result JSON already exists for "
-             "this (length, ratio, page_group). If every task is already done, "
-             "the model is not loaded. Lets an interrupted sweep be re-run with "
-             "the same command to fill only the missing cells.",
+        help="Skip tasks whose result JSON already exists, so an interrupted "
+             "sweep re-run with the same command fills only the missing "
+             "cells. Nothing pending skips the model load too.",
     )
 
     return parser

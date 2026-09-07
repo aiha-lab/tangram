@@ -2,38 +2,18 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Preallocated GPU memory for the KV-compression keep decision.
 
-Every tensor the keep decision needs is allocated ONCE here, from sizes that
-follow from the configuration alone, and is then reused for the lifetime of the
-engine. Nothing in the compression path allocates a decision-sized tensor while
-requests are in flight. This matters for two reasons:
+Every decision-sized tensor is allocated once from the configuration alone, so
+nothing here allocates while requests are in flight. Growing on demand would
+scale with how many requests happen to be mid-prefill, which no startup check
+can bound.
 
-* The worker profiles peak memory AFTER ``load_model`` and sizes the KV cache
-  pool with whatever is left (``GPUWorker.determine_available_memory``). This
-  workspace is built inside ``load_model``, so the profile SEES it and the pool
-  shrinks accordingly. A budget or concurrency too large for the device then
-  fails at startup, with the reservation printed, instead of surviving startup
-  and hitting an out-of-memory error mid-generation.
-* Growing per-request buffers on demand would scale with how many requests
-  happen to be mid-prefill — a quantity no startup check can bound. Splitting
-  the memory into "shared, reused within a step" and "one row per concurrent
-  request" makes both parts exactly bounded (see below).
+The reservation lands in the weights term of the worker's memory profile, so
+the KV pool shrinks by it and a configuration too large for the device fails at
+startup rather than mid-generation.
 
-Two lifetimes, and the distinction is the whole design:
-
-* **Shared, step-local.** The eval-region scores and the position ranking are
-  produced by ``prepare_keep_decision`` and consumed by the executor's writeback
-  within the SAME iteration of the runner's per-request loop. So one copy serves
-  every request, no matter how many close a compression boundary in one step,
-  and this part does NOT scale with ``max_num_seqs``.
-* **Per row, persists across steps.** Scores accumulated across a chunk that the
-  scheduler split over several forward steps, the per-(layer, group) lengths, and
-  (budget regime only) the per-position statistics buffer must survive between
-  steps, so each active request holds one row. This part scales with
-  ``max_num_seqs`` and is the term to watch when sizing a run.
-
-Rows are handed out by an allocator private to this class rather than being
-indexed by the ``InputBatch`` row: the input batch compacts its rows when a
-request finishes, which would silently reassign another request's buffers.
+Rows come from an allocator private to this class, not the ``InputBatch`` row
+index: the input batch compacts its rows when a request finishes, which would
+hand one request's buffers to another.
 """
 from __future__ import annotations
 
@@ -44,7 +24,13 @@ import numpy as np
 import torch
 
 from vllm.logger import init_logger
+from vllm.v1.attention.compression.budget_scope import (
+    POOLED_BUDGET_SCOPES,
+)
 from vllm.v1.attention.compression.scorer import QK_SCORERS
+from vllm.v1.attention.compression.slot_scores import (
+    slot_scores_persist_across_steps,
+)
 
 if TYPE_CHECKING:
     from vllm.config.cache import CacheConfig
@@ -58,10 +44,9 @@ _MIB = 1024.0 * 1024.0
 class WorkspaceSpec:
     """Shapes the workspace is built from, all known at startup.
 
-    ``eval_capacity`` and ``slot_capacity`` are the WIDEST values the active
-    eviction regime can produce; the regime's own geometry is checked against
-    them at runtime, so a shape that would have overflowed raises instead of
-    silently reallocating.
+    ``eval_capacity`` and ``slot_capacity`` are the WIDEST the active regime
+    can produce, and its geometry is checked against them at runtime, so an
+    overflowing shape raises instead of silently reallocating.
     """
     num_layers: int
     num_kv_heads: int          # per tensor-parallel rank
@@ -75,9 +60,21 @@ class WorkspaceSpec:
     #: Widest live cache length per (layer, group); 0 when the regime keeps no
     #: per-position statistics (the ratio regime).
     slot_capacity: int
-    #: dtype the active scorer produces. Held exactly, not coerced: the gate
-    #: (FastKVZip) emits the model dtype while the query/key scorers emit
-    #: float32, and rounding either way would change the keep decision.
+    #: Most one entry may hold after a keep decision, 0 under the ratio regime.
+    #: ``budget`` when the scope holds every entry to it, ``max_model_len`` when
+    #: it pools -- one entry may then take the whole span, so only the physical
+    #: limit bounds it. The keep decision reads this back as its ceiling, so
+    #: buffer width and decision cannot disagree.
+    per_group_capacity: int
+    #: Budget scope ``per_group_capacity`` was derived from, so the compressor
+    #: can refuse a scope the workspace was not sized for: a pooling scope on a
+    #: ``uniform``-sized buffer silently caps every entry at ``budget`` again.
+    budget_scope: str
+    #: Rows of per-position statistics: ``max_num_reqs`` when the source keeps
+    #: scores between steps, 1 when it rewrites every live slot, 0 when none.
+    slot_rows: int
+    #: dtype the active scorer produces, held exactly: the gate emits the model
+    #: dtype and qk scorers float32, and rounding would change the decision.
     score_dtype: torch.dtype
 
     @staticmethod
@@ -103,7 +100,9 @@ class WorkspaceSpec:
             n_sink_tokens=cache_config.compression_n_sink_tokens,
             budget_tokens=cache_config.compression_budget_tokens,
             evict_current_chunk=cache_config.compression_evict_current_chunk,
+            budget_scope=cache_config.compression_budget_scope,
             scorer=cache_config.compression_scorer,
+            slot_score_source=cache_config.compression_slot_score_source,
         )
 
     @staticmethod
@@ -121,39 +120,50 @@ class WorkspaceSpec:
         budget_tokens: int | None,
         evict_current_chunk: bool,
         scorer: str,
+        slot_score_source: str,
+        budget_scope: str = "uniform",
     ) -> "WorkspaceSpec":
         """Derive the shapes from the cache configuration.
 
-        The bounds below are the ones the regimes guarantee
-        (``eviction_regime.py``); each is asserted at runtime rather than
-        trusted.
+        The bounds the regimes guarantee, each asserted at runtime rather than
+        trusted. Under the ratio regime the eval region is the previous window
+        plus the fresh chunk, never over one chunk, and no statistics are kept.
+        Under a budget every entry is held to ``per_group_capacity``, so the
+        live length before the next eviction is at most that plus a chunk, and
+        the eval region is the live cache minus sink and protected tail.
 
-        Ratio regime — the eval region is the previous chunk's window plus the
-        fresh chunk, addressed in a ``window + chunk`` staging buffer, so it can
-        never exceed one chunk. No per-position statistics are kept.
-
-        Budget regime — the keep decision caps every (layer, group) at
-        ``budget``, so the live length before the next eviction is at most
-        ``budget + chunk``. A budget at or above ``max_model_len`` can never
-        trigger eviction, so the live length is bounded by the model length
-        instead and the capacity is clamped to it. The eval region is the live
-        cache minus the sink and the protected tail: with the fresh chunk
-        protected the two chunk terms cancel and it is at most
-        ``budget - sink``; with only the recent window protected the chunk stays
-        in and it is at most ``budget + chunk - sink``.
+        That capacity is ``budget`` under ``uniform``, which caps each entry,
+        and ``max_model_len`` under a POOLING scope, which holds only the span's
+        total and lets one entry take it all -- the ceiling must be physical or
+        the reservation decides the outcome.
         """
         if budget_tokens is None:
             eval_capacity = chunk_size
             slot_capacity = 0
+            slot_rows = 0
+            per_group_capacity = 0
         else:
-            effective_budget = min(int(budget_tokens), int(max_model_len))
-            slot_capacity = effective_budget + chunk_size
+            # A pooling scope holds only its span's TOTAL, so nothing stops
+            # one entry taking it all. The only non-arbitrary ceiling is the
+            # physical one, so sizing for that keeps the reservation from
+            # deciding the outcome. ``uniform`` keeps the tight ``budget``.
+            per_group_capacity = int(max_model_len)
+            if budget_scope not in POOLED_BUDGET_SCOPES:
+                per_group_capacity = min(
+                    int(budget_tokens), per_group_capacity)
+            slot_capacity = per_group_capacity + chunk_size
             eval_capacity = (slot_capacity - n_sink_tokens
                              if evict_current_chunk
-                             else effective_budget - n_sink_tokens)
+                             else per_group_capacity - n_sink_tokens)
             eval_capacity = max(eval_capacity, 0)
-        # Query/key scorers promote to float32 for a stable reduction; the
-        # checkpoint-backed gate scores in the model dtype.
+            # A recomputing source holds nothing between steps, so one buffer
+            # does rather than one per request -- the largest term here. From
+            # the knobs, the scorer being installed after this runs.
+            slot_rows = (max_num_reqs
+                         if slot_scores_persist_across_steps(
+                             scorer, slot_score_source)
+                         else 1)
+        # qk scorers need float32 for a stable reduction; the gate does not.
         score_dtype = (torch.float32
                        if scorer in QK_SCORERS else model_dtype)
         return WorkspaceSpec(
@@ -166,6 +176,9 @@ class WorkspaceSpec:
             window_size=window_size,
             eval_capacity=eval_capacity,
             slot_capacity=slot_capacity,
+            per_group_capacity=per_group_capacity,
+            budget_scope=budget_scope,
+            slot_rows=slot_rows,
             score_dtype=score_dtype,
         )
 
@@ -200,61 +213,75 @@ class CompressionWorkspace:
         dtype = spec.score_dtype
 
         # ---- shared, step-local ------------------------------------------
-        # Staging for one chunk's scores, laid out [previous window | chunk].
-        # The ratio regime's eval region is a view into it; the budget regime
-        # uses it only as the landing area for the fresh chunk.
+        # One chunk's scores as [previous window | chunk]: the ratio regime's
+        # eval region is a view into this, the budget regime only lands the
+        # fresh chunk here.
         self.staging = torch.empty(
             num_layers, num_kv_heads, spec.window_size + spec.chunk_size,
             dtype=dtype, device=device)
-        # Scores of the eval region in MEMBER order — what the budget scope
-        # consumes (it maps members to clusters itself).
+        # MEMBER order: the budget scope maps members to clusters itself.
         self.eval_scores = torch.empty(
             num_layers, num_kv_heads, spec.eval_capacity,
             dtype=dtype, device=device)
-        # The same scores in (cluster, column) order, which is the order the
-        # executor's writeback indexes. Sorting happens in place here (the
-        # sorted VALUES are never read), so no separate values buffer exists.
+        # The same scores in (cluster, column) order, as the writeback indexes
+        # them. Sorted in place: the sorted VALUES are never read.
         self.rank_scores = torch.empty(
             num_layers, num_groups, spec.page_group_size, spec.eval_capacity,
             dtype=dtype, device=device)
-        # Descending position ranking per (cluster, column). int64 because that
-        # is the index dtype ``torch.sort`` writes; a narrower slab would need
-        # an int64 temporary of the same shape and raise the peak instead of
-        # lowering it.
+        # int64 is what ``torch.sort`` writes; a narrower slab would need an
+        # int64 temporary of the same shape and raise the peak instead.
         self.sorted_index = torch.empty(
             num_layers, num_groups, spec.page_group_size, spec.eval_capacity,
             dtype=torch.int64, device=device)
+        # Scratch for the write-back kernel's in-place sort of the selected
+        # positions: one byte per ``sorted_index`` cell.
+        self.keep_mask = torch.zeros(
+            num_layers, num_groups, spec.page_group_size, spec.eval_capacity,
+            dtype=torch.uint8, device=device)
 
         # ---- per row, persists across steps ------------------------------
-        # Scores of the chunk so far, for a chunk the scheduler split across
-        # forward steps. ``pending_len`` is the per-(row, layer) write cursor.
+        # The chunk's scores so far, for a chunk the scheduler split over
+        # several steps. ``pending_len`` is the per-(row, layer) write cursor.
         self.pending_score = torch.empty(
             num_rows, num_layers, num_kv_heads, spec.chunk_size,
             dtype=dtype, device=device)
         self.pending_len = np.zeros((num_rows, num_layers), dtype=np.int32)
-        # Previous chunk's window scores, the one region a later chunk of the
-        # ratio regime still re-ranks.
+        # The one region a later ratio-regime chunk still re-ranks.
         self.prior_window = torch.empty(
             num_rows, num_layers, num_kv_heads, spec.window_size,
             dtype=dtype, device=device)
-        # Positions promoted to permanently kept, and the length the last
-        # eviction left, per (layer, group).
+        # Permanently kept positions, and the length the last eviction left.
         self.locked = torch.zeros(
             num_rows, num_layers, num_groups, dtype=torch.long, device=device)
         self.valid_lengths = torch.zeros(
             num_rows, num_layers, num_groups, dtype=torch.long, device=device)
         # Per-position statistics in cache-slot coordinates (budget regime).
+        # ``slot_rows`` is ``num_rows`` only when the source keeps scores
+        # between steps; otherwise ``stat_buffer_for`` shares one row.
         self.stat_buffer: torch.Tensor | None = (
             torch.empty(
-                num_rows, num_layers, num_kv_heads, spec.slot_capacity,
+                spec.slot_rows, num_layers, num_kv_heads, spec.slot_capacity,
                 dtype=dtype, device=device)
-            if spec.slot_capacity > 0 else None)
+            if spec.slot_capacity > 0 and spec.slot_rows > 0 else None)
+
+    def stat_buffer_for(self, row: int) -> torch.Tensor:
+        """This request's slice of the per-position statistics.
+
+        A source that rewrites every live slot shares one slice with the whole
+        step, its values never outliving the request loop's iteration; one that
+        keeps history gets its own row.
+        """
+        if self.stat_buffer is None:
+            raise RuntimeError(
+                "stat_buffer_for: the workspace was built without per-position "
+                "statistics (slot_capacity == 0), so no regime may ask for "
+                "them.")
+        return self.stat_buffer[row if self.spec.slot_rows > 1 else 0]
 
     # ------------------------------------------------------------------ rows
     def acquire_row(self) -> int:
-        """Reserve a row for one request. Raises when the pool is exhausted,
-        which means a row outlived the request that held it — a bookkeeping
-        bug, not a capacity question."""
+        """Reserve a row for one request. Exhaustion means a row outlived the
+        request that held it -- a bookkeeping bug, not a capacity question."""
         if not self._free_rows:
             raise RuntimeError(
                 f"CompressionWorkspace: all {self.spec.max_num_reqs} rows are "
@@ -273,15 +300,18 @@ class CompressionWorkspace:
     # ------------------------------------------------------------- reporting
     @property
     def shared_bytes(self) -> int:
-        return sum(t.numel() * t.element_size() for t in (
-            self.staging, self.eval_scores, self.rank_scores,
-            self.sorted_index))
+        tensors = [self.staging, self.eval_scores, self.rank_scores,
+                   self.sorted_index, self.keep_mask]
+        # Shared exactly when they hold nothing between steps.
+        if self.stat_buffer is not None and self.spec.slot_rows <= 1:
+            tensors.append(self.stat_buffer)
+        return sum(t.numel() * t.element_size() for t in tensors)
 
     @property
     def per_row_bytes(self) -> int:
         tensors = [self.pending_score, self.prior_window,
                    self.locked, self.valid_lengths]
-        if self.stat_buffer is not None:
+        if self.stat_buffer is not None and self.spec.slot_rows > 1:
             tensors.append(self.stat_buffer)
         return sum(t.numel() * t.element_size() for t in tensors)
 
@@ -290,20 +320,20 @@ class CompressionWorkspace:
         return self.shared_bytes + self.per_row_bytes
 
     def log_reservation(self) -> None:
-        """Report the reservation at startup. It is subtracted from the KV cache
-        pool by the memory profiling that follows, so it belongs in the log
-        where a too-small KV cache is diagnosed."""
+        """Report the reservation at startup. The profiling that follows
+        subtracts it from the KV pool, so it belongs in the log where a
+        too-small KV cache is diagnosed."""
         spec = self.spec
         logger.info(
             "KV compression workspace reserved %.1f MiB "
             "(shared %.1f MiB, %d rows x %.1f MiB): eval_capacity=%d, "
-            "slot_capacity=%d, chunk=%d, score dtype=%s.",
+            "slot_capacity=%d (%d rows), chunk=%d, score dtype=%s.",
             self.reserved_bytes / _MIB,
             self.shared_bytes / _MIB,
             spec.max_num_reqs,
             self.per_row_bytes / max(spec.max_num_reqs, 1) / _MIB,
-            spec.eval_capacity, spec.slot_capacity, spec.chunk_size,
-            spec.score_dtype)
+            spec.eval_capacity, spec.slot_capacity, spec.slot_rows,
+            spec.chunk_size, spec.score_dtype)
         if self.reserved_bytes > 1024 * _MIB:
             logger.warning(
                 "The KV compression workspace reserves %.2f GiB, which is "
@@ -316,12 +346,10 @@ class CompressionWorkspace:
     def _reject_if_unusable(self) -> None:
         """Fail now if the reservation leaves no room for a KV cache.
 
-        The reservation is subtracted from the KV pool by the profiling that
-        follows, so an over-large one surfaces later as "not enough memory for
-        the KV cache" — a message that points at the wrong knob. The row pool is
-        sized by ``max_num_seqs``, while the concurrency a long budget can
-        actually sustain is limited by the KV pool instead, so the two are easy
-        to mis-pair; say so here, with the numbers.
+        Otherwise it surfaces later as "not enough memory for the KV cache",
+        which points at the wrong knob. The row pool is sized by
+        ``max_num_seqs`` while the concurrency a long budget sustains is bounded
+        by the KV pool instead, so the two are easy to mis-pair.
         """
         if self.device.type != "cuda":
             return

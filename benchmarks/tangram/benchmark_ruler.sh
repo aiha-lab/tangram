@@ -1,216 +1,130 @@
 #!/usr/bin/env bash
-# RULER accuracy across compression ratios for one method.
+# RULER accuracy for one compression method. Sibling of benchmark_scbench.sh;
+# adds a context-LENGTH sweep. Each (length, setting) is one model load.
 #
-# Sibling of benchmark_scbench.sh — same method-selection knobs (SCORER /
-# SCOPE / RESUME) and engine setup, but drives benchmark_ruler.py over RULER's
-# synthetic long-context tasks instead of SCBench. RULER adds a context-LENGTH
-# sweep axis (4096 / 8192 / 16384); each (length, ratio) is one model load.
+# RULER reference protocol: single-turn, natural EOS, per-task output length,
+# string-match metric. ratio=0 is the uncompressed reference.
 #
-# Accuracy protocol (RULER reference):
-#   * single-turn          — one context+question prompt per sample
-#   * natural EOS          — stop at EOS (no --force-exact-tokens)
-#   * per-task length      — output budget from the dataset's max_new_tokens
-#   * string-match metric  — recall (retrieval/tracking/extraction) or any-match (QA)
-#
-# ratio=0 (evict nothing) is the uncompressed reference; uniform vs
-# non-uniform differ only at ratio>0.
-#
-# Select the method with two knobs:
 #   SCORER  = fastkvzip | snapkv | keydiff | streamingllm | tova | expected_attention
-#   SCOPE   = layer (per-layer budget, pooled across its head groups; default,
-#             needs a per-layer cluster map)
-#           | global (one budget pooled across all layers and head groups;
-#             needs a global cluster map)
-#           | uniform (same kept count per (layer, group))
-#   RESUME  = 1 (skip already-saved (length,task,ratio) cells) | 0 (recompute all)
+#   SCOPE   = layer (default) | global | uniform      # axis 1, see budget_scope.py
+#   RESUME  = 1 skips (length,task,setting) cells already saved
+#
 # Results land in results_ruler/<scorer>_<selection>/ so methods stay separate.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
-# Force spawn: vLLM V1's engine core forks by default; CUDA touched in the driver
-# makes the fork raise "Cannot re-initialize CUDA".
+
+# The driver touches CUDA, and a forked engine core cannot re-initialize it.
 export VLLM_WORKER_MULTIPROC_METHOD="${VLLM_WORKER_MULTIPROC_METHOD:-spawn}"
 export PYTHONPATH="${REPO_ROOT}:${PYTHONPATH:-}"
-# Reduce allocator fragmentation so the transient compression score-buffer spike
-# can reuse reserved blocks. PyTorch renamed the env var, so set both names (the
-# old PYTORCH_CUDA_ALLOC_CONF is deprecated/ignored on current builds).
+# Let the transient compression spike reuse reserved blocks. Both names: the
+# CUDA-prefixed one is deprecated but still what older builds read.
 export PYTORCH_ALLOC_CONF="${PYTORCH_ALLOC_CONF:-expandable_segments:True}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
 # ---- Model ---------------------------------------------------------------
 GPU_ID=${GPU_ID:-0}
 MODEL=${MODEL:-Qwen/Qwen3-4B-Instruct-2507}
-# RULER's longest config here is 16384 tokens; 32768 holds it plus generation
-# without over-allocating the KV cache / per-member block table for a 262k
-# window (which is unnecessary for RULER and a known OOM source on 4B at 0.9).
+# Fits RULER's longest (16384) plus generation. A 262k window over-allocates
+# the block table and OOMs a 4B at 0.85.
 MAX_LEN=${MAX_LEN:-32768}
 GPU_MEM_UTIL=${GPU_MEM_UTIL:-0.85}
 PYTHON=${PYTHON:-python3}
 
 # ---- Method --------------------------------------------------------------
 SCORER=${SCORER:-snapkv}
-# Budget scope (axis 1): uniform | layer | global.
 SCOPE=${SCOPE:-layer}
 
 # ---- Sweep ---------------------------------------------------------------
 LENGTHS=${LENGTHS:-"8192 4096 16384"}   # 8K -> 4K -> 16K completion order
-# ``${VAR-default}`` (not ``:-``) so an explicitly EMPTY value means "none":
-# RATIOS="" BUDGETS="4096 2048" sweeps budgets only.
+# ${VAR-...}, not :-, so RATIOS="" means "no ratio sweep".
 RATIOS=${RATIOS-"0.0 0.3 0.5 0.7"}
-# Fixed KV budgets in tokens per (layer, head group), swept alongside RATIOS.
-# Empty (default) = ratio-only sweep. A budget run is a DIFFERENT retention
-# target, not a ratio: nothing is evicted until the cache would exceed the
-# budget, and it is then cut back to it. Compare a budget against the ratio that
-# keeps the same amount, i.e. budget ~= (1 - ratio) * length.
+# Fixed KV tokens per (layer, head group) — a different retention target, not a
+# ratio. Comparable to the ratio keeping the same amount: b ~= (1-r) * length.
 BUDGETS=${BUDGETS:-}
-# 1 = let the chunk just written compete for eviction, protecting only the
-# always-kept recent window; 0 (default) = protect the whole fresh chunk, which
-# is the more accurate setting in our measurements. Budget runs only.
+# Budget runs only. 1 = the fresh chunk competes too; 0 measured better.
 EVICT_CURRENT_CHUNK=${EVICT_CURRENT_CHUNK:-0}
-# Where a cached position's score comes from when it competes again under a
-# budget: auto (default) = whatever the scorer specifies; persist = keep the
-# score each position's own chunk produced. Budget runs only.
-#
-# Set it to "persist" with SCORER=keydiff to separate the two things a
-# ratio->budget comparison changes at once: the retention target (lock-in and
-# the candidate set) and the score itself (KeyDiff's anchor becomes the whole
-# cache instead of the chunk). A "budget + persist" run keeps the score a ratio
-# run would rank, so the remaining difference is the target alone. Not a serving
-# setting — the engine warns when it overrides a rescoring scorer.
+# Budget runs only. persist holds the score a ratio run would rank, which is
+# what separates the retention target from the score in a ratio->budget
+# comparison. An ablation, not a serving setting.
 SLOT_SCORE_SOURCE=${SLOT_SCORE_SOURCE:-auto}
-# Settings the selected SCORER declares, as key=value,key=value. Empty = the
-# scorer's own defaults. Applies to ratio AND budget runs (unlike the two knobs
-# above, a scorer setting is not regime-specific).
-#
-# The one that changes what KeyDiff computes:
-#   SCORER_OPTIONS=anchor=normalized  -> Eq. (8) as written, mu(K-hat)
-#   (default, unset)                  -> mu(K), the paper's experimental setting
+# Settings the SCORER declares, key=value,key=value. Both regimes.
+#   SCORER_OPTIONS=anchor=normalized  -> KeyDiff Eq.(8) as written, mu(K-hat)
+#   unset                             -> mu(K), the paper's experiments
 SCORER_OPTIONS=${SCORER_OPTIONS:-}
 TASKS=${TASKS:-}            # empty = all 13 RULER tasks
 NUM=${NUM:-50}             # samples PER TASK (RULER ships 500/task)
 MAX_NUM_SEQS=${MAX_NUM_SEQS:-16}
 
-# ---- Method-specific args ------------------------------------------------
+# ---- Args ----------------------------------------------------------------
+SELECTION="${SCOPE}"
+PAGE_GROUP_SIZE=${PAGE_GROUP_SIZE:-4}
 METHOD_ARGS=(--compression-scorer "${SCORER}"
              --compression-budget-scope "${SCOPE}")
-SELECTION="${SCOPE}"
 
-# RESUME=1 skips (length, task, ratio) cells already saved under OUTPUT_DIR, so
-# an interrupted sweep continues with the same command (fully-done lengths skip
-# the model load too). Default 0 recomputes everything.
-if [ "${RESUME:-0}" = "1" ]; then
-    METHOD_ARGS+=(--skip-existing)
-fi
+# Append "<flag> <value>" only when the value is set; append a bare flag when
+# its variable is 1. An unknown SCORER needs no check here — argparse rejects it
+# against the same list, and CacheConfig against the scorer registry.
+opt()  { if [ -n "${2:-}" ]; then METHOD_ARGS+=("$1" "$2"); fi; }
+flag() { if [ "${2:-0}" = "1" ]; then METHOD_ARGS+=("$1"); fi; }
 
-if [ -n "${TASKS}" ]; then
-    METHOD_ARGS+=(--tasks "${TASKS}")
-fi
-
-# LOG_STATS=1 turns on vLLM's periodic engine stats logger (prints the
-# cumulative "Preemptions: N" line when N>0).
-if [ "${LOG_STATS:-0}" = "1" ]; then
-    METHOD_ARGS+=(--enable-log-stats)
-fi
-
-# Fixed KV cache size in blocks. Small values force preemption.
-if [ -n "${NUM_GPU_BLOCKS:-}" ]; then
-    METHOD_ARGS+=(--num-gpu-blocks-override "${NUM_GPU_BLOCKS}")
-fi
-
-# Compression keep-geometry overrides (the engine/bench defaults are tuned for
-# SCBench's long contexts: window 4096 / floor 512). For RULER's short contexts
-# those floors swamp the ratio, so set them small (e.g. WINDOW_SIZE=32 FLOOR_MIN=0)
-# to make the compression ratio the binding KV budget. Only applied when set.
-if [ -n "${WINDOW_SIZE:-}" ]; then
-    METHOD_ARGS+=(--compression-window-size "${WINDOW_SIZE}")
-fi
-if [ -n "${FLOOR_MIN:-}" ]; then
-    METHOD_ARGS+=(--compression-floor-min "${FLOOR_MIN}")
-fi
-# Prefix sink tokens kept regardless of score. Set N_SINK=0 to reproduce a
-# reference that protects no prefix (KeyDiff's, for one), where a sink would
-# otherwise hold tokens the method under comparison is free to evict.
-if [ -n "${N_SINK:-}" ]; then
-    METHOD_ARGS+=(--compression-n-sink-tokens "${N_SINK}")
-fi
-# Compression chunk size. Under a fixed budget this also bounds the budget from
-# below (the fresh chunk is kept unconditionally unless EVICT_CURRENT_CHUNK=1),
-# so a small budget needs a small chunk.
-if [ -n "${CHUNK_SIZE:-}" ]; then
-    METHOD_ARGS+=(--compression-chunk-size "${CHUNK_SIZE}")
-fi
-# Scorer settings. Tagged into the result filename with the '=' dropped, since a
-# different setting is a different algorithm and must not overwrite a result.
-SCORER_OPTION_TAG=""
-if [ -n "${SCORER_OPTIONS}" ]; then
-    METHOD_ARGS+=(--compression-scorer-options "${SCORER_OPTIONS}")
-    SCORER_OPTION_TAG=$(echo "${SCORER_OPTIONS}" | tr '=,' '-_')
-fi
-
-# Budget-run extras. The tag keeps runs that differ only in eviction policy in
-# separate result files so one sweep does not overwrite another; each part is
-# spelled out because it ends up in result filenames a reader has to interpret.
-BUDGET_ARGS=()
-BUDGET_TAG_PARTS=()
-if [ -n "${SCORER_OPTION_TAG}" ]; then
-    BUDGET_TAG_PARTS+=("${SCORER_OPTION_TAG}")
-fi
-if [ "${EVICT_CURRENT_CHUNK}" = "1" ]; then
-    BUDGET_ARGS+=(--compression-evict-current-chunk)
-    BUDGET_TAG_PARTS+=("evict-current-chunk")
-fi
-if [ "${SLOT_SCORE_SOURCE}" != "auto" ]; then
-    BUDGET_ARGS+=(--compression-slot-score-source "${SLOT_SCORE_SOURCE}")
-    BUDGET_TAG_PARTS+=("${SLOT_SCORE_SOURCE}-scores")
-fi
-BUDGET_TAG=$(IFS=- ; echo "${BUDGET_TAG_PARTS[*]}")
-
-case "${SCORER}" in
-    fastkvzip)
-        # Gate-based. GATE_PATH overrides the gate checkpoint (absolute path or
-        # a Hub-relative name). Unset → the engine auto-resolves "fastkvzip".
-        DEFAULT_PG=4
-        if [ -n "${GATE_PATH:-}" ]; then
-            METHOD_ARGS+=(--compression-gate-path "${GATE_PATH}")
-        fi
-        ;;
-    snapkv)
-        DEFAULT_PG=4
-        # SnapKV knobs travel through the generic scorer-option channel:
-        # SCORER_OPTIONS="window=32,kernel=7".
-        ;;
-    keydiff|streamingllm|tova|expected_attention)
-        DEFAULT_PG=4
-        ;;
-    *)
-        echo "Unknown SCORER='${SCORER}' (use fastkvzip|snapkv|keydiff|streamingllm|tova|expected_attention)" >&2
-        exit 1
-        ;;
-esac
-
-# Head-group cluster map (applies to ANY scorer). Set HEAD_GROUP_CLUSTER_MAP to
-# a map .npz (see tools/head_group_clustering); a missing/unset path falls back
-# to identity (adjacent-head) grouping.
+# RESUME: an interrupted sweep continues with the same command, and a
+# fully-done length skips the model load too.
+flag --skip-existing "${RESUME:-0}"
+# vLLM's periodic stats logger — the "Preemptions: N" line.
+flag --enable-log-stats "${LOG_STATS:-0}"
+opt --tasks "${TASKS:-}"
+# A KV pool bound; on its own it serializes admission rather than preempting.
+opt --num-gpu-blocks-override "${NUM_GPU_BLOCKS:-}"
+# 1 = admit on the next chunk instead of the whole input. With a small
+# NUM_GPU_BLOCKS this over-admits, which is what forces preemption.
+flag --no-scheduler-reserve-full-isl "${NO_RESERVE_FULL_ISL:-0}"
+# fastkvzip only; unset lets the engine auto-resolve the gate.
+opt --compression-gate-path "${GATE_PATH:-}"
+# The bench defaults (chunk 8192 / window 4096 / floor 512 / sink 32) are tuned
+# for SCBench's long contexts and swamp the target at RULER's lengths. A budget
+# below the protected tail is unreachable, so a budget sweep sets a small chunk
+# and window. N_SINK=0 matches a reference that protects no prefix (KeyDiff's).
+opt --compression-chunk-size "${CHUNK_SIZE:-}"
+opt --compression-window-size "${WINDOW_SIZE:-}"
+opt --compression-floor-min "${FLOOR_MIN:-}"
+opt --compression-n-sink-tokens "${N_SINK:-}"
+opt --compression-scorer-options "${SCORER_OPTIONS}"
+# A .npz from tools/head_group_clustering; unset or missing falls back to
+# identity (adjacent-head) grouping.
 if [ -n "${HEAD_GROUP_CLUSTER_MAP:-}" ] && [ -f "${HEAD_GROUP_CLUSTER_MAP}" ]; then
     METHOD_ARGS+=(--head-group-cluster-map "${HEAD_GROUP_CLUSTER_MAP}")
 fi
-PAGE_GROUP_SIZE=${PAGE_GROUP_SIZE:-${DEFAULT_PG}}
-OUTPUT_DIR=${OUTPUT_DIR:-"${SCRIPT_DIR}/results_ruler/${SCORER}_${SELECTION}"}
 
-# ---- Tensor parallel (opt-in) --------------------------------------------
-# TP=1 (default) keeps single-GPU behavior. TP>1 runs tensor-parallel across the
-# GPUs listed in GPU_ID (a comma list, e.g. "0,1") and disables the custom
-# all-reduce (required by the Tangram TP path).
+# Budget-regime policy, plus the tag that keeps result files apart for runs
+# differing only in it (or in a scorer setting, a different algorithm).
+BUDGET_ARGS=()
+TAG_PARTS=()
+if [ -n "${SCORER_OPTIONS}" ]; then
+    TAG_PARTS+=("$(echo "${SCORER_OPTIONS}" | tr '=,' '-_')")
+fi
+RATIO_TAG=$(IFS=- ; echo "${TAG_PARTS[*]:-}")
+if [ "${EVICT_CURRENT_CHUNK}" = "1" ]; then
+    BUDGET_ARGS+=(--compression-evict-current-chunk)
+    TAG_PARTS+=("evict-current-chunk")
+fi
+if [ "${SLOT_SCORE_SOURCE}" != "auto" ]; then
+    BUDGET_ARGS+=(--compression-slot-score-source "${SLOT_SCORE_SOURCE}")
+    TAG_PARTS+=("${SLOT_SCORE_SOURCE}-scores")
+fi
+BUDGET_TAG=$(IFS=- ; echo "${TAG_PARTS[*]:-}")
+
+# TP>1 spans the GPUs in GPU_ID ("0,1") and must disable the custom all-reduce.
 TP=${TP:-1}
 TP_ARGS=()
 if [ "${TP}" -gt 1 ]; then
     TP_ARGS=(--tensor-parallel-size "${TP}" --disable-custom-all-reduce)
 fi
+OUTPUT_DIR=${OUTPUT_DIR:-"${SCRIPT_DIR}/results_ruler/${SCORER}_${SELECTION}"}
 
 # ---- Run -----------------------------------------------------------------
-# Outer loop over context lengths so each length's full ratio sweep completes
-# before the next (the all-task average is valid after every length).
+# Length outermost, so the all-task average is valid after every length.
 run_one() {
     # $@ = the setting-specific args (a ratio, or a budget).
     CUDA_VISIBLE_DEVICES="${GPU_ID}" "$PYTHON" "${SCRIPT_DIR}/benchmark_ruler.py" \
@@ -232,7 +146,7 @@ for LENGTH in ${LENGTHS}; do
         echo "===== ${SCORER} ${SELECTION}  length=${LENGTH}  ratio=${RATIO}" \
              "options=${SCORER_OPTIONS:-<defaults>}  tp=${TP} ====="
         run_one --compression-ratio "${RATIO}" \
-                ${SCORER_OPTION_TAG:+--tag "${SCORER_OPTION_TAG}"}
+                ${RATIO_TAG:+--tag "${RATIO_TAG}"}
     done
     for BUDGET in ${BUDGETS}; do
         echo "===== ${SCORER} ${SELECTION}  length=${LENGTH}  budget=${BUDGET}" \

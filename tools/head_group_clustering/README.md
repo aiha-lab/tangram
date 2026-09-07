@@ -20,27 +20,37 @@ residual at the same group size (no attention-kernel performance loss).
 
 ```
 head_group_clustering/
+├── build_profile.py     # CLI: model + scorer -> retention profile (.npz)
+├── build_cluster_map.py # CLI: retention profile (.npz) -> cluster map (.npz)
 ├── clustering.py        # pure: rank_score [L,H] -> ClusterMap (no torch/GPU)
 ├── validate.py          # pure: Spearman rank stability + boundary sensitivity
-├── build_cluster_map.py # CLI: retention profile (.npz) -> cluster map (.npz)
+├── build_all_profiles.sh / build_all_maps.sh  # both stages, every (scorer, model)
 └── tests/test_clustering.py
 ```
 
-Measurement is **not** done here. The tool reuses a per-(layer, head) retention
-profile already produced by `tangram_impl/static_budget_profile/collect.py`
-(FastKVZip cross-layer global-threshold, ~50 pilot samples). `clustering.py` is
-model-independent so it unit-tests without a GPU.
+Two stages, both here: `build_profile.py` measures a per-(layer, head)
+retention profile by running the real engine with `page_group_size=1` and a
+retention observer attached (~50 pilot samples), and `build_cluster_map.py`
+turns that profile into a cluster map. Only the first stage needs a GPU;
+`clustering.py` is model-independent and unit-tests without one.
 
 ## Usage
 
+From the repository root (`python -m` needs it on the path):
+
 ```bash
-cd /workspace/vllm-asp
 python -m tools.head_group_clustering.build_cluster_map \
-    --profile /workspace/tangram_impl/static_budget_profiles/qwen25-7b-1m.npz \
-    --base-ratio 0.5 \
+    --profile tools/head_group_clustering/cluster_maps/fastkvzip/qwen3-4b-instruct-2507/profile.npz \
+    --base-ratio 0.3 \
     --page-group-size 4 \
-    --out /workspace/tangram_impl/static_budget_profiles/qwen25-7b-1m.cluster.npz
+    --cluster-scope global \
+    --out tools/head_group_clustering/cluster_maps/fastkvzip/qwen3-4b-instruct-2507/pg4_r0.3.npz
 ```
+
+`build_all_maps.sh` does this for every (scorer, model) pair and is the normal
+entry point. `--cluster-scope` must match the profile's threshold scope
+(`profile.npz` is `global`, `profile_perlayer.npz` is `per_layer`); pairing them
+wrong pools score scales that are not comparable.
 
 Key flags:
 
@@ -49,9 +59,9 @@ Key flags:
 - `--page-group-size` — heads per cluster (must divide `num_layers * num_kv_heads`).
 - `--aggregate {stored,mean,median}` — how to reduce per-sample retention into the
   ranking score; `stored` uses the profile's pre-aggregated `ratio_per_head`.
-- `--max-heads-per-layer-per-cluster` — optional cap on heads from one layer
-  sharing a cluster (relevant to the cross-layer write path; see open question
-  Q-B2 in the design tree). Default: unconstrained.
+- `--max-heads-per-layer-per-cluster` — optional cap on how many heads from one
+  layer may share a cluster; `--cluster-scope global` only. Default:
+  unconstrained.
 
 ## Output schema (`.npz`)
 
@@ -82,5 +92,5 @@ from the same layer occupy contiguous columns.
 ## Tests
 
 ```bash
-cd /workspace/vllm-asp && python -m pytest tools/head_group_clustering/tests/ -q
+python -m pytest --noconftest tools/head_group_clustering/tests/ -q
 ```

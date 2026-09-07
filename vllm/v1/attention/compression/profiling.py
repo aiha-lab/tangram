@@ -2,35 +2,19 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Retention profiling for head-group cluster-map construction.
 
-The head-group clustering tool (``tools/head_group_clustering``) needs the
-per-(layer, head) fraction of KV cache each head retains under non-uniform
-compression. That fraction is precisely what the engine's keep decision already
-computes, so this module lets an offline profiler read those decisions back out
-of a live engine instead of re-deriving them.
+``tools/head_group_clustering`` needs the per-(layer, head) fraction of KV each
+head retains under non-uniform compression, which is exactly what the engine's
+keep decision already computes. This observer writes those decisions out so an
+offline profiler can read them back instead of re-deriving them. Replaying the
+model in HuggingFace transformers cannot: eager-only models (gpt-oss, whose
+attention sinks have no SDPA kernel) never dispatch through the registry a
+capture hook would need.
 
-Reading from the live engine is the only approach that works for every model.
-The alternative — replaying the model in HuggingFace transformers and capturing
-query/key/value through the attention-function registry — cannot reach the
-query/key/value of eager-only models (for example gpt-oss, whose attention sinks
-have no SDPA kernel, so transformers never dispatches its attention through the
-registry the capture hooks rely on). The engine, by contrast, scores every model
-identically through its own attention path.
-
-Wiring is config-driven (no engine entanglement beyond one optional observer):
-set ``CacheConfig.compression_retention_dump`` to a directory and the worker
-attaches the observer to its compressor at construction (see
-``gpu_model_runner``). From
-the ``LLM`` entrypoint that is just a keyword argument:
-
-    from vllm import LLM
-
-    llm = LLM(model=..., compression_ratio=0.3, page_group_size=1,
-              compression_retention_dump=dump_dir, ...)
-    llm.generate(prompts, ...)          # each keep decision is written to disk
-    # then aggregate dump_dir into a profile (build_profile.py --backend vllm)
-
-``page_group_size=1`` makes every ``(layer, group)`` a single head, so the dumped
-``kept`` / ``total`` arrays are per-(layer, head).
+Wiring is one config field. Set ``CacheConfig.compression_retention_dump`` to a
+directory -- ``LLM(..., compression_retention_dump=dump_dir)`` -- and the worker
+attaches the observer at construction. Use ``page_group_size=1`` so every
+(layer, group) is a single head and the dumped ``kept`` / ``total`` arrays are
+per-(layer, head).
 """
 from __future__ import annotations
 
@@ -42,21 +26,16 @@ import numpy as np
 class RetentionProfileObserver:
     """Persist each per-request keep decision to ``<dump_dir>/<req_id>_<seq>.npz``.
 
-    One file per recorded decision keeps the writer crash-safe and lets the
-    aggregator simply glob the directory. The aggregator recovers context-only
-    retention per head as ``(kept - sink - window) / (total - sink)`` — the same
-    quantity the transformers profiling path emits — so profiles built either
-    way are interchangeable.
+    One file per decision keeps the writer crash-safe and lets the aggregator
+    glob the directory. It recovers context-only retention per head as
+    ``(kept - sink - window) / (total - sink)``, the same quantity the
+    transformers path emits, so profiles built either way are interchangeable.
+    Writer in the worker, aggregator in the driver, both on the local
+    filesystem: single-node only.
 
-    The writer runs inside the engine worker process; the aggregator reads the
-    files from the driver process. Both share the local filesystem, so this is
-    single-node only (the head-group profiler always runs single-node).
-
-    Under tensor parallelism every rank runs its own observer and they share the
-    dump directory, so the filename carries the ``rank``: a rank sees only its
-    own ``num_kv_heads // tensor_parallel_size`` heads, and without the rank tag
-    two ranks would write the same ``<req>_<seq>`` name and clobber each other.
-    The aggregator groups files by ``(req, rank)`` to reassemble per-rank heads.
+    The filename carries the ``rank`` because each rank observes only its own
+    head shard into a shared directory; the aggregator groups by
+    ``(req, rank)``.
     """
 
     def __init__(self, dump_dir: str, rank: int = 0) -> None:

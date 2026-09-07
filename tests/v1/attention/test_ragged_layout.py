@@ -7,24 +7,29 @@ virtual-block addressing writes and reads exactly the same logical cells as the
 column-minor per-cluster path. Here we verify the wiring (slot and block-table
 arithmetic) the metadata builder relies on.
 """
-import torch
-
+import dataclasses
 import os
+
+import torch
 
 import numpy as np
 
 from vllm.v1.attention.backends.ragged_layout import (
+    RaggedStepViews,
     as_virtual_block_view,
+    build_decode_layer_overlays,
     column_major_cache_shape,
-    expand_member_seq_lens,
-    identity_member_clusters,
-    identity_member_columns,
     identity_member_maps,
     load_cluster_map,
     member_maps_from_cluster_map,
     member_seq_lens,
     member_virtual_block_table,
     member_virtual_slots,
+)
+from ragged_reference import (
+    expand_member_seq_lens,
+    identity_member_clusters,
+    identity_member_columns,
     physical_to_virtual_block_table,
     physical_to_virtual_slots,
 )
@@ -348,3 +353,167 @@ def test_load_cluster_map_validates_and_matches_raw():
             pass
     print(f"load_cluster_map: validated + matched raw "
           f"({num_layers}x{num_kv_heads}, g={g})")
+
+
+# --- Per-layer decode overlays --------------------------------------------
+
+
+@dataclasses.dataclass
+class _StepMetadata:
+    """The five per-layer fields plus one shared field, to show the shared one
+    survives the copy."""
+
+    num_actual_tokens: int = 0
+    block_table: torch.Tensor | None = None
+    seq_lens: torch.Tensor | None = None
+    slot_mapping: torch.Tensor | None = None
+    query_start_loc: torch.Tensor | None = None
+    max_seq_len: int = 123
+
+
+def _decode_views(num_layers: int, num_reqs: int, num_kv_heads: int,
+                  page_group_size: int, max_blocks: int) -> RaggedStepViews:
+    """Uniform-decode views over an identity cluster map."""
+    num_clusters_per_layer = num_kv_heads // page_group_size
+    num_clusters_total = num_layers * num_clusters_per_layer
+    members = torch.arange(num_layers * num_kv_heads, dtype=torch.int64)
+    return RaggedStepViews(
+        num_layers_local=num_layers,
+        num_head_groups_per_layer=num_clusters_per_layer,
+        page_group_size=page_group_size,
+        ragged_decode_layout=True,
+        # Distinct ids so a mis-indexed layer is visible, not merely wrong.
+        cluster_block_table=torch.arange(
+            num_reqs * num_clusters_total * max_blocks, dtype=torch.int32
+        ).reshape(num_reqs, num_clusters_total, max_blocks),
+        clusters_per_layer=(members // page_group_size).reshape(
+            num_layers, num_kv_heads),
+        cols_per_layer=(members % page_group_size).reshape(
+            num_layers, num_kv_heads),
+        seq_lens_grouped=torch.arange(
+            num_layers * num_reqs * num_kv_heads, dtype=torch.int32
+        ).reshape(num_layers, num_reqs, num_kv_heads),
+        slot_mapping_grouped=torch.arange(
+            num_layers * num_reqs * num_kv_heads, dtype=torch.int64
+        ).reshape(num_layers, num_reqs, num_kv_heads),
+        query_start_loc_grouped=torch.arange(
+            num_reqs * num_kv_heads + 1, dtype=torch.int32),
+    )
+
+
+def test_decode_overlays_give_each_layer_its_own_five_fields():
+    """One overlay per layer, each carrying that layer's members flattened to
+    ``num_reqs * num_kv_heads`` sequences, with everything else shared."""
+    num_layers, num_reqs, num_kv_heads, g, max_blocks = 3, 2, 4, 2, 5
+    views = _decode_views(num_layers, num_reqs, num_kv_heads, g, max_blocks)
+    metadata = _StepMetadata()
+
+    overlays = build_decode_layer_overlays(
+        metadata, views,
+        num_reqs=num_reqs,
+        num_kv_heads_per_layer=num_kv_heads,
+    )
+
+    assert len(overlays) == num_layers
+    num_virtual_seqs = num_reqs * num_kv_heads
+    for layer_idx, overlay in enumerate(overlays):
+        assert overlay.num_actual_tokens == num_virtual_seqs
+        assert overlay.block_table.shape == (num_virtual_seqs, max_blocks)
+        assert torch.equal(
+            overlay.seq_lens,
+            views.seq_lens_grouped[layer_idx].reshape(num_virtual_seqs))
+        assert torch.equal(
+            overlay.slot_mapping,
+            views.slot_mapping_grouped[layer_idx].reshape(-1))
+        assert torch.equal(overlay.query_start_loc,
+                           views.query_start_loc_grouped)
+        # Shared, not per-layer, and the original is untouched.
+        assert overlay.max_seq_len == 123
+    assert metadata.num_actual_tokens == 0
+    print(f"decode overlays: {num_layers} layers x {num_virtual_seqs} seqs OK")
+
+
+def test_decode_overlay_block_table_matches_the_member_expansion():
+    """Each overlay row is the member's own virtual block table, so it must
+    equal what ``member_virtual_block_table`` produces for that (layer, head)."""
+    num_layers, num_reqs, num_kv_heads, g, max_blocks = 2, 3, 4, 2, 3
+    views = _decode_views(num_layers, num_reqs, num_kv_heads, g, max_blocks)
+
+    overlays = build_decode_layer_overlays(
+        _StepMetadata(), views,
+        num_reqs=num_reqs,
+        num_kv_heads_per_layer=num_kv_heads,
+    )
+
+    for layer_idx, overlay in enumerate(overlays):
+        expected = member_virtual_block_table(
+            views.cluster_block_table,
+            views.clusters_per_layer[layer_idx],
+            views.cols_per_layer[layer_idx],
+            views.page_group_size,
+            cluster_axis=1,
+        ).reshape(num_reqs * num_kv_heads, -1)
+        assert torch.equal(overlay.block_table, expected), layer_idx
+    print("decode overlay block tables match the member expansion")
+
+
+def test_decode_overlays_reject_the_member_major_layout():
+    """The member-major layout shapes seq_lens_grouped differently, so indexing
+    it by layer would read the wrong rows rather than fail."""
+    num_layers, num_reqs, num_kv_heads, g, max_blocks = 2, 2, 4, 2, 3
+    views = _decode_views(num_layers, num_reqs, num_kv_heads, g, max_blocks)
+    views = dataclasses.replace(views, ragged_decode_layout=False)
+
+    try:
+        build_decode_layer_overlays(
+            _StepMetadata(), views,
+            num_reqs=num_reqs,
+            num_kv_heads_per_layer=num_kv_heads,
+        )
+        raise AssertionError("accepted the member-major layout")
+    except AssertionError as error:
+        assert "uniform-decode layout" in str(error), error
+    print("decode overlays reject the member-major layout")
+
+
+def test_step_views_are_the_same_through_the_pinned_staging():
+    """With compression on, the per-cluster lengths reach the device through a
+    pinned staging pair (no stream-synchronising pageable copy). The views must
+    be identical to the direct-copy path, field by field."""
+    from vllm.v1.attention.backends.ragged_layout import (
+        build_ragged_step_views, identity_member_maps)
+    from vllm.v1.utils import CpuGpuBuffer
+
+    num_layers, kv_heads, pg, block, num_reqs = 2, 4, 2, 4, 3
+    clusters = num_layers * (kv_heads // pg)
+    rng = np.random.default_rng(5)
+    block_table = torch.arange(num_reqs * clusters * 6, dtype=torch.int32).view(
+        num_reqs, clusters, 6)
+    seq_lens = torch.tensor([9, 5, 12], dtype=torch.int32)
+    query_start_loc = torch.tensor([0, 1, 2, 3], dtype=torch.int32)
+    slot_mapping = torch.arange(clusters * num_reqs, dtype=torch.long).view(
+        clusters, num_reqs)
+    effective = rng.integers(0, 8, size=(num_reqs, clusters)).astype(np.int32)
+
+    def build(staging):
+        return build_ragged_step_views(
+            block_table_tensor=block_table, slot_mapping=slot_mapping,
+            seq_lens=seq_lens, query_start_loc=query_start_loc,
+            query_start_loc_cpu=query_start_loc,
+            effective_seq_lens_cpu=effective, num_reqs=num_reqs,
+            seq_lens_cluster_staging=staging, num_actual_tokens=num_reqs,
+            max_query_len=1, max_seq_len=12,
+            num_head_groups_per_layer=kv_heads // pg, page_group_size=pg,
+            block_size=block, num_kv_heads_per_layer=kv_heads,
+            member_maps_fn=lambda layers, device: identity_member_maps(
+                layers, kv_heads, pg, device))
+
+    direct = build(None)
+    staged = build(CpuGpuBuffer(clusters * num_reqs * 2, dtype=torch.int32,
+                                device=torch.device("cpu"), pin_memory=False))
+    for field in dataclasses.fields(direct):
+        a, b = getattr(direct, field.name), getattr(staged, field.name)
+        if isinstance(a, torch.Tensor):
+            assert torch.equal(a, b), field.name
+        else:
+            assert a == b, field.name

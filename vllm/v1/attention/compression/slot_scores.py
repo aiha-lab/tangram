@@ -2,32 +2,14 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Where a live cache position's score comes from (budget regime).
 
-Under a fixed KV budget nothing is locked in, so at every eviction EVERY live
-position competes — including positions written many chunks ago. A score must
-therefore be available for a position long after the chunk that produced it,
-and the eviction methods answer that in fundamentally different ways:
+A fixed budget locks nothing in, so every live position competes at every
+eviction and a score must outlive its own chunk. Two ways to arrange that:
+recompute it from what is cached, or persist what the position's own chunk
+produced. Both write the same slot-addressed buffer, which the eviction
+writeback compacts alongside the KV.
 
-* **Recompute** — the score is a function of what is already in the cache, so it
-  can simply be computed again. KeyDiff is of this kind: a key's score is its
-  similarity to the mean direction of the keys currently cached (paper Eq. 8), so
-  nothing needs to be remembered and the score is always the method's own rather
-  than a stale approximation of it. The cost is one extra read of the cached keys
-  per eviction.
-* **Persist** — keep whatever score the position's own chunk produced. This is
-  what a chunk-local scorer (SnapKV, TOVA, the FastKVZip gate) allows without
-  extra machinery, and it is an approximation: those scores were computed against
-  per-chunk reference quantities, so ranking positions from different chunks
-  together has no common scale.
-
-A third kind — accumulating a running score per position, as H2O does — has
-no source here yet. Both existing ones write into the same slot-addressed buffer
-(``[num_layers, num_kv_heads, slot_capacity]``, indexed by cache slot), which
-the eviction writeback compacts alongside the KV. Selecting between them is
-therefore a property of the SCORER, not a tuning knob:
-``make_slot_score_source`` picks recompute when the scorer can rescore the cache
-and persist otherwise. A source name can still be forced, for one purpose only —
-an ablation that holds the score fixed while the retention target changes, so
-the two can be measured apart (see ``make_slot_score_source``).
+The choice is a property of the SCORER, not a tuning knob -- see
+``make_slot_score_source``, which is also the one place it may be forced.
 """
 from __future__ import annotations
 
@@ -53,12 +35,9 @@ logger = init_logger(__name__)
 
 @dataclass(frozen=True)
 class KVCacheView:
-    """Read access to one request's cached keys, addressed the way the
-    compressor thinks: by COMPRESSED layer index (the full-attention layers)
-    and head group.
-
-    Built per compression step by the model runner, which owns the KV tensors
-    and the block table; passed down so the score source can read the cache
+    """Read access to one request's cached keys, addressed by COMPRESSED layer
+    index and head group -- the way the compressor thinks. Built per step by the
+    model runner, which owns the tensors, so a score source can read the cache
     without the compressor holding engine state.
     """
     #: KV cache tensors indexed by PHYSICAL layer.
@@ -81,15 +60,11 @@ class KVCacheView:
     ) -> CachedPositions:
         """Read one head group's live slots, but only what the scorer asked for.
 
-        ``wanted`` comes from the scorer's ``rescore_inputs``, so a key-only
-        method pays for the keys alone while a method that also needs values
-        gets them from the SAME read — and a future input can be added here
-        without changing the scorer contract again.
-
-        The cluster's pages are strided across the pool, so materialising them
-        is a genuine read; it is done at block granularity (the trailing partial
-        block is read and then sliced off), which keeps the transient shapes to
-        a few sizes the caching allocator can reuse.
+        ``wanted`` is the scorer's ``rescore_inputs``, so a key-only method
+        pays for keys alone while one needing values gets them from the SAME
+        read. The pages are strided across the pool, so this is a genuine read;
+        it runs at block granularity, the trailing partial block sliced off
+        after, keeping transient shapes to a few the allocator can reuse.
         """
         unknown = [name for name in wanted if name not in RESCORE_INPUTS]
         if unknown:
@@ -106,8 +81,7 @@ class KVCacheView:
             :num_blocks,
         ].long()
         want_values = RESCORE_VALUES in wanted
-        # [n_blocks, block_size, page_group_size, head_size] per KV component;
-        # key_only skips the value half of the page entirely when unused.
+        # ``key_only`` skips the value half of the page entirely when unused.
         pages = cluster_pages_token_major(
             kv_cache, block_ids, key_only=not want_values)
 
@@ -125,6 +99,26 @@ class KVCacheView:
                     if values_pages is not None else None),
             num_positions=num_positions,
         )
+
+
+def cluster_member_rows(
+    cluster_members_cpu: np.ndarray, cluster_id: int, *, caller: str
+) -> np.ndarray | None:
+    """Member rows holding one cluster's slots, or ``None`` if it holds none.
+
+    A cluster map assigns whole clusters, so a partly occupied one is rejected:
+    its untouched members would keep scores from before the eviction and those
+    would compete for retention. ``caller`` names the operation in that error.
+    """
+    rows = cluster_members_cpu[cluster_id]
+    if not (rows < 0).any():
+        return rows
+    if (rows < 0).all():
+        return None
+    raise RuntimeError(
+        f"{caller}: cluster {cluster_id} holds members in some columns but "
+        f"not others ({rows.tolist()}); a cluster map must leave a cluster "
+        "either full or empty.")
 
 
 @dataclass
@@ -151,9 +145,9 @@ class SlotFillTarget:
     flat: torch.Tensor
     #: ``[num_layers * num_kv_heads]`` member row -> flat cluster id.
     member_to_cluster: torch.Tensor
-    #: ``[num_clusters, page_group_size]`` cluster + column -> member row, on the
-    #: CPU so the per-cluster loop does not synchronise on every iteration.
-    #: ``-1`` marks a column no member occupies.
+    #: ``[num_clusters, page_group_size]`` cluster + column -> member row,
+    #: ``-1`` for an unfilled column. On the CPU so the per-cluster loop does
+    #: not synchronise every iteration.
     cluster_members_cpu: np.ndarray
     num_layers: int
     num_kv_heads: int
@@ -166,26 +160,31 @@ class SlotScoreSource(ABC):
 
     #: Stable identifier for logging.
     name: str
-    #: Whether the per-chunk scorer must run at all. A source that recomputes
-    #: from the cache does not read the chunk's own scores, so the scorer's
-    #: forward pass and its buffer write are skipped entirely.
+    #: Whether the per-chunk scorer must run at all: a recomputing source
+    #: reads none of the chunk's own scores, so both its forward pass and its
+    #: buffer write are skipped.
     needs_chunk_scores: bool
+
+    #: Whether a slot's score must survive between steps. A source rewriting
+    #: every live slot carries no history, so one buffer serves the whole step;
+    #: one keeping what an earlier chunk wrote needs a buffer per request.
+    #: ``WorkspaceSpec`` reads this to size it -- once vs ``max_num_seqs``.
+    slots_persist_across_steps: bool
 
     @abstractmethod
     def describe(self) -> str:
-        """One sentence naming what this source computes, for the startup log.
-        The choice changes what the eviction actually ranks, so it is reported
-        rather than left implicit — but only by the caller that knows the regime
-        consumes it (the ratio regime never does)."""
+        """One sentence for the startup log. The choice changes what the
+        eviction ranks, so it is reported rather than left implicit -- but only
+        by the caller that knows the regime consumes it."""
 
     @abstractmethod
     def fill(self, target: SlotFillTarget, inputs: ChunkScoreInputs) -> None:
         """Bring ``target.buffer`` up to date for every live slot.
 
         A source must leave a valid score at every slot in
-        ``[0, prev_len + chunk_len)`` of each (layer, group), and must not read
-        or leave meaning in slots beyond it: the eviction writeback blanks the
-        tail, and the keep decision masks it.
+        ``[0, prev_len + chunk_len)`` of each entry, and must neither read nor
+        leave meaning beyond it: the writeback blanks that tail and the keep
+        decision masks it.
         """
 
 
@@ -193,20 +192,19 @@ class PersistedChunkScores(SlotScoreSource):
     """Keep the score each position's own chunk produced.
 
     The fresh chunk's scores are scattered to ``[prev_len, prev_len + chunk)``
-    and earlier slots are left as they are. Cheap — no extra reads — but the
-    ranking mixes scores calibrated against different chunks, so it is an
-    approximation for any scorer whose score is relative to its chunk.
+    and earlier slots left alone. No extra reads, but the ranking mixes scores
+    calibrated against different chunks -- an approximation for any scorer whose
+    score is relative to its own chunk.
     """
 
     name = "persist"
     needs_chunk_scores = True
+    # An earlier chunk's scores are the whole point.
+    slots_persist_across_steps = True
 
     def __init__(self, forced_over_recompute: bool = False) -> None:
-        # True only when the scorer COULD have rescored the cache and the user
-        # asked for persistence anyway (the ablation described in
-        # ``make_slot_score_source``). It changes nothing this class does; it
-        # only makes the startup line state why the cheaper source was taken,
-        # since "the scorer cannot rescore" would be false in that case.
+        # Set only when the scorer COULD have rescored and persistence was
+        # asked for anyway; it only keeps the startup line honest.
         self.forced_over_recompute = forced_over_recompute
 
     def describe(self) -> str:
@@ -220,8 +218,7 @@ class PersistedChunkScores(SlotScoreSource):
     def fill(self, target: SlotFillTarget, inputs: ChunkScoreInputs) -> None:
         pending = inputs.pending
         chunk_len = pending.shape[-1]
-        # Members of one cluster share its length, so a member's write offset is
-        # a lookup of its cluster's pre-chunk length.
+        # A member's write offset is its cluster's shared pre-chunk length.
         member_offset = inputs.prev_lens_device.reshape(-1)[
             target.member_to_cluster].view(
                 target.num_layers, target.num_kv_heads, 1)
@@ -234,20 +231,21 @@ class PersistedChunkScores(SlotScoreSource):
 class RecomputedCacheScores(SlotScoreSource):
     """Recompute every live position's score from the cached keys.
 
-    This is what a key-similarity method (KeyDiff) actually specifies: the score
-    is relative to the keys currently in the cache, so it changes as the cache
-    changes and is only correct when computed against the present cache. Because
-    the keys are already stored, nothing else has to be — the chunk's own scores
-    are not even needed, so the per-chunk scorer is skipped.
+    What a key-similarity method (KeyDiff) actually specifies: the score is
+    relative to the keys currently cached, so it is only correct against the
+    present one. The keys being stored already, nothing else has to be -- the
+    chunk's own scores are not needed, so the per-chunk scorer is skipped.
 
-    The cost is one read of the request's cached keys per eviction, ordered
-    (layer, group) so only one group's keys are materialised at a time. The
-    eviction writeback that follows already gathers and rewrites both keys and
-    values, so this adds a fraction of traffic that is already being paid.
+    Costs one read of the cached keys per eviction, ordered (layer, group) so
+    only one group is materialised at a time. The writeback that follows already
+    gathers and rewrites keys and values, so this is traffic already paid.
     """
 
     name = "recompute"
     needs_chunk_scores = False
+    # ``fill`` rewrites every live slot and blanks the rest, so nothing an
+    # earlier step left behind is ever read.
+    slots_persist_across_steps = False
 
     def __init__(self, scorer: nn.Module) -> None:
         self.scorer = scorer
@@ -272,16 +270,10 @@ class RecomputedCacheScores(SlotScoreSource):
         for static_idx in range(target.num_layers):
             for group_idx in range(target.num_groups):
                 cluster_id = static_idx * target.num_groups + group_idx
-                rows = target.cluster_members_cpu[cluster_id]
-                if (rows < 0).any():
-                    if (rows < 0).all():
-                        continue  # Empty cluster: no member holds these slots.
-                    # A member left unscored here would rank on the previous
-                    # chunk's scores while its peers rank on the rescored ones.
-                    raise RuntimeError(
-                        f"fill: cluster {cluster_id} holds members in some "
-                        f"columns but not others ({rows.tolist()}); a cluster "
-                        "map must leave a cluster either full or empty.")
+                rows = cluster_member_rows(
+                    target.cluster_members_cpu, cluster_id, caller="fill")
+                if rows is None:
+                    continue
                 num_positions = int(live_lens[static_idx, group_idx])
                 if num_positions == 0:
                     flat[rows] = neg_inf
@@ -321,34 +313,25 @@ def make_slot_score_source(
 ) -> SlotScoreSource:
     """Bind the score source, normally from what the scorer supports.
 
-    ``source="auto"`` (the production setting) is not a user-facing choice: a
-    scorer either can rescore cached positions or it cannot, and picking the
-    wrong one is either impossible (recompute without ``score_cached``) or
-    a silent accuracy loss (persist when the method specifies a cache-relative
-    score). Hence recompute whenever the scorer offers it, persist otherwise.
+    ``"auto"``, the production setting, is not a real choice: a scorer either
+    can rescore cached positions or cannot, and the wrong answer is either
+    impossible or a silent accuracy loss. So recompute whenever the scorer
+    offers it, persist otherwise.
 
-    An explicit source name overrides that, which exists for ONE reason: an
-    ablation. Moving a run from the ratio regime to a budget changes two things
-    at once for a rescoring scorer — the retention target (and with it lock-in
-    and the candidate set) and the score itself (chunk-local anchor -> whole-
-    cache anchor). Forcing ``"persist"`` holds the score fixed at what the ratio
-    regime also ranks, so the two effects can be measured apart. It is a
-    measurement instrument, not a tuning knob: on a rescoring scorer it ranks
-    positions by scores their own chunks produced, which the method does not
-    specify. Forcing ``"recompute"`` on a scorer that cannot rescore is rejected
-    outright rather than degraded.
-
-    The caller logs ``describe()`` if the active regime consumes the source.
+    An explicit name overrides that for ONE reason, an ablation. For a rescoring
+    scorer, moving from ratio to budget changes the retention target AND the
+    score itself, so forcing ``"persist"`` holds the score fixed and the two can
+    be measured apart. A measurement instrument, not a tuning knob -- it ranks
+    by scores the method does not specify. Forcing ``"recompute"`` on a scorer
+    that cannot rescore is rejected, not degraded.
     """
-    if source == SLOT_SCORE_SOURCE_AUTO:
-        return (RecomputedCacheScores(scorer) if _supports_recompute(scorer)
-                else PersistedChunkScores())
-    if source not in SLOT_SCORE_SOURCES:
+    if source != SLOT_SCORE_SOURCE_AUTO and source not in SLOT_SCORE_SOURCES:
         raise ValueError(
             f"slot score source must be one of {SLOT_SCORE_SOURCE_CHOICES}, "
             f"got {source!r}.")
-    if source == RecomputedCacheScores.name:
-        if not _supports_recompute(scorer):
+    supports_recompute = _supports_recompute(scorer)
+    if _source_class(supports_recompute, source) is RecomputedCacheScores:
+        if not supports_recompute:
             scorer_name = (getattr(scorer, "name", type(scorer).__name__)
                            if scorer is not None else "none")
             raise ValueError(
@@ -358,7 +341,8 @@ def make_slot_score_source(
                 f"'{scorer_name}'. Use 'auto', or pick a scorer from "
                 "scorer.RESCORING_QK_SCORERS.")
         return RecomputedCacheScores(scorer)
-    forced_over_recompute = _supports_recompute(scorer)
+    forced_over_recompute = (supports_recompute
+                            and source != SLOT_SCORE_SOURCE_AUTO)
     if forced_over_recompute:
         logger.warning(
             "KV budget eviction: slot score source forced to 'persist' while "
@@ -367,3 +351,37 @@ def make_slot_score_source(
             "the scorer specifies — this setting is for ablations, not for "
             "serving. Unset --compression-slot-score-source to restore 'auto'.")
     return PersistedChunkScores(forced_over_recompute=forced_over_recompute)
+
+
+def _source_class(
+    supports_recompute: bool,
+    source: str,
+) -> type[SlotScoreSource]:
+    """The selection RULE in one place: ``auto`` takes recompute exactly when
+    the scorer can rescore, an explicit name is taken as given. Both entry
+    points go through it, so the one that builds the source and the one that
+    sizes its memory cannot drift apart."""
+    if source == SLOT_SCORE_SOURCE_AUTO:
+        return (RecomputedCacheScores if supports_recompute
+                else PersistedChunkScores)
+    return (RecomputedCacheScores if source == RecomputedCacheScores.name
+            else PersistedChunkScores)
+
+
+def slot_scores_persist_across_steps(scorer: str, source: str) -> bool:
+    """Whether the slot score buffer needs one row per concurrent request,
+    answered from the configuration alone.
+
+    The workspace is allocated inside ``load_model``, before any scorer exists,
+    so this cannot be asked of the source object -- and need not be: whether a
+    scorer can rescore is a property of its CLASS, published as
+    ``scorer.RESCORING_QK_SCORERS``, and the rule is shared with
+    :py:func:`make_slot_score_source` through ``_source_class``.
+
+    The ``"fastkvzip"`` gate is not a rescoring scorer, nor is any name outside
+    the registry, so both answer True.
+    """
+    # Not at module scope: config validation imports this module too.
+    from vllm.v1.attention.compression.scorer import RESCORING_QK_SCORERS
+    cls = _source_class(scorer in RESCORING_QK_SCORERS, source)
+    return cls.slots_persist_across_steps

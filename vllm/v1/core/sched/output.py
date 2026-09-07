@@ -157,13 +157,47 @@ class CachedRequestData:
         )
 
 
+# PREFILL ASSUMPTIONS
+#
+# Compression runs on chunked prefill only, and extending it to decode is a
+# committed direction. These are the six places that assume the step being
+# compressed is a prefill chunk, collected here so the cost of that extension
+# can be read in one place instead of rediscovered site by site. Pointers are
+# by symbol, not by line: line numbers rot within a commit or two.
+#
+#   scheduler.py  Scheduler._maybe_add_compression_metadata
+#       Attaches no metadata at all once num_computed_tokens reaches
+#       num_prompt_tokens, so a decode step arrives with no directives.
+#   scheduler.py  Scheduler._compression_chunk_cap
+#       Caps a step at the distance to the next chunk boundary only while the
+#       request is still inside its prompt; a decode step is never capped.
+#   this dataclass  chunk_in_sequence_idx, is_last_chunk,
+#                   compression_chunk_len, total_prompt_tokens
+#       Four fields expressing a geometry a decode step does not have: it is
+#       one token, with no chunk index, no final chunk, and no prompt total.
+#   compressor.py  KVCompressor._assert_once_only
+#       Requires the incoming lengths to equal what the last eviction
+#       committed, which a decode step interleaved between two chunks would
+#       have advanced.
+#   eviction_regime.py  RatioRegime._adjusted_ratio
+#       Divides by total_prompt_tokens to window-correct the keep fraction;
+#       with no prompt total the fraction is undefined.
+#   eviction_regime.py  _ChunkLocalWorkspace.build_eval_scores
+#       Hands this chunk's observation window to the next chunk only when
+#       chunk_len >= window_size. A decode step is one token, so any window
+#       wider than that takes the degenerate branch and reuses a stale carry.
+#
+# Consequence for anything added to this dataclass: a new required field must
+# not be chunk-shaped, or it adds a seventh entry to this list.
+
+
 @dataclass
 class CompressionRequestMetadata:
     """Per-request compression directives attached to ``SchedulerOutput``.
 
     Populated only for prefill chunks of compression-enabled requests;
     empty otherwise. Consumed by
-    ``GpuModelRunner._execute_with_compression``.
+    ``CompressionModelRunnerMixin._compression_step``.
     """
     req_id: str
     # Keep fraction of the re-eval region per chunk

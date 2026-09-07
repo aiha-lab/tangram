@@ -28,6 +28,7 @@ from vllm.utils import random_uuid
 
 from .cache import CacheConfig
 from .compilation import CompilationConfig, CompilationMode, CUDAGraphMode
+from .compression import default_attention_backend
 from .device import DeviceConfig
 from .ec_transfer import ECTransferConfig
 from .kv_events import KVEventsConfig
@@ -344,6 +345,12 @@ class VllmConfig:
 
         # To give each torch profile run a unique instance name.
         self.instance_id = f"{time.time_ns()}"
+
+        # Ragged paging runs only on FlashAttention, and naming the backend
+        # writes process-global state, so it is decided here with the rest of
+        # this engine's cross-config choices rather than in CacheConfig. First,
+        # because the per-model config hooks below already read the choice.
+        default_attention_backend(self.cache_config)
 
         self.try_verify_and_update_config()
 
