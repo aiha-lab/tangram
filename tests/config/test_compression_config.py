@@ -185,8 +185,18 @@ def test_unvalidated_architecture_is_rejected():
         CacheConfig(page_group_size=4).verify_model_support("MambaForCausalLM")
 
 
-def test_validated_architecture_passes():
-    CacheConfig(page_group_size=4).verify_model_support("LlamaForCausalLM")
+def test_every_advertised_architecture_passes():
+    """The README's "Supported Models" table is the promise; the allowlist is
+    what enforces it, so a model advertised there and missing here would fail
+    at startup. Checked together to keep the two from drifting."""
+    for architecture in (
+        "LlamaForCausalLM",  # meta-llama/Llama-3.1-8B-Instruct
+        "Qwen3ForCausalLM",  # Qwen/Qwen3-4B-Instruct-2507
+        "Qwen3MoeForCausalLM",  # Qwen/Qwen3-30B-A3B-Instruct-2507
+        "Gemma3ForConditionalGeneration",  # google/gemma-3-12b-it
+        "GptOssForCausalLM",  # openai/gpt-oss-20b
+    ):
+        CacheConfig(page_group_size=4).verify_model_support(architecture)
 
 
 def test_allowlist_is_not_consulted_without_the_feature():

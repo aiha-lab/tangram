@@ -116,7 +116,7 @@ The following models have been verified with Tangram. More models are on the way
 | GPT-OSS-20B | [`openai/gpt-oss-20b`](https://huggingface.co/openai/gpt-oss-20b) |
 | Qwen3-30B-A3B (MoE)&nbsp;* | [`Qwen/Qwen3-30B-A3B-Instruct-2507`](https://huggingface.co/Qwen/Qwen3-30B-A3B-Instruct-2507) |
 
-\* Verified with `tensor_parallel_size=2` and `compression_budget_scope="uniform"` — `layer` / `global` require `tensor_parallel_size=1`.
+\* Verified at `tensor_parallel_size=1`, and at `tensor_parallel_size=2` with `compression_budget_scope="uniform"` (`layer` and `global` are `tensor_parallel_size=1` only).
 
 ## Accuracy
 

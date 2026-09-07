@@ -36,6 +36,7 @@ RAGGED_SUPPORTED_ARCHITECTURES = frozenset(
         "LlamaForCausalLM",
         "Qwen2ForCausalLM",
         "Qwen3ForCausalLM",
+        "Qwen3MoeForCausalLM",
         "Gemma3ForCausalLM",
         "Gemma3ForConditionalGeneration",
         "GptOssForCausalLM",
