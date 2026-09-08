@@ -244,6 +244,21 @@ def create_dummy_kv_cache(
     return kv_cache
 
 
+def keep_decision(score: torch.Tensor, keep: float):
+    """The keep decision at one retention, in the form ties cannot perturb.
+
+    A scorer that max-pools its scores leaves runs of identical values, so the
+    k-th and (k+1)-th are routinely equal and which member of a tied run
+    ``topk`` returns is settled by index order rather than by the math.
+    Comparing raw indices would therefore test the tie-break. Returns the kept
+    score values and the mask of positions scoring STRICTLY above the
+    boundary -- together, the part of the decision no tie-break can move.
+    """
+    n = int(score.shape[-1] * keep)
+    values = torch.topk(score, n, dim=-1).values
+    return values, score > values[..., -1:]
+
+
 @dataclass
 class BackendConfig:
     name: str
