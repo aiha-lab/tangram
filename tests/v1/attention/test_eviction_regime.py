@@ -23,11 +23,16 @@ from vllm.v1.attention.compression.workspace import (
 from vllm.v1.attention.compression.keep_lengths import _apportion_blocks
 
 
-@pytest.fixture(scope="module", autouse=True)
+@pytest.fixture(autouse=True)
 def single_rank_parallel_state():
     """The budget scopes query the tensor-parallel world size to decide
     whether to all-gather. Stand up a one-process gloo group so they can run on
-    the CPU; the gather branch is never taken at world size 1."""
+    the CPU; the gather branch is never taken at world size 1.
+
+    Per test, not per module: ``tests/conftest.py`` destroys the distributed
+    state after every test, so a module-scoped group would outlive only the
+    first one.
+    """
     from vllm.distributed.parallel_state import (
         ensure_model_parallel_initialized,
         init_distributed_environment,
