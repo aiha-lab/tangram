@@ -1,0 +1,9 @@
+6fb0215eee44cf5e4b28f57e6739ef4a51945127
+
+The upstream vLLM commit this fork branched from, and the one whose prebuilt
+wheel supplies the compiled extensions under VLLM_USE_PRECOMPILED=1. Only the
+first token is read; the rest of this file is documentation.
+
+Tangram itself changes no compiled source, so that wheel matches this tree
+exactly. Rebasing onto a newer upstream must update this commit --
+tests/test_vllm_base_commit.py fails, offline, when it goes stale.
