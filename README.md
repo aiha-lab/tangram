@@ -20,6 +20,18 @@ Tangram: Unlocking Non-Uniform KV Cache Compression for Efficient Multi-turn LLM
 </p>
 
 <p align="center">
+  <video src="https://github.com/user-attachments/assets/c95750e8-2ab5-41b3-a8d7-e209c8ead399"
+         width="100%" autoplay loop muted playsinline></video>
+</p>
+
+<p align="center">
+  <sub>Four ~100K-token multi-turn requests, five turns each, on one RTX A6000 (48GB).
+  At <code>budget=16K</code> the same memory serves more requests
+  concurrently, with a lighter decode step:
+  <b>615s → 240s</b>, 2.9× the throughput.</sub>
+</p>
+
+<p align="center">
   <img src="docs/assets/speedup/speedup.png" alt="Tangram end-to-end speedup vs vLLM 0.11.1" width="100%"/>
 </p>
 
