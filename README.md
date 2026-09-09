@@ -57,6 +57,7 @@ practical for multi-turn LLM serving, built on top of
 ## Installation
 
 ```bash
+# Ragged paging runs on FlashAttention only: needs sm_80+ (Ampere or newer).
 git clone https://github.com/aiha-lab/tangram.git
 cd tangram
 uv venv --python 3.12

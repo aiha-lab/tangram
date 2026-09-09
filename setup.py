@@ -442,6 +442,53 @@ class precompiled_wheel_utils:
             )
             return "nightly"
 
+    @staticmethod
+    def wheel_tag() -> str:
+        import platform
+
+        arch = platform.machine()
+        if arch == "x86_64":
+            return "manylinux1_x86_64"
+        if arch == "aarch64":
+            return "manylinux2014_aarch64"
+        raise ValueError(f"Unsupported architecture: {arch}")
+
+    @staticmethod
+    def pinned_wheel_url() -> str | None:
+        """The wheel named by ``.vllm_base_commit``, or ``None`` if unpinned.
+
+        Tangram branched from a fixed upstream commit and changes no compiled
+        source, so the wheel built at that commit is the correct one and stays
+        correct. Reading it from the file makes the choice deterministic and
+        keeps the build from deriving a constant over the network: without the
+        pin, the commit is resolved by querying GitHub for upstream's current
+        ``main`` and fetching its history, and any failure there silently
+        substitutes the nightly wheel, which is built from a different source
+        tree. A pinned wheel that is missing raises instead.
+        """
+        pin = ROOT_DIR / ".vllm_base_commit"
+        if not pin.is_file():
+            return None
+        commit = pin.read_text().split(maxsplit=1)[0]
+        tag = precompiled_wheel_utils.wheel_tag()
+        url = f"https://wheels.vllm.ai/{commit}/vllm-1.0.0.dev-cp38-abi3-{tag}.whl"
+
+        from urllib.error import URLError
+        from urllib.request import Request, urlopen
+
+        try:
+            with urlopen(Request(url, method="HEAD")) as resp:
+                if resp.status != 200:
+                    raise RuntimeError(f"HTTP {resp.status}")
+        except (URLError, RuntimeError) as err:
+            raise RuntimeError(
+                f"Cannot reach the pinned vLLM wheel for {commit}: {err}. "
+                "Either the network is unavailable, or the wheel is gone and "
+                "the pin in .vllm_base_commit needs updating. To build the "
+                "extensions from source instead, unset VLLM_USE_PRECOMPILED."
+            ) from err
+        return url
+
 
 def _no_device() -> bool:
     return VLLM_TARGET_DEVICE == "empty"
@@ -646,19 +693,14 @@ package_data = {
 # If using precompiled, extract and patch package_data (in advance of setup)
 if envs.VLLM_USE_PRECOMPILED:
     assert _is_cuda(), "VLLM_USE_PRECOMPILED is only supported for CUDA builds"
-    wheel_location = os.getenv("VLLM_PRECOMPILED_WHEEL_LOCATION", None)
+    wheel_location = (
+        os.getenv("VLLM_PRECOMPILED_WHEEL_LOCATION")
+        or precompiled_wheel_utils.pinned_wheel_url()
+    )
     if wheel_location is not None:
         wheel_url = wheel_location
     else:
-        import platform
-
-        arch = platform.machine()
-        if arch == "x86_64":
-            wheel_tag = "manylinux1_x86_64"
-        elif arch == "aarch64":
-            wheel_tag = "manylinux2014_aarch64"
-        else:
-            raise ValueError(f"Unsupported architecture: {arch}")
+        wheel_tag = precompiled_wheel_utils.wheel_tag()
         base_commit = precompiled_wheel_utils.get_base_commit_in_main_branch()
         wheel_url = f"https://wheels.vllm.ai/{base_commit}/vllm-1.0.0.dev-cp38-abi3-{wheel_tag}.whl"
         nightly_wheel_url = (

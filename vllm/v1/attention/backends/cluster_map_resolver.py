@@ -246,5 +246,9 @@ def resolve_bundled_cluster_map(
             "mismatched field is named in the warning above)")
         return None
 
-    logger.info("Auto-resolved head-group cluster map: %s", path)
+    # The r<ratio> token reads as a contradiction next to any other
+    # compression_ratio unless it is named as provenance.
+    logger.info(
+        "Auto-resolved head-group cluster map: %s (r<ratio> is the retention "
+        "it was clustered at, not this run's compression_ratio)", path)
     return path
