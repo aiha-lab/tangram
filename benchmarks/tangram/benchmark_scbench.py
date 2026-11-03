@@ -38,7 +38,9 @@ from bench_common import (  # noqa: E402
 from scbench_local import (  # noqa: E402
     evaluate_answer,
     f1_score,
+    followup_turn_prefix,
     get_data_list,
+    harmony_final,
     load_dataset_all,
     set_gen_length,
     template,
@@ -79,6 +81,7 @@ def build_multi_turn_from_dataset(
     max_questions: int | None,
     max_tokens: int,
     max_model_len: int | None = None,
+    reasoning_effort: str | None = None,
 ) -> tuple[
     list[dict[str, list[int]]],
     list[list[list[int]]],
@@ -91,17 +94,22 @@ def build_multi_turn_from_dataset(
     Token assembly mirrors FastKVZip's DataWrapper / ModelKVzip exactly:
       Turn 0 = encode(prefix) + encode(context)        # prefill-only
       Turn k = encode("\\n\\n{query}") + encode(postfix)   # generation
+    except that questions after the first get ``followup_turn_prefix`` in
+    front (a user-message header for harmony with ``reasoning_effort``;
+    empty otherwise).
     vLLM uses ``multi_turn_token_ids[i][0]`` as the actual turn-0 prompt
     (overriding ``prompts``), so we also pass turn-0 IDs as the prompt.
     """
     task = get_eval_task(dataset_name)
-    prefix, postfix = template(model_name, dataset_name)
+    prefix, postfix = template(model_name, dataset_name, reasoning_effort)
 
     def encode(text: str) -> list[int]:
         return tokenizer.encode(text, add_special_tokens=False)
 
     prefix_ids = encode(prefix)
     postfix_ids = encode(postfix)
+    followup_prefix_ids = encode(
+        followup_turn_prefix(model_name, reasoning_effort))
 
     prompts: list[dict[str, list[int]]] = []
     multi_turn_token_ids: list[list[list[int]]] = []
@@ -127,10 +135,11 @@ def build_multi_turn_from_dataset(
         turn0_ids = prefix_ids + context_ids
 
         per_conv_turns = [turn0_ids]
-        for question in questions:
+        for q_idx, question in enumerate(questions):
             query_text = get_query_text(task, question)
+            header_ids = followup_prefix_ids if q_idx > 0 else []
             per_conv_turns.append(
-                encode(f"\n\n{query_text.strip()}") + postfix_ids
+                header_ids + encode(f"\n\n{query_text.strip()}") + postfix_ids
             )
 
         # Turn 0 emits one throwaway token (context-only prefill); turns 1+ run
@@ -191,6 +200,9 @@ def run_dataset(
     dataset = load_dataset_all(dataset_name, tokenizer, n_data=args.num)
     end_idx = min(args.idx + args.num, len(dataset))
     max_tokens = args.max_tokens or set_gen_length(dataset_name)
+    # The analysis channel spends tokens before the answer; give it its own share.
+    if args.reasoning_effort:
+        max_tokens += args.reasoning_budget
     max_questions = 1 if args.single_turn else args.max_questions
     eval_task = get_eval_task(dataset_name)
 
@@ -210,6 +222,7 @@ def run_dataset(
         max_questions=max_questions,
         max_tokens=max_tokens,
         max_model_len=args.max_model_len,
+        reasoning_effort=args.reasoning_effort,
     )
 
     if not prompts:
@@ -260,20 +273,29 @@ def run_dataset(
     queued_series: list[float] = []
     total_input_tokens = 0
     total_output_tokens = 0
+    # Reasoning runs score only the final channel, so channel markers must
+    # survive decoding: skip_special_tokens=True would merge analysis and final.
+    keep_channels = bool(args.reasoning_effort)
+    num_turns_reached_final = 0
+    num_turns_scored = 0
 
     for conv_idx, (output, gt_answers, sample_idx) in enumerate(
         zip(outputs, ground_truths, sample_indices)
     ):
         sample_predictions: list[str] = []
+        sample_reached_final: list[bool] = []
         sample_output_tokens = 0
 
         # turn_output_token_ids exists in the multi-turn path; the first entry
         # is turn 0 (context-only) and is dropped before evaluation.
         if output.turn_output_token_ids:
             for turn_ids in output.turn_output_token_ids[1:]:
-                sample_predictions.append(
-                    tokenizer.decode(turn_ids, skip_special_tokens=True)
-                )
+                text = tokenizer.decode(
+                    turn_ids, skip_special_tokens=not keep_channels)
+                if keep_channels:
+                    text, reached = harmony_final(text)
+                    sample_reached_final.append(reached)
+                sample_predictions.append(text)
                 sample_output_tokens += len(turn_ids)
         else:
             completion = output.outputs[0]
@@ -283,6 +305,8 @@ def run_dataset(
         n_eval = min(len(sample_predictions), len(gt_answers))
         predictions_flat.extend(sample_predictions[:n_eval])
         references_flat.extend(gt_answers[:n_eval])
+        num_turns_reached_final += sum(sample_reached_final[:n_eval])
+        num_turns_scored += n_eval
 
         per_turn_input_lengths = [
             len(ids) for ids in multi_turn_token_ids[conv_idx]
@@ -321,6 +345,7 @@ def run_dataset(
                 "total_input_tokens": sample_input_tokens,
                 "total_output_tokens": sample_output_tokens,
                 "predictions": sample_predictions[:n_eval],
+                "reached_final": sample_reached_final[:n_eval] if keep_channels else None,
                 "ground_truths": gt_answers[:n_eval],
                 "timing_sec": timing,
             }
@@ -428,6 +453,12 @@ def run_dataset(
         "compression_n_sink_tokens": args.compression_n_sink_tokens,
         "page_group_size": args.page_group_size,
         "max_tokens": max_tokens,
+        # gpt-oss only: reasoning allowed, final channel scored. A turn cut off
+        # before its final channel scores as an empty answer.
+        "reasoning_effort": args.reasoning_effort,
+        "reasoning_budget": args.reasoning_budget if args.reasoning_effort else 0,
+        "reached_final": (round(num_turns_reached_final / num_turns_scored, 4)
+                          if keep_channels and num_turns_scored else None),
         "num_samples": len(per_sample),
         "total_qa_pairs": len(scores),
         "avg_score": round(avg_score, 4),
@@ -491,6 +522,16 @@ def build_argument_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--tag", type=str, default="")
     parser.add_argument(
+        "--reasoning-effort", choices=["low", "medium", "high"], default=None,
+        help="gpt-oss only: open the analysis channel at this effort and score "
+             "the final channel. Unset forces the final channel (no reasoning).",
+    )
+    parser.add_argument(
+        "--reasoning-budget", type=int, default=2048,
+        help="Output tokens per turn added for reasoning on top of the "
+             "dataset's answer length (with --reasoning-effort).",
+    )
+    parser.add_argument(
         "--skip-existing", action="store_true",
         help="Skip datasets whose result JSON already exists, so an "
              "interrupted sweep re-run with the same command fills only the "
@@ -511,7 +552,10 @@ def main() -> None:
     model_basename = os.path.basename(args.model_path.rstrip("/"))
     dataset_names = get_data_list(args.data, model_basename, args.max_model_len)
 
-    tag_suffix = f"_{args.tag}" if args.tag else ""
+    tags = [args.tag] if args.tag else []
+    if args.reasoning_effort:
+        tags.append(f"reason-{args.reasoning_effort}")
+    tag_suffix = "".join(f"_{t}" for t in tags)
 
     def save_path_for(dataset_name: str) -> str:
         return os.path.join(

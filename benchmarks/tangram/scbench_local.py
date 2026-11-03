@@ -129,9 +129,29 @@ def get_data_list(
 # Prompt templates (FastKVZip/prefill/model/template.py: template)
 # ---------------------------------------------------------------------------
 
-def template(model_name: str, task: str) -> tuple[str, str]:
+# Harmony (gpt-oss) system message, as the model's chat template writes it
+# for ``reasoning_effort``. The template stamps today's date; it is pinned here
+# so a prompt does not change from one day's run to the next.
+HARMONY_DATE = "2026-10-27"
+HARMONY_SYSTEM = (
+    "<|start|>system<|message|>You are ChatGPT, a large language model trained "
+    "by OpenAI.\nKnowledge cutoff: 2024-06\nCurrent date: {date}\n\n"
+    "Reasoning: {effort}\n\n# Valid channels: analysis, commentary, final. "
+    "Channel must be included for every message.<|end|>"
+)
+HARMONY_FINAL = "<|channel|>final<|message|>"
+HARMONY_STOPS = ("<|return|>", "<|end|>")
+
+
+def template(
+    model_name: str, task: str, reasoning_effort: str | None = None
+) -> tuple[str, str]:
     """Return (prefix, postfix) wrapping a context+question prompt for the
-    given model family and task."""
+    given model family and task.
+
+    ``reasoning_effort`` (low/medium/high) applies to gpt-oss only: the analysis
+    channel is opened, as in OpenAI's own evaluation of the model. Other
+    families ignore it."""
     model_name = model_name.lower()
 
     if "llama" in model_name or model_name == "duo":
@@ -164,6 +184,12 @@ def template(model_name: str, task: str) -> tuple[str, str]:
         prefix = "<|start|>system<|message|>You are a helpful assistant.<|end|>"
         prefix += "<|start|>user<|message|>"
         postfix = "<|end|><|start|>assistant<|channel|>final<|message|>"
+        if reasoning_effort:
+            # The chat template's own prompt: the assistant turn is left open so
+            # the model reasons in the analysis channel before the final one.
+            prefix = HARMONY_SYSTEM.format(date=HARMONY_DATE, effort=reasoning_effort)
+            prefix += "<|start|>user<|message|>"
+            postfix = "<|end|><|start|>assistant"
     else:
         print(
             "**Warning** No prompt template for this model; using a generic "
@@ -184,6 +210,43 @@ def template(model_name: str, task: str) -> tuple[str, str]:
         )
 
     return prefix, postfix
+
+
+def harmony_final(text: str) -> tuple[str, bool]:
+    """The final-channel answer in a gpt-oss output decoded with special
+    tokens kept, and whether the output reached that channel at all.
+
+    e.g. ``<|channel|>analysis<|message|>...<|end|><|start|>assistant
+    <|channel|>final<|message|>887<|return|>`` -> ``("887", True)``. An output
+    cut off while still reasoning has no final channel: ``("", False)``."""
+    if HARMONY_FINAL not in text:
+        return "", False
+
+    final = text.split(HARMONY_FINAL)[-1]
+    for stop in HARMONY_STOPS:
+        final = final.split(stop)[0]
+    return final.strip(), True
+
+
+def followup_turn_prefix(
+    model_name: str, reasoning_effort: str | None = None
+) -> str:
+    """Header that opens a user message for every question after the first.
+
+    The first question continues the user message ``template``'s prefix opened
+    around the context; later ones follow the previous answer. Harmony
+    (gpt-oss) needs an explicit ``<|start|>user<|message|>`` there: without it
+    the question reads as text after the assistant's message, and gpt-oss
+    learns to keep generating past its answer (``...\\n\\nQ: ...``) instead of
+    emitting ``<|return|>``. Without ``reasoning_effort`` gpt-oss keeps the
+    FastKVZip turn format, as other families do."""
+    if not reasoning_effort:
+        return ""
+
+    model_name = model_name.lower()
+    if model_name.startswith("gpt-oss") or model_name.startswith("gpt_oss"):
+        return "<|start|>user<|message|>"
+    return ""
 
 
 # ---------------------------------------------------------------------------

@@ -69,6 +69,10 @@ flag --skip-existing "${RESUME:-0}"
 # fastkvzip only; unset lets the engine auto-resolve the gate.
 opt --compression-gate-path "${GATE_PATH:-}"
 opt --compression-scorer-options "${SCORER_OPTIONS:-}"
+# gpt-oss only: REASONING_EFFORT=low opens the analysis channel and scores the
+# final one; REASONING_BUDGET adds output tokens per turn for it (default 2048).
+opt --reasoning-effort "${REASONING_EFFORT:-}"
+opt --reasoning-budget "${REASONING_BUDGET:-}"
 opt --compression-chunk-size "${CHUNK_SIZE}"
 opt --compression-window-size "${WINDOW_SIZE}"
 # A .npz from tools/head_group_clustering; unset or missing falls back to
