@@ -27,7 +27,6 @@ from vllm.logger import init_logger
 from vllm.v1.attention.compression.budget_scope import (
     POOLED_BUDGET_SCOPES,
 )
-from vllm.v1.attention.compression.scorer import QK_SCORERS
 from vllm.v1.attention.compression.slot_scores import (
     slot_scores_persist_across_steps,
 )
@@ -73,8 +72,9 @@ class WorkspaceSpec:
     #: Rows of per-position statistics: ``max_num_reqs`` when the source keeps
     #: scores between steps, 1 when it rewrites every live slot, 0 when none.
     slot_rows: int
-    #: dtype the active scorer produces, held exactly: the gate emits the model
-    #: dtype and qk scorers float32, and rounding would change the decision.
+    #: dtype the active scorer produces, held exactly: every scorer emits
+    #: float32 (the gate's norms and sink keys are float32 in its checkpoint),
+    #: and rounding would change the decision.
     score_dtype: torch.dtype
 
     @staticmethod
@@ -163,9 +163,9 @@ class WorkspaceSpec:
                          if slot_scores_persist_across_steps(
                              scorer, slot_score_source)
                          else 1)
-        # qk scorers need float32 for a stable reduction; the gate does not.
-        score_dtype = (torch.float32
-                       if scorer in QK_SCORERS else model_dtype)
+        # qk scorers reduce in float32, and the gate promotes to float32
+        # through its float32 norms and sink keys.
+        score_dtype = torch.float32
         return WorkspaceSpec(
             num_layers=num_layers,
             num_kv_heads=num_kv_heads,
