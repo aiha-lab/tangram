@@ -7,7 +7,6 @@ from collections.abc import Callable, Mapping
 from functools import partial
 from typing import TYPE_CHECKING, Any, Optional
 
-import numpy as np
 import torch
 
 from vllm.multimodal.inputs import MultiModalFeatureSpec
@@ -148,13 +147,15 @@ class Request:
 
         self.skip_reading_prefix_cache = self.get_skip_reading_prefix_cache()
 
-        # Scheduler-side mirror of post-compression cache occupancy, one
-        # kept length per (layer, head group) because compression leaves them
-        # different. Set after each compression-active prefill step, then
-        # incremented by ``num_scheduled`` on non-compression steps. The
-        # scheduler sizes ``allocate_slots`` from this instead of
-        # ``num_computed_tokens``. ``None`` for non-compression requests.
-        self.compress_eff_seq_lens: np.ndarray | None = None
+        # Scheduler-side mirror of post-compression cache occupancy. Set
+        # to the kept length after each compression-active prefill step,
+        # then incremented by ``num_scheduled`` on non-compression steps.
+        # The scheduler uses this instead of ``num_computed_tokens`` to
+        # size ``allocate_slots``. ``None`` for non-compression requests.
+        self.compress_max_eff_seq_len: int | None = None
+        # Blocks the head groups compression shortened need fewer than the
+        # longest one; fixed between compressions. See ``ragged_allocation``.
+        self.compress_spare_blocks: int = 0
 
         # Once-only compression: True (sticky) once the initial prefill
         # cycle finishes; the scheduler then stops emitting compression
@@ -294,7 +295,8 @@ class Request:
         yet unfinished (engine livelock).
         """
         self.compression_done = False
-        self.compress_eff_seq_lens = None
+        self.compress_max_eff_seq_len = None
+        self.compress_spare_blocks = 0
         num_absorbed = self.num_output_tokens
         self.absorb_output_into_prompt()
         self.max_tokens = max(1, self.max_tokens - num_absorbed)

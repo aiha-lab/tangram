@@ -3,14 +3,15 @@
 """How many blocks a ragged request costs.
 
 Compression leaves each head group a different length, so what a request
-occupies is the SUM over groups::
+occupies is about the SUM over groups::
 
-    blocks = sum_g ceil(len_g / block_size)
+    blocks ~= sum_g ceil(len_g / block_size)
 
 Sizing it as a rectangle over the longest group instead -- ``ceil(max_g len_g /
 block_size) x num_groups`` -- hands the pages back that compression just freed,
 which is invisible in an accuracy benchmark and shows up only as fewer
-concurrent requests. These pin the sum.
+concurrent requests. These pin the sum, and that decode still allocates once
+per block of tokens rather than on almost every step.
 
 Everything runs on CPU with no model. Run without the root conftest, which
 imports a package this fork does not install:
@@ -22,11 +23,15 @@ import pytest
 import torch
 
 from vllm.v1.core.block_pool import BlockPool
+from vllm.v1.core.ragged_allocation import (
+    group_block_depths,
+    spare_blocks,
+)
 from vllm.v1.core.single_type_kv_cache_manager import (
     FullAttentionManager,
     SingleTypeKVCacheManager,
 )
-from vllm.v1.kv_cache_interface import RaggedAttentionSpec
+from vllm.v1.kv_cache_interface import FullAttentionSpec, RaggedAttentionSpec
 
 pytestmark = pytest.mark.cpu_test
 
@@ -59,8 +64,8 @@ def make_manager() -> SingleTypeKVCacheManager:
     return FullAttentionManager(spec, pool, kv_cache_group_id=0)
 
 
-def blocks_for(per_group_tokens) -> int:
-    """The sum rule, written out for the tests to compare against."""
+def exact_blocks(per_group_tokens) -> int:
+    """The exact sum rule, written out for the tests to compare against."""
     return int(np.ceil(np.asarray(per_group_tokens) / BLOCK_SIZE).sum())
 
 
@@ -91,67 +96,40 @@ def test_a_scalar_need_hands_out_that_many_ids():
     assert held(manager) == 3 * NUM_HEAD_GROUPS
 
 
-# --- the per-group path: after compression the groups diverge -------------
+# --- the compressed path: after compression the groups diverge ----------
+
+# Kept lengths a compression could leave: every group at a different offset
+# inside its last block, so the groups cross block edges on different steps.
+KEPT = np.array([12, 5, 9, 6], dtype=np.int64)
+LONGEST = int(KEPT.max())
+MAX_LEN = 1 << 20
 
 
-def test_a_per_group_need_costs_the_sum_not_the_rectangle():
-    """The whole point: a request whose groups kept 12, 4, 8 and 4 tokens is
-    priced at 3 + 1 + 2 + 1 = 7 blocks, not at 3 x 4 = 12."""
+def compact(manager: SingleTypeKVCacheManager) -> None:
+    """Hold what compaction leaves: each group trimmed to its own last block."""
+    manager.allocate_new_blocks(REQ, LONGEST, spare_blocks(KEPT, BLOCK_SIZE))
+    assert held(manager) == exact_blocks(KEPT)
+
+
+def test_spare_blocks_counts_what_short_groups_need_less():
+    """Gaps to the longest group are 0, 7, 3 and 6 tokens: whole blocks 0, 1,
+    0 and 1."""
+    assert spare_blocks(KEPT, BLOCK_SIZE) == 2
+
+
+def test_spare_blocks_is_zero_when_the_groups_agree():
+    assert spare_blocks(np.full(NUM_HEAD_GROUPS, 10), BLOCK_SIZE) == 0
+
+
+def test_a_compressed_need_costs_the_sum_not_the_rectangle():
+    """The whole point: groups that kept 12, 5, 9 and 6 tokens are priced at
+    3 + 2 + 3 + 2 = 10 blocks, not at 3 x 4 = 12."""
     manager = make_manager()
-    per_group = np.array([12, 4, 8, 4], dtype=np.int64)
 
-    cost = manager.get_num_blocks_to_allocate(REQ, per_group, [])
+    cost = manager.get_num_blocks_to_allocate(
+        REQ, LONGEST, [], spare_blocks(KEPT, BLOCK_SIZE))
 
-    assert cost == blocks_for(per_group) == 7
-
-
-def test_a_per_group_need_hands_out_the_sum():
-    manager = make_manager()
-    per_group = np.array([12, 4, 8, 4], dtype=np.int64)
-
-    new_ids = manager.allocate_new_blocks(REQ, per_group)
-
-    assert new_ids.size == 7
-    assert held(manager) == 7
-
-
-def test_a_uniform_per_group_need_matches_the_scalar_rule():
-    """The two rules are the same function when the groups agree, which is
-    what makes the switch safe before the first compression."""
-    manager = make_manager()
-
-    scalar = manager.get_num_blocks_to_allocate(REQ, 10, [])
-    vector = manager.get_num_blocks_to_allocate(
-        REQ, np.full(NUM_HEAD_GROUPS, 10, dtype=np.int64), []
-    )
-
-    assert scalar == vector
-
-
-def test_a_per_group_need_subtracts_what_the_request_already_holds():
-    manager = make_manager()
-    manager.allocate_new_blocks(REQ, np.array([12, 4, 8, 4], dtype=np.int64))
-
-    # Every group grows by one token: only the groups that cross a block
-    # boundary cost anything. 12 -> 13 crosses, 4 -> 5 crosses, 8 -> 9
-    # crosses, 4 -> 5 crosses.
-    grown = np.array([13, 5, 9, 5], dtype=np.int64)
-    cost = manager.get_num_blocks_to_allocate(REQ, grown, [])
-
-    assert cost == blocks_for(grown) - 7 == 4
-
-
-def test_a_group_that_needs_nothing_new_costs_nothing():
-    """A decode step after compression must not re-grow the short groups back
-    to the longest one -- that is the pages coming straight back."""
-    manager = make_manager()
-    manager.allocate_new_blocks(REQ, np.array([12, 4, 8, 4], dtype=np.int64))
-
-    # One more token, and no group crosses a block boundary.
-    unchanged = np.array([9, 1, 5, 1], dtype=np.int64)
-    cost = manager.get_num_blocks_to_allocate(REQ, unchanged, [])
-
-    assert cost == 0
+    assert cost == exact_blocks(KEPT) == 10
 
 
 def test_the_pool_only_loses_the_sum():
@@ -160,49 +138,99 @@ def test_the_pool_only_loses_the_sum():
     manager = make_manager()
     free_before = manager.block_pool.num_free_blocks
 
-    manager.allocate_new_blocks(REQ, np.array([12, 4, 8, 4], dtype=np.int64))
+    compact(manager)
 
-    assert manager.block_pool.num_free_blocks == free_before - 7
+    assert manager.block_pool.num_free_blocks == free_before - 10
 
 
-def test_a_per_group_need_rejects_a_wrong_group_count():
-    """A vector that is not one entry per head group means the caller and the
-    pool disagree about the layout."""
+def test_no_spare_blocks_matches_the_scalar_rule():
+    """Before the first compression nothing is spared, which is what makes
+    one code path serve both."""
     manager = make_manager()
 
-    with pytest.raises(ValueError, match="num_head_groups"):
-        manager.get_num_blocks_to_allocate(
-            REQ, np.array([12, 4], dtype=np.int64), []
-        )
+    assert (manager.get_num_blocks_to_allocate(REQ, 10, [], 0)
+            == manager.get_num_blocks_to_allocate(REQ, 10, []))
+
+
+def test_decode_allocates_once_per_block_of_tokens():
+    """Groups top up together at the longest group's block edge. Topping each
+    up at its own edge allocates on almost every decode step, because the
+    edges are staggered; that per-step work is what this rule removes."""
+    manager = make_manager()
+    compact(manager)
+    spare = spare_blocks(KEPT, BLOCK_SIZE)
+    steps = 4 * BLOCK_SIZE
+
+    allocations = 0
+    for step in range(1, steps + 1):
+        need = LONGEST + step
+        if manager.get_num_blocks_to_allocate(REQ, need, [], spare) == 0:
+            continue
+        manager.allocate_new_blocks(REQ, need, spare)
+        allocations += 1
+
+    assert allocations == steps // BLOCK_SIZE
+
+
+def test_decode_holds_at_most_one_block_per_group_over_the_sum():
+    """Topping up together reserves at most the rest of one block per group
+    ahead of time, so the saving compression made survives decode."""
+    manager = make_manager()
+    compact(manager)
+    spare = spare_blocks(KEPT, BLOCK_SIZE)
+
+    for step in range(1, 4 * BLOCK_SIZE + 1):
+        manager.allocate_new_blocks(REQ, LONGEST + step, spare)
+        exact = exact_blocks(KEPT + step)
+        assert exact <= held(manager) <= exact + NUM_HEAD_GROUPS
 
 
 # --- the contract the worker has to satisfy -------------------------------
 
 
-@pytest.mark.parametrize(
-    "kept,new_tokens",
-    [
-        ([12, 4, 8, 4], 1),
-        ([12, 4, 8, 4], 7),
-        ([1, 1, 1, 1], 16),
-        ([0, 0, 0, 0], 5),
-        ([13, 5, 9, 5], 0),
-    ],
-)
-def test_the_worker_target_consumes_exactly_what_is_handed_over(
-    kept, new_tokens
-):
-    """Both sides derive the per-group depth from the same two inputs: the
-    kept lengths and the tokens this step writes. The block table fills each
-    group to ``ceil((kept_g + new) / block)``, so the count the allocator
-    hands over must be exactly the shortfall summed over groups -- otherwise
-    the block table would be left with ids it cannot place."""
+@pytest.mark.parametrize("new_tokens", [0, 1, 3, 4, 7, 16])
+def test_the_worker_depths_add_up_to_the_price(new_tokens):
+    """The block table fills each group to ``group_block_depths``; the
+    allocator hands over ids for ``cdiv(longest + new) x groups - spare``.
+    The two must agree, or the block table is left with ids it cannot place
+    or groups it cannot fill."""
     manager = make_manager()
-    kept = np.asarray(kept, dtype=np.int64)
-    manager.allocate_new_blocks(REQ, kept)
-    depth = np.ceil(kept / BLOCK_SIZE).astype(np.int64)
+    compact(manager)
+    spare = spare_blocks(KEPT, BLOCK_SIZE)
 
-    handed = manager.allocate_new_blocks(REQ, kept + new_tokens)
+    handed = manager.allocate_new_blocks(REQ, LONGEST + new_tokens, spare)
+    depths = group_block_depths(KEPT, new_tokens, MAX_LEN, BLOCK_SIZE)
 
-    target = np.ceil((kept + new_tokens) / BLOCK_SIZE).astype(np.int64)
-    assert handed.size == int((target - depth).sum())
+    held_before = np.ceil(KEPT / BLOCK_SIZE).astype(np.int64)
+    assert handed.size == int((depths - held_before).sum())
+
+
+@pytest.mark.parametrize("new_tokens", [0, 1, 3, 4, 7, 16])
+def test_every_group_has_room_for_its_tokens(new_tokens):
+    depths = group_block_depths(KEPT, new_tokens, MAX_LEN, BLOCK_SIZE)
+
+    room = depths * BLOCK_SIZE
+
+    assert (room >= KEPT + new_tokens).all()
+
+
+# --- the base path: no head groups, nothing to spare ----------------------
+
+
+def test_the_base_path_prices_what_it_allocates():
+    """``spare_blocks`` is a ragged quantity. The base path must ignore it in
+    the price as it does in the allocation, or it admits a request on fewer
+    blocks than it then takes."""
+    spec = FullAttentionSpec(
+        block_size=BLOCK_SIZE,
+        num_kv_heads=NUM_KV_HEADS,
+        head_size=8,
+        dtype=torch.float16,
+    )
+    pool = BlockPool(POOL_BLOCKS, enable_caching=False)
+    manager = FullAttentionManager(spec, pool, kv_cache_group_id=0)
+
+    cost = manager.get_num_blocks_to_allocate(REQ, 10, [], spare_blocks=2)
+    new_blocks = manager.allocate_new_blocks(REQ, 10, spare_blocks=2)
+
+    assert cost == len(new_blocks) == 3

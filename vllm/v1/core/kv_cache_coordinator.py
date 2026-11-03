@@ -87,9 +87,10 @@ class KVCacheCoordinator(ABC):
     def get_num_blocks_to_allocate(
         self,
         request_id: str,
-        num_tokens: int | np.ndarray,
+        num_tokens: int,
         new_computed_blocks: tuple[Sequence[KVCacheBlock], ...],
         num_encoder_tokens: int,
+        spare_blocks: int = 0,
     ) -> int:
         """
         Get the number of blocks needed to be allocated for the request.
@@ -102,6 +103,8 @@ class KVCacheCoordinator(ABC):
                 prefix caching.
             num_encoder_tokens: The number of encoder tokens for allocating
                 blocks for cross-attention.
+            spare_blocks: Blocks a compressed ragged request's head groups
+                need fewer than its longest one.
 
         Returns:
             The number of blocks.
@@ -116,7 +119,7 @@ class KVCacheCoordinator(ABC):
                 )
             else:
                 num_blocks_to_allocate += manager.get_num_blocks_to_allocate(
-                    request_id, num_tokens, new_computed_blocks[i]
+                    request_id, num_tokens, new_computed_blocks[i], spare_blocks
                 )
         return num_blocks_to_allocate
 
@@ -135,8 +138,11 @@ class KVCacheCoordinator(ABC):
             manager.save_new_computed_blocks(request_id, new_computed_blocks[i])
 
     def allocate_new_blocks(
-        self, request_id: str, num_tokens: int | np.ndarray,
-        num_encoder_tokens: int = 0
+        self,
+        request_id: str,
+        num_tokens: int,
+        num_encoder_tokens: int = 0,
+        spare_blocks: int = 0,
     ) -> tuple["list[KVCacheBlock] | np.ndarray", ...]:
         """
         Allocate new blocks for the request to give it at least `num_tokens`
@@ -148,6 +154,7 @@ class KVCacheCoordinator(ABC):
                 tokens that are already allocated).
             num_encoder_tokens: The number of encoder tokens for allocating
                 blocks for cross-attention.
+            spare_blocks: See ``get_num_blocks_to_allocate``.
 
         Returns:
             ``list[KVCacheBlock]`` per group on the base path, or
@@ -156,12 +163,10 @@ class KVCacheCoordinator(ABC):
             every manager in the coordinator runs in the same mode.
         """
         return tuple(
-            manager.allocate_new_blocks(
-                request_id,
-                num_encoder_tokens
-                if isinstance(manager, CrossAttentionManager)
-                else num_tokens,
-            )
+            manager.allocate_new_blocks(request_id, num_encoder_tokens)
+            if isinstance(manager, CrossAttentionManager)
+            else manager.allocate_new_blocks(
+                request_id, num_tokens, spare_blocks)
             for manager in self.single_type_managers
         )
 

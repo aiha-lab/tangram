@@ -165,7 +165,7 @@ class RaggedBlockTable(BlockTable):
 
         ``block_ids`` is a flat sequence sized by the allocator as the total
         shortfall across groups. ``target_depth`` names the block depth each
-        group must reach — the same ``ceil(len_g / block_size)`` the allocator
+        group must reach — ``group_block_depths``, the same rule the allocator
         priced the request with, so the two cannot drift.
 
         Without a target the groups all hold the same tokens (a request that

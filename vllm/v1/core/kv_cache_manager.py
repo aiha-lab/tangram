@@ -342,7 +342,8 @@ class KVCacheManager:
         num_lookahead_tokens: int = 0,
         delay_cache_blocks: bool = False,
         num_encoder_tokens: int = 0,
-        effective_num_cached_tokens: np.ndarray | None = None,
+        effective_num_cached_tokens: int | None = None,
+        spare_blocks: int = 0,
         full_sequence_must_fit: bool = False,
         has_scheduled_reqs: bool = False,
     ) -> KVCacheBlocks | None:
@@ -363,6 +364,10 @@ class KVCacheManager:
             delay_cache_blocks: Whether to skip caching the blocks. This is
                 used by P/D when allocating blocks used in a KV transfer
                 which will complete in a future step.
+            effective_num_cached_tokens: The longest head group's kept length
+                once compression has trimmed the cache.
+            spare_blocks: Blocks the other head groups need fewer than the
+                longest one; see ``ragged_allocation``.
 
         Blocks layout:
         ```
@@ -421,9 +426,7 @@ class KVCacheManager:
         # against post-compression occupancy rather than the model-side
         # ``num_computed_tokens``. Pre-compression they coincide.
         if effective_num_cached_tokens is not None:
-            # One kept length per head group, so the clamp is elementwise;
-            # every group stores every new token.
-            num_tokens_need_slot = np.minimum(
+            num_tokens_need_slot = min(
                 effective_num_cached_tokens + num_new_tokens + num_lookahead_tokens,
                 self.max_model_len,
             )
@@ -438,6 +441,7 @@ class KVCacheManager:
             num_tokens=num_tokens_need_slot,
             new_computed_blocks=new_computed_block_list,
             num_encoder_tokens=num_encoder_tokens,
+            spare_blocks=spare_blocks,
         )
 
         # Apply the same admission headroom to the per-step allocation check.
@@ -467,7 +471,8 @@ class KVCacheManager:
             )
 
         new_blocks = self.coordinator.allocate_new_blocks(
-            request.request_id, num_tokens_need_slot, num_encoder_tokens
+            request.request_id, num_tokens_need_slot, num_encoder_tokens,
+            spare_blocks
         )
 
         # P/D: delay caching blocks if we have to recv from

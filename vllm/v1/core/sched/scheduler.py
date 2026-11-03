@@ -6,8 +6,6 @@ from collections import defaultdict
 from collections.abc import Iterable
 from typing import Any
 
-import numpy as np
-
 from vllm import envs
 from vllm.config import VllmConfig
 from vllm.distributed.ec_transfer.ec_connector.base import (
@@ -31,6 +29,7 @@ from vllm.v1.core.encoder_cache_manager import (
     compute_encoder_budget,
 )
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
+from vllm.v1.core.ragged_allocation import spare_blocks
 from vllm.v1.core.sched.interface import SchedulerInterface
 from vllm.v1.core.sched.output import (
     CachedRequestData,
@@ -329,7 +328,7 @@ class Scheduler(SchedulerInterface):
             # Once a request has been compressed, size the next allocation
             # against post-compression cache occupancy rather than
             # ``num_computed_tokens``.
-            effective_num_cached_tokens = request.compress_eff_seq_lens
+            effective_num_cached_tokens = request.compress_max_eff_seq_len
 
             # Schedule newly needed KV blocks for the request.
             with record_function_or_nullcontext("schedule: allocate_slots"):
@@ -339,6 +338,7 @@ class Scheduler(SchedulerInterface):
                         num_new_tokens,
                         num_lookahead_tokens=self.num_lookahead_tokens,
                         effective_num_cached_tokens=effective_num_cached_tokens,
+                        spare_blocks=request.compress_spare_blocks,
                     )
 
                     if new_blocks is not None:
@@ -624,10 +624,10 @@ class Scheduler(SchedulerInterface):
                 else:
                     num_encoder_tokens = 0
 
-                # New requests have ``compress_eff_seq_lens is None`` so
+                # New requests have ``compress_max_eff_seq_len is None`` so
                 # the base path runs; only resumed requests carry a value
                 # from a prior compression cycle.
-                effective_num_cached_tokens = request.compress_eff_seq_lens
+                effective_num_cached_tokens = request.compress_max_eff_seq_len
 
                 new_blocks = self.kv_cache_manager.allocate_slots(
                     request,
@@ -638,6 +638,7 @@ class Scheduler(SchedulerInterface):
                     delay_cache_blocks=load_kv_async,
                     num_encoder_tokens=num_encoder_tokens,
                     effective_num_cached_tokens=effective_num_cached_tokens,
+                    spare_blocks=request.compress_spare_blocks,
                     full_sequence_must_fit=self.scheduler_reserve_full_isl,
                     # A non-empty running queue (carryover from a prior step or
                     # requests admitted earlier in this step) means the watermark
@@ -1197,11 +1198,11 @@ class Scheduler(SchedulerInterface):
                     continue
                 if not eff_list:
                     continue
-                # One kept length per (layer, head-group); they differ under
-                # every non-uniform budget scope, and keeping the whole vector
-                # is what lets ``allocate_slots`` charge their sum.
-                request.compress_eff_seq_lens = np.asarray(
-                    eff_list, dtype=np.int64)
+                # One kept length per (layer, head-group). Allocation is sized
+                # by the longest, less the blocks the shorter ones spare.
+                request.compress_max_eff_seq_len = int(max(eff_list))
+                request.compress_spare_blocks = spare_blocks(
+                    eff_list, self.block_size)
                 compressed_this_step.add(req_id)
                 # Sticky once-only flag: set on the last prefill chunk so
                 # subsequent steps skip compression entirely.
@@ -1239,7 +1240,7 @@ class Scheduler(SchedulerInterface):
                 candidate_req_ids=candidate_req_ids,
             )
 
-        # Keep ``compress_eff_seq_lens`` in sync with cache occupancy on
+        # Keep ``compress_max_eff_seq_len`` in sync with cache occupancy on
         # decode steps too — mirrors the worker-side ``effective_seq_lens_cpu``
         # increment. Without this, decode writes would spill back into block 0
         # once they exceeded the post-compression block count. Gated on
@@ -1251,10 +1252,8 @@ class Scheduler(SchedulerInterface):
                     continue
                 request = self.requests.get(req_id)
                 if (request is not None
-                        and request.compress_eff_seq_lens is not None):
-                    # Every group stores every new token, so the spread
-                    # compression left survives decode.
-                    request.compress_eff_seq_lens += num_tokens
+                        and request.compress_max_eff_seq_len is not None):
+                    request.compress_max_eff_seq_len += num_tokens
 
         # NOTE(woosuk): As len(num_scheduled_tokens) can be up to 1K or more,
         # the below loop can be a performance bottleneck. We should do our best

@@ -92,8 +92,9 @@ class SingleTypeKVCacheManager(ABC):
     def get_num_blocks_to_allocate(
         self,
         request_id: str,
-        num_tokens: int | np.ndarray,
+        num_tokens: int,
         new_computed_blocks: Sequence[KVCacheBlock] | np.ndarray,
+        spare_blocks: int = 0,
     ) -> int:
         """
         Get the number of blocks needed to be allocated for the request.
@@ -101,13 +102,15 @@ class SingleTypeKVCacheManager(ABC):
         Args:
             request_id: The request ID.
             num_tokens: The total number of tokens that need a slot (including
-                tokens that are already allocated). On the ragged path this may
-                be one length per head group, which is what compression leaves;
-                see ``ragged_allocation``.
+                tokens that are already allocated). On the ragged path, the
+                longest head group's.
             new_computed_blocks: The new computed blocks just hitting the
                 prefix caching. Accepts ``Sequence[KVCacheBlock]`` (base
                 path) or ``np.ndarray`` of block ids (ragged path
                 — always empty since prefix caching is disabled there).
+            spare_blocks: Ragged path only: blocks the head groups need fewer
+                than the longest one after compression; see
+                ``ragged_allocation``.
 
         Returns:
             The number of blocks.
@@ -121,7 +124,7 @@ class SingleTypeKVCacheManager(ABC):
             ids = self.req_to_block_ids.get(request_id)
             existing_len = 0 if ids is None else int(ids.size)
             num_required_blocks = blocks_for(
-                num_tokens, self.block_size, num_groups)
+                num_tokens, self.block_size, num_groups, spare_blocks)
         else:
             existing_len = len(self.req_to_blocks[request_id])
             num_required_blocks = cdiv(num_tokens, self.block_size) * num_groups
@@ -182,7 +185,7 @@ class SingleTypeKVCacheManager(ABC):
             assert num_computed == 0
 
     def allocate_new_blocks(
-        self, request_id: str, num_tokens: int | np.ndarray
+        self, request_id: str, num_tokens: int, spare_blocks: int = 0
     ) -> list[KVCacheBlock] | np.ndarray:
         """
         Allocate new blocks for the request to give it at least `num_tokens`
@@ -191,9 +194,9 @@ class SingleTypeKVCacheManager(ABC):
         Args:
             request_id: The request ID.
             num_tokens: The total number of tokens that need a slot (including
-                tokens that are already allocated). On the ragged path this may
-                be one length per head group, which is what compression leaves;
-                see ``ragged_allocation``.
+                tokens that are already allocated). On the ragged path, the
+                longest head group's.
+            spare_blocks: Ragged path only; see ``get_num_blocks_to_allocate``.
 
         Returns:
             ``list[KVCacheBlock]`` for the base path,
@@ -204,7 +207,8 @@ class SingleTypeKVCacheManager(ABC):
             existing = self.req_to_block_ids.get(request_id)
             existing_len = 0 if existing is None else int(existing.size)
             num_new_blocks = blocks_for(
-                num_tokens, self.block_size, num_groups) - existing_len
+                num_tokens, self.block_size, num_groups,
+                spare_blocks) - existing_len
             if num_new_blocks <= 0:
                 return np.empty(0, dtype=np.int32)
             # Pull new ids directly from the ring buffer; the int32 array
@@ -912,6 +916,7 @@ class MambaManager(SingleTypeKVCacheManager):
         request_id: str,
         num_tokens: int,
         new_computed_blocks: Sequence[KVCacheBlock],
+        spare_blocks: int = 0,
     ) -> int:
         # Allocate extra `num_speculative_blocks` blocks for
         # speculative decoding (MTP/EAGLE) with linear attention.
@@ -922,11 +927,11 @@ class MambaManager(SingleTypeKVCacheManager):
                 * self.kv_cache_spec.num_speculative_blocks
             )
         return super().get_num_blocks_to_allocate(
-            request_id, num_tokens, new_computed_blocks
+            request_id, num_tokens, new_computed_blocks, spare_blocks
         )
 
     def allocate_new_blocks(
-        self, request_id: str, num_tokens: int
+        self, request_id: str, num_tokens: int, spare_blocks: int = 0
     ) -> list[KVCacheBlock]:
         # Allocate extra `num_speculative_blocks` blocks for
         # speculative decoding (MTP/EAGLE) with linear attention.
@@ -936,7 +941,8 @@ class MambaManager(SingleTypeKVCacheManager):
                 self.kv_cache_spec.block_size
                 * self.kv_cache_spec.num_speculative_blocks
             )
-        return super().allocate_new_blocks(request_id, num_tokens)
+        return super().allocate_new_blocks(
+            request_id, num_tokens, spare_blocks)
 
 
 class CrossAttentionManager(SingleTypeKVCacheManager):

@@ -543,11 +543,9 @@ class CompressionModelRunnerMixin:
         spec = self.speculative_config
         lookahead = (spec.num_speculative_tokens
                      if spec is not None and spec.use_eagle() else 0)
-        needed = np.minimum(
-            kept_lengths.astype(np.int64) + num_new_tokens + lookahead,
-            self.max_model_len)
         return group_block_depths(
-            needed, self.input_batch.block_table[0].block_size, needed.size)
+            kept_lengths, num_new_tokens + lookahead, self.max_model_len,
+            self.input_batch.block_table[0].block_size)
 
     def _postprocess_compress_updates(
         self,
